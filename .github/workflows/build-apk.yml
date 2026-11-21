@@ -1,12 +1,11 @@
-name: Build QuickCircle APK
+name: Build QuickCircle Release APK
 
 on:
   push:
-    branches: [ main, master ]
   workflow_dispatch:
 
 jobs:
-  build-apk:
+  build-release-apk:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout source
@@ -18,24 +17,44 @@ jobs:
           distribution: temurin
           java-version: 17
 
+      - name: Accept Android SDK licenses
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null 2>&1 || true
+
       - name: Set up Gradle 9.3.1
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: 9.3.1
 
-      - name: Restore debug keystore
+      - name: Prepare Release Signing Keystore
+        env:
+          SECRET_KS: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
+          SECRET_STORE_PW: ${{ secrets.RELEASE_STORE_PASSWORD }}
+          SECRET_KEY_PW: ${{ secrets.RELEASE_KEY_PASSWORD }}
         run: |
-          if [ -f debug.keystore.base64 ]; then
-            base64 -d debug.keystore.base64 > debug.keystore
+          KS_PATH="${{ runner.temp }}/release-upload.jks"
+          if [ -n "$SECRET_KS" ]; then
+            echo "$SECRET_KS" | base64 -d > "$KS_PATH"
+            echo "STORE_PASSWORD=$SECRET_STORE_PW" >> "$GITHUB_ENV"
+            echo "KEY_PASSWORD=$SECRET_KEY_PW" >> "$GITHUB_ENV"
           else
-            keytool -genkeypair -v -keystore debug.keystore -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
+            keytool -genkeypair -noprompt \
+              -keystore "$KS_PATH" \
+              -storetype PKCS12 \
+              -alias upload \
+              -storepass quickcircle-oss \
+              -keypass quickcircle-oss \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=QuickCircle OSS,O=QuickCircle,C=US"
+            echo "STORE_PASSWORD=quickcircle-oss" >> "$GITHUB_ENV"
+            echo "KEY_PASSWORD=quickcircle-oss" >> "$GITHUB_ENV"
           fi
+          echo "KEYSTORE_PATH=$KS_PATH" >> "$GITHUB_ENV"
 
-      - name: Build Debug APK
-        run: gradle assembleDebug
+      - name: Build Signed Release APK
+        run: gradle :app:assembleRelease
 
-      - name: Upload QuickCircle APK
+      - name: Upload QuickCircle Release APK
         uses: actions/upload-artifact@v4
         with:
-          name: QuickCircle-debug-apk
-          path: app/build/outputs/apk/debug/app-debug.apk
+          name: QuickCircle-release-apk
+          path: app/build/outputs/apk/release/app-release.apk
