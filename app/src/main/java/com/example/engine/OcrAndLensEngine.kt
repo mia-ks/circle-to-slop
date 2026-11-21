@@ -3,10 +3,12 @@ package com.example.engine
 import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
+import android.graphics.Color as AndroidColor
 import android.graphics.Rect
 import android.net.Uri
 import android.util.Log
 import androidx.core.content.FileProvider
+import androidx.core.graphics.ColorUtils
 import com.example.data.OcrScriptMode
 import com.example.data.SupportedTargetLanguages
 import com.google.android.gms.tasks.Task
@@ -41,9 +43,54 @@ import java.util.concurrent.ConcurrentHashMap
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
-data class RecognizedTextLine(
+data class RecognizedTextWord(
+    val globalIndex: Int,
+    val lineIndex: Int,
+    val blockId: Int,
     val text: String,
     val boundingBox: Rect
+)
+
+data class RecognizedTextLine(
+    val text: String,
+    val boundingBox: Rect,
+    val lineIndex: Int = 0,
+    val blockId: Int = 0,
+    val words: List<RecognizedTextWord> = emptyList()
+)
+
+data class InlineTextBlock(
+    val id: Int,
+    val text: String,
+    val boundingBox: Rect,
+    val lineCount: Int,
+    val averageLineHeightPx: Float,
+    val detectedLanguageCode: String?,
+    val backgroundColorArgb: Int,
+    val foregroundColorArgb: Int
+)
+
+data class ScreenOcrAnalysis(
+    val lines: List<RecognizedTextLine> = emptyList(),
+    val words: List<RecognizedTextWord> = emptyList(),
+    val blocks: List<InlineTextBlock> = emptyList(),
+    val dominantLanguageCode: String? = null
+)
+
+sealed interface InlineBlockStatus {
+    data object Translating : InlineBlockStatus
+    data class Translated(val text: String, val sourceLangName: String) : InlineBlockStatus
+    data object SameLanguage : InlineBlockStatus
+    data class Error(val message: String) : InlineBlockStatus
+}
+
+data class InlineScreenTranslationState(
+    val targetLangCode: String = "en",
+    val isDownloadingPacks: Boolean = false,
+    val missingPacksLabel: String = "",
+    val isTranslating: Boolean = false,
+    val blockStates: Map<Int, InlineBlockStatus> = emptyMap(),
+    val errorMessage: String? = null
 )
 
 data class OcrRegionResult(
@@ -227,7 +274,12 @@ object OcrAndLensEngine {
     suspend fun recognizeFullScreenLines(
         bitmap: Bitmap,
         scriptMode: OcrScriptMode
-    ): List<RecognizedTextLine> = withContext(Dispatchers.Default) {
+    ): List<RecognizedTextLine> = analyzeFullScreen(bitmap, scriptMode).lines
+
+    suspend fun analyzeFullScreen(
+        bitmap: Bitmap,
+        scriptMode: OcrScriptMode
+    ): ScreenOcrAnalysis = withContext(Dispatchers.Default) {
         try {
             val image = InputImage.fromBitmap(bitmap, 0)
             val recognizer = when (scriptMode) {
@@ -235,10 +287,185 @@ object OcrAndLensEngine {
                 OcrScriptMode.JAPANESE_AND_LATIN -> japaneseRecognizer
             }
             val result = recognizer.process(image).awaitTask()
-            extractLinesFromMlKitResult(result)
+            buildScreenAnalysis(bitmap, result)
         } catch (e: Exception) {
-            Log.e(TAG, "Full-screen OCR failed", e)
-            emptyList()
+            Log.e(TAG, "Full-screen OCR analysis failed", e)
+            ScreenOcrAnalysis()
+        }
+    }
+
+    suspend fun translateBlocksInline(
+        blocks: List<InlineTextBlock>,
+        targetLangCode: String,
+        dominantLangHint: String?,
+        onState: (InlineScreenTranslationState) -> Unit
+    ) {
+        val mlTarget = resolveMlKitTag(targetLangCode)
+        if (mlTarget == null) {
+            onState(
+                InlineScreenTranslationState(
+                    targetLangCode = targetLangCode,
+                    errorMessage = "Unsupported target language ($targetLangCode) for offline ML Kit."
+                )
+            )
+            return
+        }
+        if (blocks.isEmpty()) {
+            onState(InlineScreenTranslationState(targetLangCode = targetLangCode))
+            return
+        }
+
+        val currentStates = mutableMapOf<Int, InlineBlockStatus>()
+        val sourcePerBlock = mutableMapOf<Int, String>()
+        val uniqueMissingSources = linkedSetOf<String>()
+
+        // Resolve source language per block
+        for (block in blocks) {
+            if (!block.text.any { it.isLetter() }) {
+                currentStates[block.id] = InlineBlockStatus.SameLanguage
+                continue
+            }
+            val rawTag = block.detectedLanguageCode ?: detectLanguageCode(block.text) ?: dominantLangHint
+            val mlSource = rawTag?.let { resolveMlKitTag(it) }
+            when {
+                mlSource == null -> {
+                    currentStates[block.id] = InlineBlockStatus.SameLanguage
+                }
+                mlSource == mlTarget -> {
+                    currentStates[block.id] = InlineBlockStatus.SameLanguage
+                }
+                else -> {
+                    sourcePerBlock[block.id] = mlSource
+                    currentStates[block.id] = InlineBlockStatus.Translating
+                    uniqueMissingSources.add(mlSource)
+                }
+            }
+        }
+
+        if (sourcePerBlock.isEmpty()) {
+            onState(
+                InlineScreenTranslationState(
+                    targetLangCode = targetLangCode,
+                    blockStates = currentStates.toMap()
+                )
+            )
+            return
+        }
+
+        // Check which ML Kit packs need downloading
+        val modelManager = try {
+            RemoteModelManager.getInstance()
+        } catch (e: Exception) {
+            onState(
+                InlineScreenTranslationState(
+                    targetLangCode = targetLangCode,
+                    errorMessage = e.localizedMessage ?: "ML Kit unavailable"
+                )
+            )
+            return
+        }
+
+        val missingTags = mutableListOf<String>()
+        val allNeededTags = (uniqueMissingSources + mlTarget).distinct()
+        for (tag in allNeededTags) {
+            val downloaded = try {
+                modelManager.isModelDownloaded(TranslateRemoteModel.Builder(tag).build()).awaitTask()
+            } catch (_: Exception) {
+                false
+            }
+            if (!downloaded) {
+                missingTags.add(tag)
+            } else {
+                _packStatusFlow.update { it + (tag to ModelPackStatus.DOWNLOADED) }
+            }
+        }
+
+        if (missingTags.isNotEmpty()) {
+            val missingLabel = missingTags.joinToString(" + ") { formatLanguageName(it) }
+            onState(
+                InlineScreenTranslationState(
+                    targetLangCode = targetLangCode,
+                    isDownloadingPacks = true,
+                    missingPacksLabel = missingLabel,
+                    isTranslating = true,
+                    blockStates = currentStates.toMap()
+                )
+            )
+            for (tag in missingTags) {
+                val res = ensureLanguagePackDownloaded(tag)
+                if (res.isFailure) {
+                    val reason = res.exceptionOrNull()?.localizedMessage ?: "network or Play Services unavailable"
+                    onState(
+                        InlineScreenTranslationState(
+                            targetLangCode = targetLangCode,
+                            isDownloadingPacks = false,
+                            isTranslating = false,
+                            blockStates = currentStates.toMap(),
+                            errorMessage = "Could not download ${formatLanguageName(tag)} offline pack ($reason)."
+                        )
+                    )
+                    return
+                }
+            }
+        }
+
+        onState(
+            InlineScreenTranslationState(
+                targetLangCode = targetLangCode,
+                isDownloadingPacks = false,
+                isTranslating = true,
+                blockStates = currentStates.toMap()
+            )
+        )
+
+        // Reuse one Translator instance per unique source language for speed and low memory
+        val translators = mutableMapOf<String, com.google.mlkit.nl.translate.Translator>()
+        try {
+            for ((blockId, mlSource) in sourcePerBlock) {
+                val block = blocks.firstOrNull { it.id == blockId } ?: continue
+                val translator = translators.getOrPut(mlSource) {
+                    Translation.getClient(
+                        TranslatorOptions.Builder()
+                            .setSourceLanguage(mlSource)
+                            .setTargetLanguage(mlTarget)
+                            .build()
+                    )
+                }
+                try {
+                    val translated = translator.translate(block.text).awaitTask().trim()
+                    currentStates[blockId] = InlineBlockStatus.Translated(
+                        text = translated.ifBlank { block.text },
+                        sourceLangName = formatLanguageName(mlSource)
+                    )
+                } catch (e: Exception) {
+                    currentStates[blockId] = InlineBlockStatus.Error(
+                        e.localizedMessage ?: "Translation failed"
+                    )
+                }
+                onState(
+                    InlineScreenTranslationState(
+                        targetLangCode = targetLangCode,
+                        isDownloadingPacks = false,
+                        isTranslating = true,
+                        blockStates = currentStates.toMap()
+                    )
+                )
+            }
+            onState(
+                InlineScreenTranslationState(
+                    targetLangCode = targetLangCode,
+                    isDownloadingPacks = false,
+                    isTranslating = false,
+                    blockStates = currentStates.toMap()
+                )
+            )
+        } finally {
+            translators.values.forEach {
+                try {
+                    it.close()
+                } catch (_: Exception) {
+                }
+            }
         }
     }
 
@@ -601,6 +828,232 @@ object OcrAndLensEngine {
             ?: Locale.forLanguageTag(clean).getDisplayLanguage(Locale.ENGLISH)
                 .replaceFirstChar { if (it.isLowerCase()) it.titlecase(Locale.ENGLISH) else it.toString() }
                 .ifBlank { clean.uppercase(Locale.ROOT) }
+    }
+
+    private suspend fun buildScreenAnalysis(
+        bitmap: Bitmap,
+        visionText: Text
+    ): ScreenOcrAnalysis {
+        val rawLineEntries = mutableListOf<Pair<Text.Line, Rect>>()
+        // First split ML Kit textBlocks into cohesive visual sub-blocks so paragraphs stay unified
+        // while separate buttons/labels stay isolated
+        val visualGroups = mutableListOf<List<Text.Line>>()
+        for (block in visionText.textBlocks) {
+            val blockLines = block.lines.filter { it.boundingBox != null && it.text.isNotBlank() }
+            if (blockLines.isEmpty()) continue
+            var currentGroup = mutableListOf<Text.Line>()
+            for (line in blockLines) {
+                val rect = line.boundingBox ?: continue
+                if (currentGroup.isEmpty()) {
+                    currentGroup.add(line)
+                } else {
+                    val prevRect = currentGroup.last().boundingBox ?: rect
+                    val avgH = currentGroup.mapNotNull { it.boundingBox?.height() }.average().toFloat().coerceAtLeast(8f)
+                    val curH = rect.height().toFloat().coerceAtLeast(8f)
+                    val vGap = rect.top - prevRect.bottom
+                    val sizeRatio = curH / avgH
+                    val sameRowOrCloseParagraph = vGap <= avgH * 0.95f && sizeRatio in 0.62f..1.6f
+                    if (sameRowOrCloseParagraph) {
+                        currentGroup.add(line)
+                    } else {
+                        visualGroups.add(currentGroup)
+                        currentGroup = mutableListOf(line)
+                    }
+                }
+                rawLineEntries.add(line to rect)
+            }
+            if (currentGroup.isNotEmpty()) {
+                visualGroups.add(currentGroup)
+            }
+        }
+
+        val linesOut = mutableListOf<RecognizedTextLine>()
+        val wordsOut = mutableListOf<RecognizedTextWord>()
+        val blocksOut = mutableListOf<InlineTextBlock>()
+
+        var nextLineIdx = 0
+        var nextWordIdx = 0
+
+        for ((blockId, groupLines) in visualGroups.withIndex()) {
+            val blockBounds = Rect(groupLines.first().boundingBox)
+            var heightSum = 0f
+            val joinedPieces = mutableListOf<String>()
+
+            for (mlLine in groupLines) {
+                val lineBox = mlLine.boundingBox ?: continue
+                blockBounds.union(lineBox)
+                heightSum += lineBox.height().toFloat()
+                joinedPieces.add(mlLine.text.trim())
+
+                val lineWords = mutableListOf<RecognizedTextWord>()
+                val elements = mlLine.elements.filter { it.boundingBox != null && it.text.isNotBlank() }
+                if (elements.isNotEmpty()) {
+                    for (el in elements) {
+                        val elBox = el.boundingBox ?: continue
+                        val word = RecognizedTextWord(
+                            globalIndex = nextWordIdx++,
+                            lineIndex = nextLineIdx,
+                            blockId = blockId,
+                            text = el.text,
+                            boundingBox = elBox
+                        )
+                        lineWords.add(word)
+                        wordsOut.add(word)
+                    }
+                } else {
+                    val word = RecognizedTextWord(
+                        globalIndex = nextWordIdx++,
+                        lineIndex = nextLineIdx,
+                        blockId = blockId,
+                        text = mlLine.text,
+                        boundingBox = lineBox
+                    )
+                    lineWords.add(word)
+                    wordsOut.add(word)
+                }
+
+                linesOut.add(
+                    RecognizedTextLine(
+                        text = mlLine.text,
+                        boundingBox = lineBox,
+                        lineIndex = nextLineIdx,
+                        blockId = blockId,
+                        words = lineWords
+                    )
+                )
+                nextLineIdx++
+            }
+
+            val blockText = joinLinesIntelligently(joinedPieces)
+            val langTag = if (blockText.length >= 4) detectLanguageCode(blockText) else null
+            val (bgArgb, fgArgb) = sampleBlockColors(bitmap, blockBounds)
+            blocksOut.add(
+                InlineTextBlock(
+                    id = blockId,
+                    text = blockText,
+                    boundingBox = blockBounds,
+                    lineCount = groupLines.size,
+                    averageLineHeightPx = (heightSum / groupLines.size.coerceAtLeast(1)).coerceAtLeast(12f),
+                    detectedLanguageCode = langTag,
+                    backgroundColorArgb = bgArgb,
+                    foregroundColorArgb = fgArgb
+                )
+            )
+        }
+
+        val fullScreenSample = blocksOut.take(8).joinToString(" ") { it.text }
+        val dominantLang = if (fullScreenSample.isNotBlank()) detectLanguageCode(fullScreenSample) else null
+
+        val enrichedBlocks = blocksOut.map { b ->
+            if (b.detectedLanguageCode == null && dominantLang != null) {
+                b.copy(detectedLanguageCode = dominantLang)
+            } else {
+                b
+            }
+        }
+
+        return ScreenOcrAnalysis(
+            lines = linesOut,
+            words = wordsOut,
+            blocks = enrichedBlocks,
+            dominantLanguageCode = dominantLang
+        )
+    }
+
+    private fun joinLinesIntelligently(lines: List<String>): String {
+        if (lines.isEmpty()) return ""
+        val sb = StringBuilder()
+        for (i in lines.indices) {
+            val part = lines[i]
+            if (part.isBlank()) continue
+            if (sb.isNotEmpty()) {
+                val prevChar = sb[sb.length - 1]
+                val nextChar = part[0]
+                val bothCjk = isCjkChar(prevChar) && isCjkChar(nextChar)
+                if (!bothCjk) sb.append(' ')
+            }
+            sb.append(part)
+        }
+        return sb.toString()
+    }
+
+    private fun isCjkChar(ch: Char): Boolean {
+        val code = ch.code
+        return code in 0x3040..0x30FF || // Hiragana & Katakana
+            code in 0x4E00..0x9FFF ||    // CJK Unified Ideographs
+            code in 0x3400..0x4DBF ||
+            code in 0xAC00..0xD7AF       // Hangul
+    }
+
+    private fun sampleBlockColors(bitmap: Bitmap, rect: Rect): Pair<Int, Int> {
+        val w = bitmap.width
+        val h = bitmap.height
+        if (w <= 2 || h <= 2) return 0xFF141419.toInt() to 0xFFF8FAFC.toInt()
+
+        val l = rect.left.coerceIn(0, w - 1)
+        val t = rect.top.coerceIn(0, h - 1)
+        val r = rect.right.coerceIn(l, w - 1)
+        val b = rect.bottom.coerceIn(t, h - 1)
+
+        val borderOut = 3
+        val topY = (t - borderOut).coerceIn(0, h - 1)
+        val botY = (b + borderOut).coerceIn(0, h - 1)
+        val leftX = (l - borderOut).coerceIn(0, w - 1)
+        val rightX = (r + borderOut).coerceIn(0, w - 1)
+        val midX = ((l + r) / 2).coerceIn(0, w - 1)
+        val midY = ((t + b) / 2).coerceIn(0, h - 1)
+        val q1X = (l + (r - l) / 4).coerceIn(0, w - 1)
+        val q3X = (l + (r - l) * 3 / 4).coerceIn(0, w - 1)
+
+        val bgCoords = listOf(
+            leftX to topY, q1X to topY, midX to topY, q3X to topY, rightX to topY,
+            leftX to botY, q1X to botY, midX to botY, q3X to botY, rightX to botY,
+            leftX to midY, rightX to midY
+        )
+        val rs = IntArray(bgCoords.size)
+        val gs = IntArray(bgCoords.size)
+        val bs = IntArray(bgCoords.size)
+        for (i in bgCoords.indices) {
+            val px = bitmap.getPixel(bgCoords[i].first, bgCoords[i].second)
+            rs[i] = AndroidColor.red(px)
+            gs[i] = AndroidColor.green(px)
+            bs[i] = AndroidColor.blue(px)
+        }
+        rs.sort()
+        gs.sort()
+        bs.sort()
+        val mid = bgCoords.size / 2
+        val bgColor = AndroidColor.rgb(rs[mid], gs[mid], bs[mid])
+
+        // Pick high-contrast foreground color by sampling interior pixels vs WCAG fallback
+        var bestFg = bgColor
+        var bestContrast = 1.0
+        for (row in 1..3) {
+            val sy = (t + (b - t) * row / 4).coerceIn(0, h - 1)
+            for (col in 1..4) {
+                val sx = (l + (r - l) * col / 5).coerceIn(0, w - 1)
+                val px = AndroidColor.rgb(
+                    AndroidColor.red(bitmap.getPixel(sx, sy)),
+                    AndroidColor.green(bitmap.getPixel(sx, sy)),
+                    AndroidColor.blue(bitmap.getPixel(sx, sy))
+                )
+                val c = ColorUtils.calculateContrast(px, bgColor)
+                if (c > bestContrast) {
+                    bestContrast = c
+                    bestFg = px
+                }
+            }
+        }
+
+        val finalFg = if (bestContrast >= 4.5) {
+            bestFg
+        } else {
+            val whiteContrast = ColorUtils.calculateContrast(0xFFF8FAFC.toInt(), bgColor)
+            val darkContrast = ColorUtils.calculateContrast(0xFF0E1015.toInt(), bgColor)
+            if (whiteContrast >= darkContrast) 0xFFF8FAFC.toInt() else 0xFF0E1015.toInt()
+        }
+
+        return bgColor to finalFg
     }
 
     private fun extractLinesFromMlKitResult(visionText: Text): List<RecognizedTextLine> {

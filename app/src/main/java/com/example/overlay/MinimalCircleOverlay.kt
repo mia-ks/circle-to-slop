@@ -48,7 +48,10 @@ import androidx.compose.material.icons.rounded.ContentCopy
 import androidx.compose.material.icons.rounded.ImageSearch
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Search
+import androidx.compose.material.icons.rounded.SelectAll
 import androidx.compose.material.icons.rounded.Translate
+import androidx.compose.material.icons.rounded.Visibility
+import androidx.compose.material.icons.rounded.VisibilityOff
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
@@ -60,6 +63,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -70,6 +74,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.RoundRect
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.BlendMode
 import androidx.compose.ui.graphics.Color
@@ -95,10 +100,14 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.data.OcrScriptMode
 import com.example.data.SupportedTargetLanguages
+import com.example.engine.InlineBlockStatus
+import com.example.engine.InlineScreenTranslationState
+import com.example.engine.InlineTextBlock
 import com.example.engine.ModelPackStatus
 import com.example.engine.OcrAndLensEngine
 import com.example.engine.OcrRegionResult
 import com.example.engine.RecognizedTextLine
+import com.example.engine.ScreenOcrAnalysis
 import com.example.engine.TranslationState
 import com.example.ui.theme.CoralError
 import com.example.ui.theme.ElectricCyan
@@ -106,7 +115,6 @@ import com.example.ui.theme.EmeraldActive
 import com.example.ui.theme.InterFamily
 import com.example.ui.theme.JetBrainsMonoFamily
 import com.example.ui.theme.SpaceGroteskFamily
-import androidx.compose.runtime.collectAsState
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -116,6 +124,7 @@ import kotlin.math.min
 private sealed interface SelectionGeometry {
     data class Freehand(val points: List<Offset>, val isClosed: Boolean) : SelectionGeometry
     data class BoxRect(val left: Float, val top: Float, val right: Float, val bottom: Float) : SelectionGeometry
+    data class LensWords(val range: TextSelectionRange) : SelectionGeometry
 }
 
 @Composable
@@ -136,11 +145,16 @@ fun MinimalCircleOverlay(
 
     val screenImageBitmap = remember(screenshotBitmap) { screenshotBitmap.asImageBitmap() }
 
-    var fullScreenLines by remember(screenshotBitmap) {
-        mutableStateOf<List<RecognizedTextLine>>(emptyList())
+    var screenAnalysis by remember(screenshotBitmap) {
+        mutableStateOf(ScreenOcrAnalysis())
     }
+    val fullScreenLines = screenAnalysis.lines
+    val fullScreenWords = screenAnalysis.words
+    val fullScreenBlocks = screenAnalysis.blocks
+
     var selection by remember { mutableStateOf<SelectionGeometry?>(null) }
     var isDrawing by remember { mutableStateOf(false) }
+    var isDraggingTextHandle by remember { mutableStateOf(false) }
 
     var croppedBitmap by remember { mutableStateOf<Bitmap?>(null) }
     var ocrResult by remember { mutableStateOf<OcrRegionResult?>(null) }
@@ -154,15 +168,22 @@ fun MinimalCircleOverlay(
     var translationJob by remember { mutableStateOf<Job?>(null) }
     var copiedLabel by remember { mutableStateOf<String?>(null) }
 
+    // Lens-style Inline Screen Translation mode state
+    var isInlineTranslateMode by remember { mutableStateOf(false) }
+    var showOriginalScreen by remember { mutableStateOf(false) }
+    var inlineTranslationState by remember { mutableStateOf(InlineScreenTranslationState()) }
+    var inlineTranslationJob by remember { mutableStateOf<Job?>(null) }
+    var focusedInlineBlock by remember { mutableStateOf<InlineTextBlock?>(null) }
+
     val packStatuses by OcrAndLensEngine.packStatusFlow.collectAsState()
     val hasGoogleTranslateApp = remember(context) {
         OcrAndLensEngine.isGoogleTranslateAppInstalled(context)
     }
 
-    // Pre-scan full screen text in background & refresh pack cache status
+    // Pre-scan full screen text (words + visual blocks + color sampling) & refresh pack cache
     LaunchedEffect(screenshotBitmap, scriptMode) {
         OcrAndLensEngine.refreshDownloadedPacksAsync()
-        fullScreenLines = OcrAndLensEngine.recognizeFullScreenLines(screenshotBitmap, scriptMode)
+        screenAnalysis = OcrAndLensEngine.analyzeFullScreen(screenshotBitmap, scriptMode)
     }
 
     // Clear copied indicator quickly
@@ -197,7 +218,75 @@ fun MinimalCircleOverlay(
         }
     }
 
-    fun completeSelection(
+    fun runInlineScreenTranslation(targetLang: String) {
+        inlineTranslationJob?.cancel()
+        inlineTranslationJob = scope.launch {
+            OcrAndLensEngine.translateBlocksInline(
+                blocks = screenAnalysis.blocks,
+                targetLangCode = targetLang,
+                dominantLangHint = screenAnalysis.dominantLanguageCode
+            ) { state ->
+                inlineTranslationState = state
+            }
+        }
+    }
+
+    // If user enabled Inline Translate before fullScreenAnalysis finished, trigger automatically once ready
+    LaunchedEffect(isInlineTranslateMode, screenAnalysis.blocks) {
+        if (isInlineTranslateMode && screenAnalysis.blocks.isNotEmpty() &&
+            inlineTranslationState.blockStates.isEmpty() && !inlineTranslationState.isTranslating
+        ) {
+            runInlineScreenTranslation(selectedTargetLang)
+        }
+    }
+
+    fun applyLensWordSelection(range: TextSelectionRange, runOcrTranslationNow: Boolean) {
+        selection = SelectionGeometry.LensWords(range)
+        if (!runOcrTranslationNow) return
+
+        val selectedWords = selectedWordsForRange(fullScreenWords, range)
+        val text = buildSelectedText(fullScreenWords, range)
+        val bounds = computeSelectionBitmapBounds(fullScreenWords, range) ?: return
+
+        val padPx = (8 * density.density).toInt()
+        val l = (bounds.left - padPx).coerceIn(0, screenshotBitmap.width - 1)
+        val t = (bounds.top - padPx).coerceIn(0, screenshotBitmap.height - 1)
+        val r = (bounds.right + padPx).coerceIn(l + 1, screenshotBitmap.width)
+        val b = (bounds.bottom + padPx).coerceIn(t + 1, screenshotBitmap.height)
+
+        croppedBitmap = Bitmap.createBitmap(
+            screenshotBitmap,
+            l,
+            t,
+            (r - l).coerceAtLeast(1),
+            (b - t).coerceAtLeast(1)
+        )
+        editableText = text
+        isAnalyzingOcr = false
+
+        val firstBlockId = selectedWords.firstOrNull()?.blockId
+        val blockLangHint = fullScreenBlocks.firstOrNull { it.id == firstBlockId }?.detectedLanguageCode
+        val lineCount = selectedWords.map { it.lineIndex }.distinct().size.coerceAtLeast(1)
+
+        scope.launch {
+            val resolvedLang = if (text.length >= 4) {
+                OcrAndLensEngine.detectLanguageCode(text) ?: blockLangHint
+            } else {
+                blockLangHint ?: OcrAndLensEngine.detectLanguageCode(text)
+            }
+            ocrResult = OcrRegionResult(
+                extractedText = text,
+                lineCount = lineCount,
+                detectedLanguageCode = resolvedLang,
+                detectedLanguageName = resolvedLang?.let { OcrAndLensEngine.formatLanguageName(it) }
+            )
+            if (text.isNotBlank()) {
+                runTranslation(text, resolvedLang, selectedTargetLang)
+            }
+        }
+    }
+
+    fun completeRegionSelection(
         canvasWidth: Float,
         canvasHeight: Float,
         leftPx: Float,
@@ -255,7 +344,10 @@ fun MinimalCircleOverlay(
         ocrResult = null
         editableText = ""
         isAnalyzingOcr = false
+        isDraggingTextHandle = false
+        translationJob?.cancel()
         translationState = TranslationState.Idle
+        focusedInlineBlock = null
     }
 
     BoxWithConstraints(
@@ -278,194 +370,370 @@ fun MinimalCircleOverlay(
             modifier = Modifier.fillMaxSize()
         )
 
-        // 2. Minimal black tint on non-selected area + pure white circle cutout
-        Canvas(
-            modifier = Modifier
-                .fillMaxSize()
-                .graphicsLayer { compositingStrategy = CompositingStrategy.Offscreen }
-                .pointerInput(screenshotBitmap, fullScreenLines) {
-                    detectTapGestures { tapOffset ->
-                        val bitmapX = tapOffset.x * screenshotBitmap.width / canvasWidthPx
-                        val bitmapY = tapOffset.y * screenshotBitmap.height / canvasHeightPx
-                        val hitPad = with(density) { 12.dp.toPx() } *
-                            (screenshotBitmap.width / canvasWidthPx)
+        // 2. Lens-style word selection highlights OR pure white circle cutout for objects
+        if (!isInlineTranslateMode) {
+            Canvas(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .graphicsLayer { compositingStrategy = CompositingStrategy.Offscreen }
+                    .pointerInput(screenshotBitmap, fullScreenWords) {
+                        detectTapGestures { tapOffset ->
+                            val bitmapX = tapOffset.x * screenshotBitmap.width / canvasWidthPx
+                            val bitmapY = tapOffset.y * screenshotBitmap.height / canvasHeightPx
+                            val hitPad = with(density) { 10.dp.toPx() } *
+                                (screenshotBitmap.width / canvasWidthPx)
 
-                        val tappedLine = fullScreenLines.firstOrNull { line ->
-                            val r = line.boundingBox
-                            bitmapX >= (r.left - hitPad) && bitmapX <= (r.right + hitPad) &&
-                                bitmapY >= (r.top - hitPad) && bitmapY <= (r.bottom + hitPad)
-                        }
-
-                        if (tappedLine != null) {
-                            val padScreen = with(density) { 6.dp.toPx() }
-                            val sx = canvasWidthPx / screenshotBitmap.width
-                            val sy = canvasHeightPx / screenshotBitmap.height
-                            val l = (tappedLine.boundingBox.left * sx - padScreen).coerceAtLeast(0f)
-                            val t = (tappedLine.boundingBox.top * sy - padScreen).coerceAtLeast(0f)
-                            val r = (tappedLine.boundingBox.right * sx + padScreen).coerceAtMost(canvasWidthPx)
-                            val b = (tappedLine.boundingBox.bottom * sy + padScreen).coerceAtMost(canvasHeightPx)
-                            selection = SelectionGeometry.BoxRect(l, t, r, b)
-                            completeSelection(canvasWidthPx, canvasHeightPx, l, t, r, b)
-                        } else {
-                            // Tap an object to create an instant crisp search circle around tap point
-                            val radius = with(density) { 54.dp.toPx() }
-                            val l = (tapOffset.x - radius).coerceAtLeast(0f)
-                            val t = (tapOffset.y - radius).coerceAtLeast(0f)
-                            val r = (tapOffset.x + radius).coerceAtMost(canvasWidthPx)
-                            val b = (tapOffset.y + radius).coerceAtMost(canvasHeightPx)
-                            selection = SelectionGeometry.BoxRect(l, t, r, b)
-                            completeSelection(canvasWidthPx, canvasHeightPx, l, t, r, b)
+                            val tappedWord = hitTestWord(fullScreenWords, bitmapX, bitmapY, hitPad)
+                            if (tappedWord != null) {
+                                if (hapticEnabled) {
+                                    haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                }
+                                applyLensWordSelection(
+                                    TextSelectionRange(tappedWord.globalIndex, tappedWord.globalIndex),
+                                    runOcrTranslationNow = true
+                                )
+                            } else {
+                                // Tap an object/image region to create an instant circle around tap point
+                                val radius = with(density) { 54.dp.toPx() }
+                                val l = (tapOffset.x - radius).coerceAtLeast(0f)
+                                val t = (tapOffset.y - radius).coerceAtLeast(0f)
+                                val r = (tapOffset.x + radius).coerceAtMost(canvasWidthPx)
+                                val b = (tapOffset.y + radius).coerceAtMost(canvasHeightPx)
+                                selection = SelectionGeometry.BoxRect(l, t, r, b)
+                                completeRegionSelection(canvasWidthPx, canvasHeightPx, l, t, r, b)
+                            }
                         }
                     }
-                }
-                .pointerInput(screenshotBitmap) {
-                    var currentPoints = mutableListOf<Offset>()
-                    detectDragGestures(
-                        onDragStart = { startOffset ->
-                            isDrawing = true
-                            croppedBitmap = null
-                            ocrResult = null
-                            translationState = TranslationState.Idle
-                            currentPoints = mutableListOf(startOffset)
-                            selection = SelectionGeometry.Freehand(currentPoints.toList(), isClosed = false)
-                        },
-                        onDrag = { change, _ ->
-                            change.consume()
-                            val pt = change.position
-                            val last = currentPoints.lastOrNull()
-                            if (last == null || (pt - last).getDistance() >= 4f) {
-                                currentPoints.add(pt)
+                    .pointerInput(screenshotBitmap, fullScreenWords) {
+                        var currentPoints = mutableListOf<Offset>()
+                        detectDragGestures(
+                            onDragStart = { startOffset ->
+                                isDrawing = true
+                                croppedBitmap = null
+                                ocrResult = null
+                                translationJob?.cancel()
+                                translationState = TranslationState.Idle
+                                currentPoints = mutableListOf(startOffset)
                                 selection = SelectionGeometry.Freehand(currentPoints.toList(), isClosed = false)
-                            }
-                        },
-                        onDragEnd = {
-                            isDrawing = false
-                            if (currentPoints.size < 3) {
-                                return@detectDragGestures
-                            }
-                            var minX = Float.MAX_VALUE
-                            var minY = Float.MAX_VALUE
-                            var maxX = Float.MIN_VALUE
-                            var maxY = Float.MIN_VALUE
-                            for (p in currentPoints) {
-                                minX = min(minX, p.x)
-                                minY = min(minY, p.y)
-                                maxX = max(maxX, p.x)
-                                maxY = max(maxY, p.y)
-                            }
+                            },
+                            onDrag = { change, _ ->
+                                change.consume()
+                                val pt = change.position
+                                val last = currentPoints.lastOrNull()
+                                if (last == null || (pt - last).getDistance() >= 4f) {
+                                    currentPoints.add(pt)
+                                    selection = SelectionGeometry.Freehand(currentPoints.toList(), isClosed = false)
+                                }
+                            },
+                            onDragEnd = {
+                                isDrawing = false
+                                if (currentPoints.size < 3) {
+                                    return@detectDragGestures
+                                }
+                                val sx = canvasWidthPx / screenshotBitmap.width
+                                val sy = canvasHeightPx / screenshotBitmap.height
+                                val matchedWords = matchTextBrushToWordRange(
+                                    screenPoints = currentPoints,
+                                    words = fullScreenWords,
+                                    sx = sx,
+                                    sy = sy,
+                                    density = density
+                                )
+                                if (matchedWords != null) {
+                                    if (hapticEnabled) {
+                                        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                    }
+                                    applyLensWordSelection(matchedWords, runOcrTranslationNow = true)
+                                    return@detectDragGestures
+                                }
 
-                            val width = maxX - minX
-                            val height = maxY - minY
-                            if (width < tapSlopPx && height < tapSlopPx) {
-                                return@detectDragGestures
-                            }
+                                var minX = Float.MAX_VALUE
+                                var minY = Float.MAX_VALUE
+                                var maxX = Float.MIN_VALUE
+                                var maxY = Float.MIN_VALUE
+                                for (p in currentPoints) {
+                                    minX = min(minX, p.x)
+                                    minY = min(minY, p.y)
+                                    maxX = max(maxX, p.x)
+                                    maxY = max(maxY, p.y)
+                                }
 
-                            // If user scribbled horizontally across a line of text, expand vertically into a clean box
-                            if (height < minBoxHalfHeightPx && width > minBoxHalfHeightPx * 1.4f) {
-                                val cy = (minY + maxY) / 2f
-                                val l = minX.coerceAtLeast(0f)
-                                val t = (cy - minBoxHalfHeightPx).coerceAtLeast(0f)
-                                val r = maxX.coerceAtMost(canvasWidthPx)
-                                val b = (cy + minBoxHalfHeightPx).coerceAtMost(canvasHeightPx)
-                                selection = SelectionGeometry.BoxRect(l, t, r, b)
-                                completeSelection(canvasWidthPx, canvasHeightPx, l, t, r, b)
-                            } else {
-                                selection = SelectionGeometry.Freehand(currentPoints.toList(), isClosed = true)
-                                completeSelection(
-                                    canvasWidthPx,
-                                    canvasHeightPx,
-                                    minX.coerceAtLeast(0f),
-                                    minY.coerceAtLeast(0f),
-                                    maxX.coerceAtMost(canvasWidthPx),
-                                    maxY.coerceAtMost(canvasHeightPx)
+                                val width = maxX - minX
+                                val height = maxY - minY
+                                if (width < tapSlopPx && height < tapSlopPx) {
+                                    return@detectDragGestures
+                                }
+
+                                if (height < minBoxHalfHeightPx && width > minBoxHalfHeightPx * 1.4f) {
+                                    val cy = (minY + maxY) / 2f
+                                    val l = minX.coerceAtLeast(0f)
+                                    val t = (cy - minBoxHalfHeightPx).coerceAtLeast(0f)
+                                    val r = maxX.coerceAtMost(canvasWidthPx)
+                                    val b = (cy + minBoxHalfHeightPx).coerceAtMost(canvasHeightPx)
+                                    selection = SelectionGeometry.BoxRect(l, t, r, b)
+                                    completeRegionSelection(canvasWidthPx, canvasHeightPx, l, t, r, b)
+                                } else {
+                                    selection = SelectionGeometry.Freehand(currentPoints.toList(), isClosed = true)
+                                    completeRegionSelection(
+                                        canvasWidthPx,
+                                        canvasHeightPx,
+                                        minX.coerceAtLeast(0f),
+                                        minY.coerceAtLeast(0f),
+                                        maxX.coerceAtMost(canvasWidthPx),
+                                        maxY.coerceAtMost(canvasHeightPx)
+                                    )
+                                }
+                            },
+                            onDragCancel = {
+                                isDrawing = false
+                                resetSelection()
+                            }
+                        )
+                    }
+            ) {
+                val activeSel = selection
+                // Lighter tint for Lens word selection so surrounding context stays crisp; deeper tint for circle cutout
+                val tintAlpha = when (activeSel) {
+                    is SelectionGeometry.LensWords -> 0.42f
+                    null -> if (fullScreenWords.isNotEmpty()) 0.34f else 0.74f
+                    else -> 0.74f
+                }
+                drawRect(color = Color.Black.copy(alpha = tintAlpha))
+
+                // Subtle Lens-like word pills before selection so selectable text is obvious without clutter
+                if (activeSel == null && fullScreenWords.isNotEmpty()) {
+                    val sx = size.width / screenshotBitmap.width
+                    val sy = size.height / screenshotBitmap.height
+                    val wordCorner = 4.dp.toPx()
+                    val pad = 1.5.dp.toPx()
+                    for (word in fullScreenWords) {
+                        val b = word.boundingBox
+                        val left = b.left * sx - pad
+                        val top = b.top * sy - pad
+                        val w = b.width() * sx + pad * 2f
+                        val h = b.height() * sy + pad * 2f
+                        drawRoundRect(
+                            color = Color.Transparent,
+                            topLeft = Offset(left, top),
+                            size = Size(w, h),
+                            cornerRadius = CornerRadius(wordCorner, wordCorner),
+                            blendMode = BlendMode.Clear
+                        )
+                        drawRoundRect(
+                            color = Color.White.copy(alpha = 0.16f),
+                            topLeft = Offset(left, top),
+                            size = Size(w, h),
+                            cornerRadius = CornerRadius(wordCorner, wordCorner)
+                        )
+                    }
+                }
+
+                when (activeSel) {
+                    is SelectionGeometry.LensWords -> {
+                        val sx = size.width / screenshotBitmap.width
+                        val sy = size.height / screenshotBitmap.height
+                        val pillCorner = 5.dp.toPx()
+                        val padX = 3.dp.toPx()
+                        val padY = 2.dp.toPx()
+                        val chosenWords = selectedWordsForRange(fullScreenWords, activeSel.range)
+                        for (word in chosenWords) {
+                            val b = word.boundingBox
+                            val l = b.left * sx - padX
+                            val t = b.top * sy - padY
+                            val w = b.width() * sx + padX * 2f
+                            val h = b.height() * sy + padY * 2f
+                            val pillPath = Path().apply {
+                                addRoundRect(
+                                    RoundRect(
+                                        left = l,
+                                        top = t,
+                                        right = l + w,
+                                        bottom = t + h,
+                                        cornerRadius = CornerRadius(pillCorner, pillCorner)
+                                    )
                                 )
                             }
-                        },
-                        onDragCancel = {
-                            isDrawing = false
-                            resetSelection()
+                            drawPath(
+                                path = pillPath,
+                                color = Color.Transparent,
+                                blendMode = BlendMode.Clear
+                            )
+                            drawPath(
+                                path = pillPath,
+                                color = ElectricCyan.copy(alpha = 0.28f)
+                            )
+                            drawPath(
+                                path = pillPath,
+                                color = ElectricCyan.copy(alpha = 0.85f),
+                                style = Stroke(width = 1.2.dp.toPx())
+                            )
                         }
-                    )
-                }
-        ) {
-            // Black tint over entire non-selected area
-            drawRect(color = Color.Black.copy(alpha = 0.74f))
+                    }
 
-            // Subtle faint guides for tap-able OCR lines before a selection is drawn
-            if (selection == null && fullScreenLines.isNotEmpty()) {
-                val sx = size.width / screenshotBitmap.width
-                val sy = size.height / screenshotBitmap.height
-                val guideStroke = 1.dp.toPx()
-                for (line in fullScreenLines) {
-                    val b = line.boundingBox
-                    drawRoundRect(
-                        color = Color.White.copy(alpha = 0.16f),
-                        topLeft = Offset(b.left * sx, b.top * sy),
-                        size = Size(b.width() * sx, b.height() * sy),
-                        cornerRadius = CornerRadius(4.dp.toPx(), 4.dp.toPx()),
-                        style = Stroke(width = guideStroke)
-                    )
-                }
-            }
-
-            when (val sel = selection) {
-                is SelectionGeometry.Freehand -> {
-                    if (sel.points.size >= 2) {
-                        val openPath = Path().apply {
-                            moveTo(sel.points.first().x, sel.points.first().y)
-                            for (i in 1 until sel.points.size) {
-                                lineTo(sel.points[i].x, sel.points[i].y)
+                    is SelectionGeometry.Freehand -> {
+                        if (activeSel.points.size >= 2) {
+                            val openPath = Path().apply {
+                                moveTo(activeSel.points.first().x, activeSel.points.first().y)
+                                for (i in 1 until activeSel.points.size) {
+                                    lineTo(activeSel.points[i].x, activeSel.points[i].y)
+                                }
                             }
+                            val closedPath = Path().apply {
+                                addPath(openPath)
+                                close()
+                            }
+                            drawPath(
+                                path = closedPath,
+                                color = Color.Transparent,
+                                blendMode = BlendMode.Clear
+                            )
+                            drawPath(
+                                path = if (activeSel.isClosed) closedPath else openPath,
+                                color = Color.White,
+                                style = Stroke(
+                                    width = strokeWidthPx,
+                                    cap = StrokeCap.Round,
+                                    join = StrokeJoin.Round
+                                )
+                            )
                         }
-                        val closedPath = Path().apply {
-                            addPath(openPath)
-                            close()
+                    }
+
+                    is SelectionGeometry.BoxRect -> {
+                        val boxPath = Path().apply {
+                            addRoundRect(
+                                RoundRect(
+                                    left = activeSel.left,
+                                    top = activeSel.top,
+                                    right = activeSel.right,
+                                    bottom = activeSel.bottom,
+                                    cornerRadius = CornerRadius(boxCornerPx, boxCornerPx)
+                                )
+                            )
                         }
-                        // Clear black tint inside the selected region
                         drawPath(
-                            path = closedPath,
+                            path = boxPath,
                             color = Color.Transparent,
                             blendMode = BlendMode.Clear
                         )
-                        // Draw crisp pure white selection stroke
                         drawPath(
-                            path = if (sel.isClosed) closedPath else openPath,
+                            path = boxPath,
                             color = Color.White,
-                            style = Stroke(
-                                width = strokeWidthPx,
-                                cap = StrokeCap.Round,
-                                join = StrokeJoin.Round
-                            )
+                            style = Stroke(width = strokeWidthPx)
                         )
                     }
-                }
 
-                is SelectionGeometry.BoxRect -> {
-                    val boxPath = Path().apply {
-                        addRoundRect(
-                            androidx.compose.ui.geometry.RoundRect(
-                                left = sel.left,
-                                top = sel.top,
-                                right = sel.right,
-                                bottom = sel.bottom,
-                                cornerRadius = CornerRadius(boxCornerPx, boxCornerPx)
-                            )
-                        )
-                    }
-                    drawPath(
-                        path = boxPath,
-                        color = Color.Transparent,
-                        blendMode = BlendMode.Clear
-                    )
-                    drawPath(
-                        path = boxPath,
-                        color = Color.White,
-                        style = Stroke(width = strokeWidthPx)
-                    )
+                    null -> Unit
                 }
-
-                null -> Unit
             }
+
+            // Draggable Lens Teardrop Selection Handles when words are selected
+            val lensSel = selection as? SelectionGeometry.LensWords
+            if (lensSel != null && fullScreenWords.isNotEmpty()) {
+                val chosenWords = selectedWordsForRange(fullScreenWords, lensSel.range)
+                if (chosenWords.isNotEmpty()) {
+                    val sx = canvasWidthPx / screenshotBitmap.width
+                    val sy = canvasHeightPx / screenshotBitmap.height
+                    val startWord = chosenWords.first()
+                    val endWord = chosenWords.last()
+
+                    LensTeardropHandle(
+                        anchorOffset = Offset(
+                            startWord.boundingBox.left * sx,
+                            startWord.boundingBox.bottom * sy
+                        ),
+                        isStartHandle = true,
+                        canvasWidthPx = canvasWidthPx,
+                        canvasHeightPx = canvasHeightPx,
+                        onDragDeltaScreen = { screenPt ->
+                            val nearest = findNearestWordForHandle(
+                                words = fullScreenWords,
+                                bitmapX = screenPt.x / sx,
+                                bitmapY = screenPt.y / sy
+                            )
+                            val latestRange = (selection as? SelectionGeometry.LensWords)?.range ?: lensSel.range
+                            if (nearest != null) {
+                                val endBound = latestRange.maxIndex
+                                val nextRange = TextSelectionRange(
+                                    startIndex = min(nearest.globalIndex, endBound),
+                                    endIndex = endBound
+                                )
+                                if (nextRange != latestRange) {
+                                    if (hapticEnabled) {
+                                        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                    }
+                                    applyLensWordSelection(nextRange, runOcrTranslationNow = false)
+                                }
+                            }
+                        },
+                        onDragStateChanged = { dragging ->
+                            isDraggingTextHandle = dragging
+                            if (!dragging) {
+                                val latest = (selection as? SelectionGeometry.LensWords)?.range
+                                if (latest != null) {
+                                    applyLensWordSelection(latest, runOcrTranslationNow = true)
+                                }
+                            }
+                        },
+                        testTagName = "lens_start_handle"
+                    )
+
+                    LensTeardropHandle(
+                        anchorOffset = Offset(
+                            endWord.boundingBox.right * sx,
+                            endWord.boundingBox.bottom * sy
+                        ),
+                        isStartHandle = false,
+                        canvasWidthPx = canvasWidthPx,
+                        canvasHeightPx = canvasHeightPx,
+                        onDragDeltaScreen = { screenPt ->
+                            val nearest = findNearestWordForHandle(
+                                words = fullScreenWords,
+                                bitmapX = screenPt.x / sx,
+                                bitmapY = screenPt.y / sy
+                            )
+                            val latestRange = (selection as? SelectionGeometry.LensWords)?.range ?: lensSel.range
+                            if (nearest != null) {
+                                val startBound = latestRange.minIndex
+                                val nextRange = TextSelectionRange(
+                                    startIndex = startBound,
+                                    endIndex = max(nearest.globalIndex, startBound)
+                                )
+                                if (nextRange != latestRange) {
+                                    if (hapticEnabled) {
+                                        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                    }
+                                    applyLensWordSelection(nextRange, runOcrTranslationNow = false)
+                                }
+                            }
+                        },
+                        onDragStateChanged = { dragging ->
+                            isDraggingTextHandle = dragging
+                            if (!dragging) {
+                                val latest = (selection as? SelectionGeometry.LensWords)?.range
+                                if (latest != null) {
+                                    applyLensWordSelection(latest, runOcrTranslationNow = true)
+                                }
+                            }
+                        },
+                        testTagName = "lens_end_handle"
+                    )
+                }
+            }
+        } else {
+            // 2b. Full-screen Lens Inline Translation Layer
+            InlineTranslatedBlocksLayer(
+                blocks = fullScreenBlocks,
+                translationState = inlineTranslationState,
+                bitmapWidth = screenshotBitmap.width,
+                bitmapHeight = screenshotBitmap.height,
+                showOriginal = showOriginalScreen,
+                selectedBlockId = focusedInlineBlock?.id,
+                onBlockTapped = { block, _ ->
+                    focusedInlineBlock = if (focusedInlineBlock?.id == block.id) null else block
+                },
+                modifier = Modifier.fillMaxSize()
+            )
         }
 
         // 3. Minimalist top controls
@@ -482,9 +750,9 @@ fun MinimalCircleOverlay(
                 shape = RoundedCornerShape(999.dp),
                 border = BorderStroke(1.dp, Color(0x33FFFFFF)),
                 modifier = Modifier
-                    .heightIn(min = 40.dp)
+                    .heightIn(min = 44.dp)
                     .then(
-                        if (selection != null) {
+                        if (selection != null && !isInlineTranslateMode) {
                             Modifier.clickable { resetSelection() }
                         } else {
                             Modifier
@@ -493,64 +761,176 @@ fun MinimalCircleOverlay(
                     .testTag("overlay_status_pill")
             ) {
                 Row(
-                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
                     verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    horizontalArrangement = Arrangement.spacedBy(7.dp)
                 ) {
-                    if (selection != null) {
+                    if (isInlineTranslateMode) {
+                        Icon(
+                            imageVector = Icons.Rounded.Translate,
+                            contentDescription = null,
+                            tint = ElectricCyan,
+                            modifier = Modifier.size(15.dp)
+                        )
+                        Text(
+                            text = if (showOriginalScreen) "Original screen" else "Inline Translate",
+                            color = Color.White,
+                            fontFamily = SpaceGroteskFamily,
+                            fontWeight = FontWeight.Medium,
+                            fontSize = 12.5.sp
+                        )
+                    } else if (selection != null) {
                         Icon(
                             imageVector = Icons.Rounded.Refresh,
-                            contentDescription = "Redraw circle",
+                            contentDescription = "Clear selection",
                             tint = Color.White,
                             modifier = Modifier.size(16.dp)
                         )
                         Text(
-                            text = "Redraw",
+                            text = "Reset",
                             color = Color.White,
                             fontFamily = SpaceGroteskFamily,
                             fontWeight = FontWeight.Medium,
-                            fontSize = 13.sp
+                            fontSize = 12.5.sp
                         )
                     } else {
                         Box(
                             modifier = Modifier
                                 .size(8.dp)
                                 .clip(CircleShape)
-                                .background(Color.White)
+                                .background(ElectricCyan)
                         )
                         Text(
-                            text = "Circle anything or tap text",
+                            text = "Tap text, swipe, or circle",
                             color = Color.White,
                             fontFamily = InterFamily,
-                            fontSize = 13.sp
+                            fontSize = 12.5.sp
                         )
                     }
                 }
             }
 
-            Surface(
-                color = Color(0xCC121216),
-                shape = CircleShape,
-                border = BorderStroke(1.dp, Color(0x33FFFFFF))
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                IconButton(
-                    onClick = onDismiss,
+                val targetShort = SupportedTargetLanguages.firstOrNull {
+                    it.code == selectedTargetLang
+                }?.shortCode ?: selectedTargetLang.uppercase()
+
+                Surface(
+                    color = if (isInlineTranslateMode) ElectricCyan else Color(0xCC121216),
+                    shape = RoundedCornerShape(999.dp),
+                    border = BorderStroke(
+                        1.dp,
+                        if (isInlineTranslateMode) ElectricCyan else Color(0x44FFFFFF)
+                    ),
                     modifier = Modifier
-                        .size(48.dp)
-                        .testTag("overlay_close_button")
+                        .heightIn(min = 44.dp)
+                        .clickable {
+                            val next = !isInlineTranslateMode
+                            isInlineTranslateMode = next
+                            showOriginalScreen = false
+                            focusedInlineBlock = null
+                            if (next) {
+                                resetSelection()
+                                runInlineScreenTranslation(selectedTargetLang)
+                            } else {
+                                inlineTranslationJob?.cancel()
+                            }
+                        }
+                        .testTag("overlay_inline_translate_button")
                 ) {
-                    Icon(
-                        imageVector = Icons.Rounded.Close,
-                        contentDescription = "Close overlay",
-                        tint = Color.White
-                    )
+                    Row(
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(5.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Rounded.Translate,
+                            contentDescription = "Toggle inline screen translate",
+                            tint = if (isInlineTranslateMode) Color.Black else ElectricCyan,
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Text(
+                            text = if (isInlineTranslateMode) "Inline · $targetShort" else "Translate",
+                            color = if (isInlineTranslateMode) Color.Black else Color.White,
+                            fontFamily = SpaceGroteskFamily,
+                            fontWeight = FontWeight.SemiBold,
+                            fontSize = 12.5.sp
+                        )
+                    }
+                }
+
+                Surface(
+                    color = Color(0xCC121216),
+                    shape = CircleShape,
+                    border = BorderStroke(1.dp, Color(0x33FFFFFF))
+                ) {
+                    IconButton(
+                        onClick = onDismiss,
+                        modifier = Modifier
+                            .size(48.dp)
+                            .testTag("overlay_close_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Rounded.Close,
+                            contentDescription = "Close overlay",
+                            tint = Color.White
+                        )
+                    }
                 }
             }
         }
 
-        // 4. Compact High-Efficiency Results Sheet (OCR, Translation, Lens & Web Search)
+        // 4a. Inline Screen Translation Controls Bar
         AnimatedVisibility(
-            visible = croppedBitmap != null && !isDrawing,
+            visible = isInlineTranslateMode,
+            enter = slideInVertically { it } + fadeIn(),
+            exit = slideOutVertically { it } + fadeOut(),
+            modifier = Modifier.align(Alignment.BottomCenter)
+        ) {
+            InlineTranslateBottomBar(
+                selectedTargetLang = selectedTargetLang,
+                packStatuses = packStatuses,
+                hasGoogleTranslateApp = hasGoogleTranslateApp,
+                inlineTranslationState = inlineTranslationState,
+                showOriginal = showOriginalScreen,
+                focusedBlock = focusedInlineBlock,
+                fallbackScreenText = fullScreenBlocks.joinToString("\n") { it.text },
+                dominantLangHint = screenAnalysis.dominantLanguageCode,
+                copiedLabel = copiedLabel,
+                onToggleShowOriginal = { showOriginalScreen = !showOriginalScreen },
+                onSelectTargetLanguage = { code ->
+                    selectedTargetLang = code
+                    onTargetLanguageChanged(code)
+                    runInlineScreenTranslation(code)
+                },
+                onRetryInline = { runInlineScreenTranslation(selectedTargetLang) },
+                onCopy = { label, value -> copyToClipboard(label, value) },
+                onWebSearch = { query ->
+                    if (OcrAndLensEngine.launchWebSearch(context, query)) {
+                        onExternalActionLaunched()
+                    }
+                },
+                onOpenGoogleTranslate = { textToOpen, srcHint ->
+                    if (
+                        OcrAndLensEngine.launchGoogleTranslateFallback(
+                            context = context,
+                            text = textToOpen,
+                            targetLangCode = selectedTargetLang,
+                            sourceLangCodeHint = srcHint
+                        )
+                    ) {
+                        onExternalActionLaunched()
+                    }
+                }
+            )
+        }
+
+        // 4b. Compact High-Efficiency Results Sheet (OCR, Translation, Lens & Web Search)
+        AnimatedVisibility(
+            visible = croppedBitmap != null && !isDrawing && !isDraggingTextHandle && !isInlineTranslateMode,
             enter = slideInVertically { it } + fadeIn(),
             exit = slideOutVertically { it } + fadeOut(),
             modifier = Modifier.align(Alignment.BottomCenter)
@@ -564,6 +944,17 @@ fun MinimalCircleOverlay(
                         editableText = updated
                     },
                     isAnalyzingOcr = isAnalyzingOcr,
+                    canSelectAllWords = fullScreenWords.isNotEmpty() &&
+                        (selection as? SelectionGeometry.LensWords)?.range !=
+                        TextSelectionRange(0, fullScreenWords.lastIndex),
+                    onSelectAllWords = {
+                        if (fullScreenWords.isNotEmpty()) {
+                            applyLensWordSelection(
+                                TextSelectionRange(0, fullScreenWords.lastIndex),
+                                runOcrTranslationNow = true
+                            )
+                        }
+                    },
                     selectedTargetLang = selectedTargetLang,
                     packStatuses = packStatuses,
                     hasGoogleTranslateApp = hasGoogleTranslateApp,
@@ -587,6 +978,12 @@ fun MinimalCircleOverlay(
                             ocrResult?.detectedLanguageCode,
                             selectedTargetLang
                         )
+                    },
+                    onSwitchToInlineTranslate = {
+                        isInlineTranslateMode = true
+                        showOriginalScreen = false
+                        resetSelection()
+                        runInlineScreenTranslation(selectedTargetLang)
                     },
                     onLensLookup = {
                         if (OcrAndLensEngine.launchGoogleLensLookup(context, crop)) {
@@ -623,6 +1020,8 @@ private fun CompactLookupSheet(
     editableText: String,
     onEditableTextChange: (String) -> Unit,
     isAnalyzingOcr: Boolean,
+    canSelectAllWords: Boolean,
+    onSelectAllWords: () -> Unit,
     selectedTargetLang: String,
     packStatuses: Map<String, ModelPackStatus>,
     hasGoogleTranslateApp: Boolean,
@@ -631,6 +1030,7 @@ private fun CompactLookupSheet(
     onCopy: (label: String, text: String) -> Unit,
     onSelectTargetLanguage: (String) -> Unit,
     onRetranslate: () -> Unit,
+    onSwitchToInlineTranslate: () -> Unit,
     onLensLookup: () -> Unit,
     onWebSearch: (String) -> Unit,
     onWebTranslate: (String) -> Unit
@@ -788,31 +1188,62 @@ private fun CompactLookupSheet(
                             }
                         }
 
-                        if (editableText.isNotBlank()) {
-                            Surface(
-                                color = if (copiedLabel == "ocr") Color(0xFF14532D) else Color(0xFF252530),
-                                shape = RoundedCornerShape(8.dp),
-                                modifier = Modifier
-                                    .clickable { onCopy("ocr", editableText) }
-                                    .testTag("copy_ocr_button")
-                            ) {
-                                Row(
-                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            if (canSelectAllWords) {
+                                Surface(
+                                    color = Color(0xFF252530),
+                                    shape = RoundedCornerShape(8.dp),
+                                    modifier = Modifier
+                                        .clickable { onSelectAllWords() }
+                                        .testTag("select_all_words_button")
                                 ) {
-                                    Icon(
-                                        imageVector = if (copiedLabel == "ocr") Icons.Rounded.Check else Icons.Rounded.ContentCopy,
-                                        contentDescription = "Copy extracted text",
-                                        tint = Color.White,
-                                        modifier = Modifier.size(14.dp)
-                                    )
-                                    Text(
-                                        text = if (copiedLabel == "ocr") "Copied" else "Copy",
-                                        color = Color.White,
-                                        fontFamily = SpaceGroteskFamily,
-                                        fontSize = 12.sp
-                                    )
+                                    Row(
+                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Rounded.SelectAll,
+                                            contentDescription = "Select all text on screen",
+                                            tint = ElectricCyan,
+                                            modifier = Modifier.size(14.dp)
+                                        )
+                                        Text(
+                                            text = "All",
+                                            color = Color.White,
+                                            fontFamily = SpaceGroteskFamily,
+                                            fontSize = 12.sp
+                                        )
+                                    }
+                                }
+                            }
+
+                            if (editableText.isNotBlank()) {
+                                Surface(
+                                    color = if (copiedLabel == "ocr") Color(0xFF14532D) else Color(0xFF252530),
+                                    shape = RoundedCornerShape(8.dp),
+                                    modifier = Modifier
+                                        .clickable { onCopy("ocr", editableText) }
+                                        .testTag("copy_ocr_button")
+                                ) {
+                                    Row(
+                                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                                    ) {
+                                        Icon(
+                                            imageVector = if (copiedLabel == "ocr") Icons.Rounded.Check else Icons.Rounded.ContentCopy,
+                                            contentDescription = "Copy extracted text",
+                                            tint = Color.White,
+                                            modifier = Modifier.size(14.dp)
+                                        )
+                                        Text(
+                                            text = if (copiedLabel == "ocr") "Copied" else "Copy",
+                                            color = Color.White,
+                                            fontFamily = SpaceGroteskFamily,
+                                            fontSize = 12.sp
+                                        )
+                                    }
                                 }
                             }
                         }
@@ -1127,6 +1558,33 @@ private fun CompactLookupSheet(
                                                 )
                                             }
                                         }
+
+                                        Surface(
+                                            color = Color(0xFF252530),
+                                            shape = RoundedCornerShape(8.dp),
+                                            modifier = Modifier
+                                                .clickable { onSwitchToInlineTranslate() }
+                                                .testTag("apply_inline_translate_button")
+                                        ) {
+                                            Row(
+                                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                                                verticalAlignment = Alignment.CenterVertically,
+                                                horizontalArrangement = Arrangement.spacedBy(4.dp)
+                                            ) {
+                                                Icon(
+                                                    imageVector = Icons.Rounded.Translate,
+                                                    contentDescription = "Replace inline on screen",
+                                                    tint = ElectricCyan,
+                                                    modifier = Modifier.size(13.dp)
+                                                )
+                                                Text(
+                                                    text = "Inline",
+                                                    color = Color.White,
+                                                    fontFamily = SpaceGroteskFamily,
+                                                    fontSize = 12.sp
+                                                )
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -1195,6 +1653,347 @@ private fun CompactLookupSheet(
                             }
 
                             TranslationState.Idle -> Unit
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun InlineTranslateBottomBar(
+    selectedTargetLang: String,
+    packStatuses: Map<String, ModelPackStatus>,
+    hasGoogleTranslateApp: Boolean,
+    inlineTranslationState: InlineScreenTranslationState,
+    showOriginal: Boolean,
+    focusedBlock: InlineTextBlock?,
+    fallbackScreenText: String,
+    dominantLangHint: String?,
+    copiedLabel: String?,
+    onToggleShowOriginal: () -> Unit,
+    onSelectTargetLanguage: (String) -> Unit,
+    onRetryInline: () -> Unit,
+    onCopy: (label: String, value: String) -> Unit,
+    onWebSearch: (String) -> Unit,
+    onOpenGoogleTranslate: (text: String, sourceHint: String?) -> Unit
+) {
+    val translateLabel = if (hasGoogleTranslateApp) "Google Translate" else "Translate Web"
+    val translatedCount = inlineTranslationState.blockStates.values.count {
+        it is InlineBlockStatus.Translated
+    }
+
+    Surface(
+        color = Color(0xF2101014),
+        shape = RoundedCornerShape(topStart = 20.dp, topEnd = 20.dp),
+        border = BorderStroke(1.dp, Color(0xFF282832)),
+        modifier = Modifier
+            .fillMaxWidth()
+            .navigationBarsPadding()
+            .testTag("inline_translate_bar")
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 12.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    modifier = Modifier.weight(1f)
+                ) {
+                    if (inlineTranslationState.isTranslating) {
+                        CircularProgressIndicator(
+                            color = ElectricCyan,
+                            strokeWidth = 2.dp,
+                            modifier = Modifier.size(16.dp)
+                        )
+                    } else {
+                        Icon(
+                            imageVector = Icons.Rounded.Translate,
+                            contentDescription = null,
+                            tint = ElectricCyan,
+                            modifier = Modifier.size(17.dp)
+                        )
+                    }
+                    Text(
+                        text = when {
+                            inlineTranslationState.isDownloadingPacks ->
+                                "Downloading ${inlineTranslationState.missingPacksLabel}…"
+                            inlineTranslationState.isTranslating ->
+                                "Replacing text inline ($translatedCount done)…"
+                            inlineTranslationState.errorMessage != null ->
+                                "Offline pack unavailable"
+                            translatedCount > 0 ->
+                                "$translatedCount block${if (translatedCount == 1) "" else "s"} replaced inline"
+                            else ->
+                                "All detected text matches target language"
+                        },
+                        color = Color.White,
+                        fontFamily = SpaceGroteskFamily,
+                        fontWeight = FontWeight.Medium,
+                        fontSize = 13.sp,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+
+                Surface(
+                    color = if (showOriginal) ElectricCyan else Color(0xFF252530),
+                    shape = RoundedCornerShape(10.dp),
+                    modifier = Modifier
+                        .heightIn(min = 48.dp)
+                        .clickable { onToggleShowOriginal() }
+                        .testTag("toggle_original_text_button")
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(5.dp)
+                    ) {
+                        Icon(
+                            imageVector = if (showOriginal) Icons.Rounded.VisibilityOff else Icons.Rounded.Visibility,
+                            contentDescription = "Toggle original screen text",
+                            tint = if (showOriginal) Color.Black else Color.White,
+                            modifier = Modifier.size(15.dp)
+                        )
+                        Text(
+                            text = if (showOriginal) "Translated" else "Original",
+                            color = if (showOriginal) Color.Black else Color.White,
+                            fontFamily = SpaceGroteskFamily,
+                            fontWeight = FontWeight.Medium,
+                            fontSize = 12.sp
+                        )
+                    }
+                }
+            }
+
+            if (inlineTranslationState.isDownloadingPacks) {
+                LinearProgressIndicator(
+                    color = ElectricCyan,
+                    trackColor = Color(0xFF2B2B36),
+                    modifier = Modifier.fillMaxWidth()
+                )
+                val targetText = focusedBlock?.text?.ifBlank { null } ?: fallbackScreenText
+                if (targetText.isNotBlank()) {
+                    OutlinedButton(
+                        onClick = {
+                            onOpenGoogleTranslate(
+                                targetText,
+                                focusedBlock?.detectedLanguageCode ?: dominantLangHint
+                            )
+                        },
+                        border = BorderStroke(1.dp, ElectricCyan.copy(alpha = 0.7f)),
+                        colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.White),
+                        shape = RoundedCornerShape(10.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(min = 48.dp)
+                            .testTag("inline_downloading_fallback_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.AutoMirrored.Rounded.OpenInNew,
+                            contentDescription = null,
+                            tint = ElectricCyan,
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Spacer(Modifier.width(6.dp))
+                        Text(
+                            text = "Use $translateLabel Now",
+                            fontFamily = SpaceGroteskFamily,
+                            fontWeight = FontWeight.Medium,
+                            fontSize = 12.5.sp
+                        )
+                    }
+                }
+            }
+
+            inlineTranslationState.errorMessage?.let { err ->
+                Text(
+                    text = err,
+                    color = Color(0xFFFCA5A5),
+                    fontFamily = InterFamily,
+                    fontSize = 12.sp
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    OutlinedButton(
+                        onClick = onRetryInline,
+                        shape = RoundedCornerShape(10.dp),
+                        modifier = Modifier
+                            .weight(1f)
+                            .heightIn(min = 48.dp)
+                    ) {
+                        Text("Retry Offline", fontSize = 12.sp, color = Color.White)
+                    }
+                    Button(
+                        onClick = {
+                            val targetText = focusedBlock?.text?.ifBlank { null } ?: fallbackScreenText
+                            if (targetText.isNotBlank()) {
+                                onOpenGoogleTranslate(
+                                    targetText,
+                                    focusedBlock?.detectedLanguageCode ?: dominantLangHint
+                                )
+                            }
+                        },
+                        enabled = (focusedBlock?.text?.isNotBlank() == true) || fallbackScreenText.isNotBlank(),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = ElectricCyan,
+                            contentColor = Color.Black
+                        ),
+                        shape = RoundedCornerShape(10.dp),
+                        modifier = Modifier
+                            .weight(1.3f)
+                            .heightIn(min = 48.dp)
+                            .testTag("inline_error_fallback_button")
+                    ) {
+                        Text(translateLabel, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                    }
+                }
+            }
+
+            // Focused block inspector when user taps an inline-translated block
+            if (focusedBlock != null) {
+                val st = inlineTranslationState.blockStates[focusedBlock.id]
+                val translatedStr = (st as? InlineBlockStatus.Translated)?.text
+                Surface(
+                    color = Color(0xFF17171D),
+                    shape = RoundedCornerShape(12.dp),
+                    border = BorderStroke(1.dp, Color(0xFF2B2B36)),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(
+                        modifier = Modifier.padding(10.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        if (translatedStr != null) {
+                            Text(
+                                text = translatedStr,
+                                color = Color.White,
+                                fontFamily = InterFamily,
+                                fontSize = 13.5.sp
+                            )
+                        }
+                        Text(
+                            text = focusedBlock.text,
+                            color = Color(0xFF9CA3AF),
+                            fontFamily = JetBrainsMonoFamily,
+                            fontSize = 11.5.sp,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            val copyValue = translatedStr ?: focusedBlock.text
+                            Surface(
+                                color = if (copiedLabel == "inline") Color(0xFF14532D) else Color(0xFF252530),
+                                shape = RoundedCornerShape(8.dp),
+                                modifier = Modifier.clickable { onCopy("inline", copyValue) }
+                            ) {
+                                Text(
+                                    text = if (copiedLabel == "inline") "Copied" else "Copy",
+                                    color = Color.White,
+                                    fontFamily = SpaceGroteskFamily,
+                                    fontSize = 12.sp,
+                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                                )
+                            }
+                            Surface(
+                                color = Color(0xFF252530),
+                                shape = RoundedCornerShape(8.dp),
+                                modifier = Modifier.clickable { onWebSearch(copyValue) }
+                            ) {
+                                Text(
+                                    text = "Search",
+                                    color = ElectricCyan,
+                                    fontFamily = SpaceGroteskFamily,
+                                    fontSize = 12.sp,
+                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                                )
+                            }
+                            Surface(
+                                color = Color(0xFF252530),
+                                shape = RoundedCornerShape(8.dp),
+                                modifier = Modifier.clickable {
+                                    onOpenGoogleTranslate(focusedBlock.text, focusedBlock.detectedLanguageCode)
+                                }
+                            ) {
+                                Text(
+                                    text = translateLabel,
+                                    color = Color.White,
+                                    fontFamily = SpaceGroteskFamily,
+                                    fontSize = 12.sp,
+                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Target Language Chips for instant inline switching
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                SupportedTargetLanguages.forEach { lang ->
+                    val selected = lang.code == selectedTargetLang
+                    val st = packStatuses[lang.code] ?: ModelPackStatus.NOT_DOWNLOADED
+                    Surface(
+                        color = if (selected) Color.White else Color(0xFF22222B),
+                        shape = RoundedCornerShape(8.dp),
+                        modifier = Modifier
+                            .clickable { onSelectTargetLanguage(lang.code) }
+                            .testTag("inline_lang_chip_${lang.code}")
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(5.dp),
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp)
+                        ) {
+                            when (st) {
+                                ModelPackStatus.DOWNLOADING -> {
+                                    CircularProgressIndicator(
+                                        color = if (selected) Color(0xFF0B0B0E) else ElectricCyan,
+                                        strokeWidth = 1.6.dp,
+                                        modifier = Modifier.size(9.dp)
+                                    )
+                                }
+                                ModelPackStatus.DOWNLOADED -> {
+                                    Box(
+                                        modifier = Modifier
+                                            .size(6.dp)
+                                            .clip(CircleShape)
+                                            .background(EmeraldActive)
+                                    )
+                                }
+                                ModelPackStatus.ERROR -> {
+                                    Box(
+                                        modifier = Modifier
+                                            .size(6.dp)
+                                            .clip(CircleShape)
+                                            .background(CoralError)
+                                    )
+                                }
+                                ModelPackStatus.NOT_DOWNLOADED -> Unit
+                            }
+                            Text(
+                                text = lang.shortCode,
+                                color = if (selected) Color(0xFF0B0B0E) else Color(0xFFD1D5DB),
+                                fontFamily = JetBrainsMonoFamily,
+                                fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
+                                fontSize = 11.5.sp
+                            )
                         }
                     }
                 }
