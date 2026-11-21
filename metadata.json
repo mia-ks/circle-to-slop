@@ -1,0 +1,6 @@
+{
+  "name": "QuickCircle",
+  "description": "Instant minimal Circle to Search with a customizable launch gesture zone and AI visual search, OCR copy, translation, and web search.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
