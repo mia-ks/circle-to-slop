@@ -5,6 +5,7 @@ import android.os.Handler
 import android.os.Looper
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -37,6 +38,7 @@ import androidx.compose.material.icons.automirrored.rounded.ArrowBack
 import androidx.compose.material.icons.rounded.OpenWith
 import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material.icons.rounded.RestartAlt
+import androidx.compose.material.icons.rounded.WarningAmber
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -45,6 +47,8 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
+import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
@@ -57,11 +61,14 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
-import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.LocalView
@@ -77,6 +84,7 @@ import com.example.data.EdgeAnchor
 import com.example.data.GestureZoneConfig
 import com.example.data.TriggerMode
 import com.example.overlay.MinimalCircleOverlay
+import com.example.ui.theme.AmberWarn
 import com.example.ui.theme.ElectricCyan
 import com.example.ui.theme.EmeraldActive
 import com.example.ui.theme.InterFamily
@@ -100,6 +108,8 @@ fun ZoneEditorScreen(
     ) -> Unit,
     onSetTriggerMode: (TriggerMode) -> Unit,
     onSetHandleOpacity: (Float) -> Unit,
+    onSetEdgeInsetDp: (Float) -> Unit,
+    onSetExcludeSystemBack: (Boolean) -> Unit,
     onSetTargetLanguage: (String) -> Unit,
     onResetDefaults: () -> Unit
 ) {
@@ -247,11 +257,61 @@ fun ZoneEditorScreen(
                         text = if (isLiveTestMode) {
                             "Perform \"${config.triggerMode.label}\" inside the highlighted zone to test launch."
                         } else {
-                            "Drag the zone to reposition. Drag the cyan corner handle to resize width & height."
+                            "Drag the zone to reposition. Drag the cyan corner handle to resize. Amber corners mark OS Assistant & nav gesture zones."
                         },
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
+
+                    val bottomCornerRisk = (config.anchor == EdgeAnchor.BOTTOM_BAR && config.edgeInsetDp < 16f) ||
+                        ((config.anchor == EdgeAnchor.LEFT_EDGE || config.anchor == EdgeAnchor.RIGHT_EDGE) && config.offsetYFraction > 0.76f) ||
+                        (config.anchor == EdgeAnchor.FREE && config.offsetYFraction > 0.84f && (config.offsetXFraction < 0.22f || config.offsetXFraction > 0.78f))
+                    val backGestureRisk = (config.anchor == EdgeAnchor.LEFT_EDGE || config.anchor == EdgeAnchor.RIGHT_EDGE) &&
+                        (!config.excludeSystemBack || config.heightDp > 200f)
+
+                    if (bottomCornerRisk || backGestureRisk) {
+                        val warningMessage = buildString {
+                            if (bottomCornerRisk) {
+                                append("Near bottom-corner Assistant / nav gesture area. Raise Edge Inset (>= 16 dp), drag higher, or use Single Tap / Hold.")
+                            }
+                            if (backGestureRisk) {
+                                if (isNotEmpty()) append(" ")
+                                if (!config.excludeSystemBack) {
+                                    append("Enable \"Block System Back in Zone\" to prevent OS Back swipes from intercepting this edge handle.")
+                                } else {
+                                    append("Android only excludes up to 200 dp vertically per edge from System Back; keep Height <= 200 dp for full protection.")
+                                }
+                            }
+                        }
+                        Surface(
+                            shape = RoundedCornerShape(14.dp),
+                            color = AmberWarn.copy(alpha = 0.14f),
+                            border = BorderStroke(1.dp, AmberWarn.copy(alpha = 0.5f)),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .testTag("zone_conflict_warning")
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(12.dp),
+                                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                                verticalAlignment = Alignment.Top
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Rounded.WarningAmber,
+                                    contentDescription = "Gesture conflict warning",
+                                    tint = AmberWarn,
+                                    modifier = Modifier.size(20.dp)
+                                )
+                                Text(
+                                    text = warningMessage,
+                                    fontFamily = InterFamily,
+                                    fontSize = 12.sp,
+                                    lineHeight = 16.sp,
+                                    color = MaterialTheme.colorScheme.onSurface
+                                )
+                            }
+                        }
+                    }
 
                     // Anchor Edge Selector
                     Surface(
@@ -284,7 +344,7 @@ fun ZoneEditorScreen(
                                         },
                                         modifier = Modifier
                                             .weight(1f)
-                                            .heightIn(min = 42.dp)
+                                            .heightIn(min = 48.dp)
                                             .clickable { onSetAnchor(anchor) }
                                             .testTag("anchor_${anchor.name}")
                                     ) {
@@ -329,7 +389,7 @@ fun ZoneEditorScreen(
                                         },
                                         modifier = Modifier
                                             .weight(1f)
-                                            .heightIn(min = 44.dp)
+                                            .heightIn(min = 48.dp)
                                             .clickable { onSetTriggerMode(mode) }
                                             .testTag("trigger_mode_${mode.name}")
                                     ) {
@@ -386,6 +446,13 @@ fun ZoneEditorScreen(
                                 }
                             )
                             DimensionSlider(
+                                label = "Edge / Bottom Inset",
+                                valueText = "${config.edgeInsetDp.roundToInt()} dp",
+                                value = config.edgeInsetDp,
+                                valueRange = 0f..48f,
+                                onValueChange = onSetEdgeInsetDp
+                            )
+                            DimensionSlider(
                                 label = "Handle Opacity",
                                 valueText = if (config.handleOpacity <= 0.02f) {
                                     "0% (Invisible)"
@@ -396,6 +463,44 @@ fun ZoneEditorScreen(
                                 valueRange = 0f..0.85f,
                                 onValueChange = onSetHandleOpacity
                             )
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .heightIn(min = 48.dp)
+                                    .clickable { onSetExcludeSystemBack(!config.excludeSystemBack) }
+                                    .padding(vertical = 4.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .padding(end = 12.dp),
+                                    verticalArrangement = Arrangement.spacedBy(2.dp)
+                                ) {
+                                    Text(
+                                        text = "Block System Back in Zone",
+                                        fontFamily = InterFamily,
+                                        fontSize = 13.5.sp,
+                                        color = MaterialTheme.colorScheme.onSurface
+                                    )
+                                    Text(
+                                        text = "Excludes up to 200 dp vertically from OS Back swipe",
+                                        fontFamily = InterFamily,
+                                        fontSize = 11.5.sp,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                                Switch(
+                                    checked = config.excludeSystemBack,
+                                    onCheckedChange = onSetExcludeSystemBack,
+                                    colors = SwitchDefaults.colors(
+                                        checkedThumbColor = Color.Black,
+                                        checkedTrackColor = ElectricCyan
+                                    ),
+                                    modifier = Modifier.testTag("exclude_system_back_switch")
+                                )
+                            }
                         }
                     }
 
@@ -451,11 +556,13 @@ private fun InteractivePhoneViewport(
         val minZonePx = with(density) { 16.dp.toPx() }
         val zoneW = (config.widthDp * scaleX).coerceIn(minZonePx, frameW * 0.9f)
         val zoneH = (config.heightDp * scaleY).coerceIn(minZonePx, frameH * 0.85f)
+        val insetX = (config.edgeInsetDp * scaleX).coerceAtLeast(0f)
+        val insetY = (config.edgeInsetDp * scaleY).coerceAtLeast(0f)
 
         val (zoneLeft, zoneTop) = when (config.anchor) {
-            EdgeAnchor.LEFT_EDGE -> 0f to ((frameH - zoneH) * config.offsetYFraction)
-            EdgeAnchor.RIGHT_EDGE -> (frameW - zoneW) to ((frameH - zoneH) * config.offsetYFraction)
-            EdgeAnchor.BOTTOM_BAR -> ((frameW - zoneW) * config.offsetYFraction) to (frameH - zoneH)
+            EdgeAnchor.LEFT_EDGE -> insetX.coerceIn(0f, (frameW - zoneW).coerceAtLeast(0f)) to ((frameH - zoneH) * config.offsetYFraction)
+            EdgeAnchor.RIGHT_EDGE -> (frameW - zoneW - insetX).coerceIn(0f, (frameW - zoneW).coerceAtLeast(0f)) to ((frameH - zoneH) * config.offsetYFraction)
+            EdgeAnchor.BOTTOM_BAR -> ((frameW - zoneW) * config.offsetYFraction) to (frameH - zoneH - insetY).coerceIn(0f, (frameH - zoneH).coerceAtLeast(0f))
             EdgeAnchor.FREE -> ((frameW - zoneW) * config.offsetXFraction) to ((frameH - zoneH) * config.offsetYFraction)
         }
 
@@ -510,6 +617,67 @@ private fun InteractivePhoneViewport(
                     }
                 }
             }
+        }
+
+        // OS System Gesture conflict guides (Back side edges & bottom-corner Assistant / nav strip)
+        Canvas(modifier = Modifier.fillMaxSize()) {
+            val edgeBandW = 20f * scaleX
+            val cornerSize = 54f * scaleX
+            val navBarH = 22f * scaleY
+            val backBandColor = if (!config.excludeSystemBack || config.heightDp > 200f) {
+                AmberWarn.copy(alpha = 0.22f)
+            } else {
+                ElectricCyan.copy(alpha = 0.08f)
+            }
+
+            // Left & right OS Back gesture edge bands above bottom corners
+            drawRect(
+                color = backBandColor,
+                topLeft = Offset(0f, 36f * scaleY),
+                size = Size(edgeBandW, (size.height - cornerSize - 36f * scaleY).coerceAtLeast(0f))
+            )
+            drawRect(
+                color = backBandColor,
+                topLeft = Offset(size.width - edgeBandW, 36f * scaleY),
+                size = Size(edgeBandW, (size.height - cornerSize - 36f * scaleY).coerceAtLeast(0f))
+            )
+
+            // Bottom OS Home/Recents swipe strip
+            drawRect(
+                color = AmberWarn.copy(alpha = 0.14f),
+                topLeft = Offset(cornerSize, size.height - navBarH),
+                size = Size((size.width - cornerSize * 2f).coerceAtLeast(0f), navBarH)
+            )
+
+            // Bottom-left and bottom-right corner Assistant swipe regions
+            val cornerFill = AmberWarn.copy(alpha = 0.26f)
+            val cornerStroke = Stroke(width = 1.5f)
+            drawRoundRect(
+                color = cornerFill,
+                topLeft = Offset(0f, size.height - cornerSize),
+                size = Size(cornerSize, cornerSize),
+                cornerRadius = CornerRadius(14f, 14f)
+            )
+            drawRoundRect(
+                color = AmberWarn.copy(alpha = 0.55f),
+                topLeft = Offset(0f, size.height - cornerSize),
+                size = Size(cornerSize, cornerSize),
+                cornerRadius = CornerRadius(14f, 14f),
+                style = cornerStroke
+            )
+            drawRoundRect(
+                color = cornerFill,
+                topLeft = Offset(size.width - cornerSize, size.height - cornerSize),
+                size = Size(cornerSize, cornerSize),
+                cornerRadius = CornerRadius(14f, 14f)
+            )
+            drawRoundRect(
+                color = AmberWarn.copy(alpha = 0.55f),
+                topLeft = Offset(size.width - cornerSize, size.height - cornerSize),
+                size = Size(cornerSize, cornerSize),
+                cornerRadius = CornerRadius(14f, 14f),
+                style = cornerStroke
+            )
         }
 
         // Visual handle indicator inside zone (mirrors real overlay look)
@@ -603,7 +771,7 @@ private fun InteractivePhoneViewport(
                                 )
                             }
                     } else {
-                        Modifier.pointerInput(config.anchor, zoneW, zoneH, frameW, frameH) {
+                        Modifier.pointerInput(config.anchor, zoneW, zoneH, frameW, frameH, insetX, insetY) {
                             var curLeft = zoneLeft
                             var curTop = zoneTop
                             var curAnchor = config.anchor

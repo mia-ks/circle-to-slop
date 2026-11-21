@@ -10,7 +10,9 @@ import androidx.test.core.app.ApplicationProvider
 import com.example.data.EdgeAnchor
 import com.example.data.GestureZoneConfig
 import com.example.data.TriggerMode
+import com.example.engine.OcrAndLensEngine
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -40,15 +42,28 @@ class ExampleRobolectricTest {
             triggerMode = TriggerMode.TAP
         )
         assertEquals("Bottom · 140×32 dp · Single Tap", cfg.summaryLine())
+
+        val insetCfg = cfg.copy(edgeInsetDp = 16f)
+        assertEquals("Bottom · 140×32 dp · +16dp inset · Single Tap", insetCfg.summaryLine())
     }
 
     @Test
-    fun `dashboard navigates to zone editor and sandbox`() {
+    fun `google translate fallback rejects blank text`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        assertFalse(OcrAndLensEngine.launchGoogleTranslateFallback(context, "   ", "en"))
+    }
+
+    @Test
+    fun `dashboard shows offline pack status and navigates to zone editor and sandbox`() {
         composeRule.onNodeWithTag("launch_sandbox_button").performScrollTo().assertIsDisplayed()
         composeRule.onNodeWithTag("open_zone_editor_button").performScrollTo().assertIsDisplayed()
+        composeRule.onNodeWithTag("offline_pack_status_card").performScrollTo().assertIsDisplayed()
+        composeRule.onNodeWithTag("toggle_pack_manager_button").performScrollTo().performClick()
+        composeRule.onNodeWithTag("pack_download_ja").performScrollTo().assertIsDisplayed()
 
         composeRule.onNodeWithTag("open_zone_editor_button").performScrollTo().performClick()
         composeRule.onNodeWithTag("zone_editor_viewport").assertIsDisplayed()
+        composeRule.onNodeWithTag("exclude_system_back_switch").performScrollTo().assertIsDisplayed()
         composeRule.onNodeWithTag("zone_editor_back_button").performClick()
 
         composeRule.onNodeWithTag("launch_sandbox_button").performScrollTo().performClick()

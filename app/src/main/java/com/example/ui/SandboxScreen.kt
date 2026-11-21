@@ -310,11 +310,12 @@ fun SandboxScreen(
                 val screenH = constraints.maxHeight.toFloat()
                 val zoneW = with(density) { config.widthDp.dp.toPx() }.coerceAtLeast(with(density) { 18.dp.toPx() })
                 val zoneH = with(density) { config.heightDp.dp.toPx() }.coerceAtLeast(with(density) { 18.dp.toPx() })
+                val insetPx = with(density) { config.edgeInsetDp.dp.toPx() }
 
                 val (posX, posY) = when (config.anchor) {
-                    EdgeAnchor.LEFT_EDGE -> 0f to ((screenH - zoneH) * config.offsetYFraction)
-                    EdgeAnchor.RIGHT_EDGE -> (screenW - zoneW) to ((screenH - zoneH) * config.offsetYFraction)
-                    EdgeAnchor.BOTTOM_BAR -> ((screenW - zoneW) * config.offsetYFraction) to (screenH - zoneH)
+                    EdgeAnchor.LEFT_EDGE -> insetPx.coerceIn(0f, (screenW - zoneW).coerceAtLeast(0f)) to ((screenH - zoneH) * config.offsetYFraction)
+                    EdgeAnchor.RIGHT_EDGE -> (screenW - zoneW - insetPx).coerceIn(0f, (screenW - zoneW).coerceAtLeast(0f)) to ((screenH - zoneH) * config.offsetYFraction)
+                    EdgeAnchor.BOTTOM_BAR -> ((screenW - zoneW) * config.offsetYFraction) to (screenH - zoneH - insetPx).coerceIn(0f, (screenH - zoneH).coerceAtLeast(0f))
                     EdgeAnchor.FREE -> ((screenW - zoneW) * config.offsetXFraction) to ((screenH - zoneH) * config.offsetYFraction)
                 }
 

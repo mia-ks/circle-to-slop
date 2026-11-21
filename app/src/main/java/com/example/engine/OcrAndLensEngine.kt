@@ -22,12 +22,22 @@ import com.google.mlkit.vision.text.Text
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.japanese.JapaneseTextRecognizerOptions
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileOutputStream
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
@@ -43,13 +53,27 @@ data class OcrRegionResult(
     val detectedLanguageName: String?
 )
 
+enum class ModelPackStatus {
+    NOT_DOWNLOADED,
+    DOWNLOADING,
+    DOWNLOADED,
+    ERROR
+}
+
 sealed interface TranslationState {
     data object Idle : TranslationState
-    data class DownloadingModel(val languagePairLabel: String) : TranslationState
+    data class DownloadingModel(
+        val languagePairLabel: String,
+        val missingPacksLabel: String,
+        val engineLabel: String = "Google ML Kit Offline"
+    ) : TranslationState
     data object Translating : TranslationState
     data class Success(val translatedText: String, val sourceLangName: String, val targetLangName: String) : TranslationState
     data class SameLanguage(val languageName: String) : TranslationState
-    data class Error(val message: String) : TranslationState
+    data class Error(
+        val message: String,
+        val canFallbackToGoogleTranslate: Boolean = true
+    ) : TranslationState
 }
 
 object OcrAndLensEngine {
@@ -67,6 +91,17 @@ object OcrAndLensEngine {
         LanguageIdentification.getClient()
     }
 
+    private val engineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val activeDownloads = ConcurrentHashMap<String, Deferred<Result<Unit>>>()
+
+    private val _packStatusFlow = MutableStateFlow<Map<String, ModelPackStatus>>(
+        SupportedTargetLanguages.associate { it.code to ModelPackStatus.NOT_DOWNLOADED }
+    )
+    val packStatusFlow: StateFlow<Map<String, ModelPackStatus>> = _packStatusFlow.asStateFlow()
+
+    private val _packErrorFlow = MutableStateFlow<Map<String, String>>(emptyMap())
+    val packErrorFlow: StateFlow<Map<String, String>> = _packErrorFlow.asStateFlow()
+
     fun prewarm(context: Context) {
         try {
             com.google.mlkit.common.sdkinternal.MlKitContext.initializeIfNeeded(context.applicationContext)
@@ -74,9 +109,119 @@ object OcrAndLensEngine {
             latinRecognizer
             japaneseRecognizer
             languageIdentifier
+            refreshDownloadedPacksAsync()
         } catch (e: Exception) {
             Log.w(TAG, "ML Kit prewarm skipped: ${e.message}")
         }
+    }
+
+    fun refreshDownloadedPacksAsync() {
+        engineScope.launch {
+            refreshDownloadedPacks()
+        }
+    }
+
+    suspend fun refreshDownloadedPacks() = withContext(Dispatchers.IO) {
+        try {
+            val modelManager = RemoteModelManager.getInstance()
+            val downloaded = modelManager.getDownloadedModels(TranslateRemoteModel::class.java).awaitTask()
+            val downloadedCodes = downloaded.map { it.language.lowercase(Locale.ROOT) }.toSet()
+
+            _packStatusFlow.update { current ->
+                val allKeys = (SupportedTargetLanguages.map { it.code } + downloadedCodes + current.keys).toSet()
+                allKeys.associateWith { code ->
+                    val existing = current[code]
+                    when {
+                        code in downloadedCodes -> ModelPackStatus.DOWNLOADED
+                        existing == ModelPackStatus.DOWNLOADING -> ModelPackStatus.DOWNLOADING
+                        existing == ModelPackStatus.ERROR -> ModelPackStatus.ERROR
+                        else -> ModelPackStatus.NOT_DOWNLOADED
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Unable to query downloaded ML Kit packs: ${e.message}")
+        }
+    }
+
+    fun startPackDownload(langCode: String) {
+        engineScope.launch {
+            ensureLanguagePackDownloaded(langCode)
+        }
+    }
+
+    suspend fun ensureLanguagePackDownloaded(langCode: String): Result<Unit> {
+        val mlTag = resolveMlKitTag(langCode)
+            ?: return Result.failure(IllegalArgumentException("Unsupported ML Kit language: $langCode"))
+
+        val modelManager = try {
+            RemoteModelManager.getInstance()
+        } catch (e: Exception) {
+            val msg = e.localizedMessage ?: "ML Kit model manager unavailable"
+            _packStatusFlow.update { it + (mlTag to ModelPackStatus.ERROR) }
+            _packErrorFlow.update { it + (mlTag to msg) }
+            return Result.failure(e)
+        }
+
+        val model = TranslateRemoteModel.Builder(mlTag).build()
+        val alreadyDownloaded = try {
+            modelManager.isModelDownloaded(model).awaitTask()
+        } catch (_: Exception) {
+            false
+        }
+        if (alreadyDownloaded) {
+            _packStatusFlow.update { it + (mlTag to ModelPackStatus.DOWNLOADED) }
+            _packErrorFlow.update { it - mlTag }
+            return Result.success(Unit)
+        }
+
+        // Reuse any already-running download for this language even across overlay open/close
+        val existingDeferred = activeDownloads[mlTag]
+        if (existingDeferred != null && existingDeferred.isActive) {
+            return existingDeferred.await()
+        }
+
+        val deferred = engineScope.async {
+            _packStatusFlow.update { it + (mlTag to ModelPackStatus.DOWNLOADING) }
+            _packErrorFlow.update { it - mlTag }
+            try {
+                val conditions = DownloadConditions.Builder().build()
+                modelManager.download(model, conditions).awaitTask()
+                _packStatusFlow.update { it + (mlTag to ModelPackStatus.DOWNLOADED) }
+                _packErrorFlow.update { it - mlTag }
+                Result.success(Unit)
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed downloading ML Kit pack for $mlTag", e)
+                val friendly = e.localizedMessage ?: "Download failed (check internet or Google Play Services)"
+                _packStatusFlow.update { it + (mlTag to ModelPackStatus.ERROR) }
+                _packErrorFlow.update { it + (mlTag to friendly) }
+                Result.failure(e)
+            } finally {
+                activeDownloads.remove(mlTag)
+            }
+        }
+        activeDownloads[mlTag] = deferred
+        return deferred.await()
+    }
+
+    fun deleteLanguagePack(langCode: String) {
+        val mlTag = resolveMlKitTag(langCode) ?: return
+        engineScope.launch {
+            try {
+                val model = TranslateRemoteModel.Builder(mlTag).build()
+                RemoteModelManager.getInstance().deleteDownloadedModel(model).awaitTask()
+                _packStatusFlow.update { it + (mlTag to ModelPackStatus.NOT_DOWNLOADED) }
+                _packErrorFlow.update { it - mlTag }
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed deleting ML Kit pack for $mlTag", e)
+            }
+        }
+    }
+
+    private fun resolveMlKitTag(langCode: String): String? {
+        val cleaned = langCode.trim()
+        return TranslateLanguage.fromLanguageTag(cleaned)
+            ?: TranslateLanguage.fromLanguageTag(cleaned.substringBefore("-"))
     }
 
     suspend fun recognizeFullScreenLines(
@@ -185,12 +330,16 @@ object OcrAndLensEngine {
         }
 
         val resolvedSourceTag = sourceLangCodeHint ?: detectLanguageCode(text) ?: "en"
-        val mlSource = TranslateLanguage.fromLanguageTag(resolvedSourceTag)
-            ?: TranslateLanguage.fromLanguageTag(resolvedSourceTag.substringBefore("-"))
-        val mlTarget = TranslateLanguage.fromLanguageTag(targetLangCode)
+        val mlSource = resolveMlKitTag(resolvedSourceTag)
+        val mlTarget = resolveMlKitTag(targetLangCode)
 
         if (mlSource == null || mlTarget == null) {
-            onState(TranslationState.Error("Unsupported language pair ($resolvedSourceTag -> $targetLangCode)."))
+            onState(
+                TranslationState.Error(
+                    message = "Language pair ($resolvedSourceTag -> $targetLangCode) is not supported offline by ML Kit.",
+                    canFallbackToGoogleTranslate = true
+                )
+            )
             return
         }
 
@@ -217,10 +366,50 @@ object OcrAndLensEngine {
                 TranslateRemoteModel.Builder(mlTarget).build()
             ).awaitTask()
 
+            _packStatusFlow.update { current ->
+                current + mapOf(
+                    mlSource to if (sourceDownloaded) ModelPackStatus.DOWNLOADED else (current[mlSource] ?: ModelPackStatus.NOT_DOWNLOADED),
+                    mlTarget to if (targetDownloaded) ModelPackStatus.DOWNLOADED else (current[mlTarget] ?: ModelPackStatus.NOT_DOWNLOADED)
+                )
+            }
+
             if (!sourceDownloaded || !targetDownloaded) {
-                onState(TranslationState.DownloadingModel("$sourceLabel ↔ $targetLabel"))
-                val conditions = DownloadConditions.Builder().build()
-                translator.downloadModelIfNeeded(conditions).awaitTask()
+                val missingNames = buildList {
+                    if (!sourceDownloaded) add(sourceLabel)
+                    if (!targetDownloaded) add(targetLabel)
+                }
+                onState(
+                    TranslationState.DownloadingModel(
+                        languagePairLabel = "$sourceLabel -> $targetLabel",
+                        missingPacksLabel = missingNames.joinToString(" + ")
+                    )
+                )
+                if (!sourceDownloaded) {
+                    val res = ensureLanguagePackDownloaded(mlSource)
+                    if (res.isFailure) {
+                        val reason = res.exceptionOrNull()?.localizedMessage ?: "network or Play Services unavailable"
+                        onState(
+                            TranslationState.Error(
+                                message = "Could not download $sourceLabel offline pack ($reason).",
+                                canFallbackToGoogleTranslate = true
+                            )
+                        )
+                        return
+                    }
+                }
+                if (!targetDownloaded) {
+                    val res = ensureLanguagePackDownloaded(mlTarget)
+                    if (res.isFailure) {
+                        val reason = res.exceptionOrNull()?.localizedMessage ?: "network or Play Services unavailable"
+                        onState(
+                            TranslationState.Error(
+                                message = "Could not download $targetLabel offline pack ($reason).",
+                                canFallbackToGoogleTranslate = true
+                            )
+                        )
+                        return
+                    }
+                }
             }
 
             onState(TranslationState.Translating)
@@ -236,7 +425,8 @@ object OcrAndLensEngine {
             Log.e(TAG, "Translation failed", e)
             onState(
                 TranslationState.Error(
-                    e.localizedMessage ?: "Offline translation failed. Connect once to download the language model."
+                    message = e.localizedMessage ?: "Offline ML Kit translation failed.",
+                    canFallbackToGoogleTranslate = true
                 )
             )
         } finally {
@@ -304,20 +494,106 @@ object OcrAndLensEngine {
         }
     }
 
-    fun launchWebTranslate(context: Context, text: String, targetLangCode: String): Boolean {
-        if (text.isBlank()) return false
-        return try {
-            val url = "https://translate.google.com/?sl=auto&tl=${Uri.encode(targetLangCode)}&text=${Uri.encode(text.trim())}&op=translate"
-            val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url)).apply {
+    fun isGoogleTranslateAppInstalled(context: Context): Boolean {
+        val pm = context.packageManager
+        val viewCheck = Intent(
+            Intent.ACTION_VIEW,
+            Uri.parse("https://translate.google.com/?sl=auto&tl=en&text=test&op=translate")
+        ).setPackage(GOOGLE_TRANSLATE_PACKAGE)
+        if (viewCheck.resolveActivity(pm) != null) return true
+
+        val sendCheck = Intent(Intent.ACTION_SEND).apply {
+            type = "text/plain"
+            setPackage(GOOGLE_TRANSLATE_PACKAGE)
+        }
+        return sendCheck.resolveActivity(pm) != null
+    }
+
+    fun launchGoogleTranslateFallback(
+        context: Context,
+        text: String,
+        targetLangCode: String,
+        sourceLangCodeHint: String? = null
+    ): Boolean {
+        val trimmed = text.trim()
+        if (trimmed.isBlank()) return false
+
+        val sl = sourceLangCodeHint?.substringBefore("-")?.lowercase(Locale.ROOT)?.ifBlank { "auto" } ?: "auto"
+        val tl = targetLangCode.substringBefore("-").lowercase(Locale.ROOT).ifBlank { "en" }
+        val translateUri = Uri.parse(
+            "https://translate.google.com/?sl=${Uri.encode(sl)}&tl=${Uri.encode(tl)}&text=${Uri.encode(trimmed)}&op=translate"
+        )
+
+        val pm = context.packageManager
+
+        // 1. Prefer Google Translate app deep link (preserves both source and target languages)
+        try {
+            val appViewIntent = Intent(Intent.ACTION_VIEW, translateUri).apply {
+                setPackage(GOOGLE_TRANSLATE_PACKAGE)
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             }
-            context.startActivity(intent)
+            if (appViewIntent.resolveActivity(pm) != null) {
+                context.startActivity(appViewIntent)
+                return true
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Google Translate app ACTION_VIEW failed: ${e.message}")
+        }
+
+        // 2. Fallback to Google Translate app ACTION_PROCESS_TEXT / ACTION_SEND
+        try {
+            val processTextIntent = Intent(Intent.ACTION_PROCESS_TEXT).apply {
+                type = "text/plain"
+                putExtra(Intent.EXTRA_PROCESS_TEXT, trimmed)
+                putExtra(Intent.EXTRA_PROCESS_TEXT_READONLY, true)
+                setPackage(GOOGLE_TRANSLATE_PACKAGE)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            if (processTextIntent.resolveActivity(pm) != null) {
+                context.startActivity(processTextIntent)
+                return true
+            }
+
+            val sendIntent = Intent(Intent.ACTION_SEND).apply {
+                type = "text/plain"
+                putExtra(Intent.EXTRA_TEXT, trimmed)
+                setPackage(GOOGLE_TRANSLATE_PACKAGE)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            if (sendIntent.resolveActivity(pm) != null) {
+                context.startActivity(sendIntent)
+                return true
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Google Translate app share intent failed: ${e.message}")
+        }
+
+        // 3. Final fallback: Google Translate in the system web browser
+        return try {
+            val browserIntent = Intent(Intent.ACTION_VIEW, translateUri).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            context.startActivity(browserIntent)
             true
         } catch (e: Exception) {
             Log.e(TAG, "Failed to open Google Translate in browser", e)
             false
         }
     }
+
+    fun launchWebTranslate(
+        context: Context,
+        text: String,
+        targetLangCode: String,
+        sourceLangCodeHint: String? = null
+    ): Boolean = launchGoogleTranslateFallback(
+        context = context,
+        text = text,
+        targetLangCode = targetLangCode,
+        sourceLangCodeHint = sourceLangCodeHint
+    )
+
+    private const val GOOGLE_TRANSLATE_PACKAGE = "com.google.android.apps.translate"
 
     fun formatLanguageName(code: String): String {
         val clean = code.substringBefore("-").lowercase(Locale.ROOT)

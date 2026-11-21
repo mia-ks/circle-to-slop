@@ -8,6 +8,7 @@ import com.example.data.GestureConfigRepository
 import com.example.data.GestureZoneConfig
 import com.example.data.OcrScriptMode
 import com.example.data.TriggerMode
+import com.example.engine.ModelPackStatus
 import com.example.engine.OcrAndLensEngine
 import com.example.service.QuickCircleAccessibilityService
 import kotlinx.coroutines.Dispatchers
@@ -44,6 +45,9 @@ class QuickCircleViewModel(application: Application) : AndroidViewModel(applicat
         initialValue = QuickCircleAccessibilityService.isAccessibilityEnabled(application.applicationContext)
     )
 
+    val packStatuses: StateFlow<Map<String, ModelPackStatus>> = OcrAndLensEngine.packStatusFlow
+    val packErrors: StateFlow<Map<String, String>> = OcrAndLensEngine.packErrorFlow
+
     init {
         viewModelScope.launch(Dispatchers.Default) {
             OcrAndLensEngine.prewarm(getApplication())
@@ -53,6 +57,15 @@ class QuickCircleViewModel(application: Application) : AndroidViewModel(applicat
     fun refreshAccessibilityStatus() {
         _systemCheckFlag.value =
             QuickCircleAccessibilityService.isAccessibilityEnabled(getApplication())
+        OcrAndLensEngine.refreshDownloadedPacksAsync()
+    }
+
+    fun downloadLanguagePack(code: String) {
+        OcrAndLensEngine.startPackDownload(code)
+    }
+
+    fun deleteLanguagePack(code: String) {
+        OcrAndLensEngine.deleteLanguagePack(code)
     }
 
     fun setAnchor(anchor: EdgeAnchor) {
@@ -118,6 +131,18 @@ class QuickCircleViewModel(application: Application) : AndroidViewModel(applicat
     fun setHandleOpacity(opacity: Float) {
         viewModelScope.launch {
             repository.updateConfig { it.copy(handleOpacity = opacity.coerceIn(0f, 0.85f)) }
+        }
+    }
+
+    fun setEdgeInsetDp(insetDp: Float) {
+        viewModelScope.launch {
+            repository.updateConfig { it.copy(edgeInsetDp = insetDp.coerceIn(0f, 48f)) }
+        }
+    }
+
+    fun setExcludeSystemBack(enabled: Boolean) {
+        viewModelScope.launch {
+            repository.updateConfig { it.copy(excludeSystemBack = enabled) }
         }
     }
 

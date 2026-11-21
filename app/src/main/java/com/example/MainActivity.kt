@@ -44,6 +44,8 @@ fun QuickCircleApp(
     val navController = rememberNavController()
     val config by viewModel.config.collectAsStateWithLifecycle()
     val isAccessibilityEnabled by viewModel.isAccessibilityEnabled.collectAsStateWithLifecycle()
+    val packStatuses by viewModel.packStatuses.collectAsStateWithLifecycle()
+    val packErrors by viewModel.packErrors.collectAsStateWithLifecycle()
     val lifecycleOwner = LocalLifecycleOwner.current
 
     DisposableEffect(lifecycleOwner) {
@@ -66,12 +68,16 @@ fun QuickCircleApp(
             DashboardScreen(
                 config = config,
                 isAccessibilityEnabled = isAccessibilityEnabled,
+                packStatuses = packStatuses,
+                packErrors = packErrors,
                 onOpenZoneEditor = { navController.navigate(ROUTE_ZONE_EDITOR) },
                 onOpenSandbox = { navController.navigate(ROUTE_SANDBOX) },
                 onToggleTriggerEnabled = viewModel::setTriggerEnabled,
                 onToggleHaptic = viewModel::setHapticFeedback,
                 onSelectTargetLanguage = viewModel::setTargetLanguage,
-                onSelectScriptMode = viewModel::setScriptMode
+                onSelectScriptMode = viewModel::setScriptMode,
+                onDownloadLanguagePack = viewModel::downloadLanguagePack,
+                onDeleteLanguagePack = viewModel::deleteLanguagePack
             )
         }
 
@@ -83,6 +89,8 @@ fun QuickCircleApp(
                 onUpdateGeometry = viewModel::updateZoneGeometry,
                 onSetTriggerMode = viewModel::setTriggerMode,
                 onSetHandleOpacity = viewModel::setHandleOpacity,
+                onSetEdgeInsetDp = viewModel::setEdgeInsetDp,
+                onSetExcludeSystemBack = viewModel::setExcludeSystemBack,
                 onSetTargetLanguage = viewModel::setTargetLanguage,
                 onResetDefaults = viewModel::resetDefaults
             )

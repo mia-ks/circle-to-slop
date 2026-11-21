@@ -95,14 +95,19 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.data.OcrScriptMode
 import com.example.data.SupportedTargetLanguages
+import com.example.engine.ModelPackStatus
 import com.example.engine.OcrAndLensEngine
 import com.example.engine.OcrRegionResult
 import com.example.engine.RecognizedTextLine
 import com.example.engine.TranslationState
+import com.example.ui.theme.CoralError
 import com.example.ui.theme.ElectricCyan
+import com.example.ui.theme.EmeraldActive
 import com.example.ui.theme.InterFamily
 import com.example.ui.theme.JetBrainsMonoFamily
 import com.example.ui.theme.SpaceGroteskFamily
+import androidx.compose.runtime.collectAsState
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlin.math.max
@@ -146,10 +151,17 @@ fun MinimalCircleOverlay(
         mutableStateOf(initialTargetLanguageCode)
     }
     var translationState by remember { mutableStateOf<TranslationState>(TranslationState.Idle) }
+    var translationJob by remember { mutableStateOf<Job?>(null) }
     var copiedLabel by remember { mutableStateOf<String?>(null) }
 
-    // Pre-scan full screen text in background for instant tap-to-select
+    val packStatuses by OcrAndLensEngine.packStatusFlow.collectAsState()
+    val hasGoogleTranslateApp = remember(context) {
+        OcrAndLensEngine.isGoogleTranslateAppInstalled(context)
+    }
+
+    // Pre-scan full screen text in background & refresh pack cache status
     LaunchedEffect(screenshotBitmap, scriptMode) {
+        OcrAndLensEngine.refreshDownloadedPacksAsync()
         fullScreenLines = OcrAndLensEngine.recognizeFullScreenLines(screenshotBitmap, scriptMode)
     }
 
@@ -169,11 +181,12 @@ fun MinimalCircleOverlay(
     }
 
     fun runTranslation(textToTranslate: String, sourceHint: String?, targetLang: String) {
+        translationJob?.cancel()
         if (textToTranslate.isBlank()) {
             translationState = TranslationState.Idle
             return
         }
-        scope.launch {
+        translationJob = scope.launch {
             OcrAndLensEngine.translateText(
                 text = textToTranslate,
                 sourceLangCodeHint = sourceHint,
@@ -552,6 +565,8 @@ fun MinimalCircleOverlay(
                     },
                     isAnalyzingOcr = isAnalyzingOcr,
                     selectedTargetLang = selectedTargetLang,
+                    packStatuses = packStatuses,
+                    hasGoogleTranslateApp = hasGoogleTranslateApp,
                     translationState = translationState,
                     copiedLabel = copiedLabel,
                     onCopy = { label, text -> copyToClipboard(label, text) },
@@ -584,7 +599,14 @@ fun MinimalCircleOverlay(
                         }
                     },
                     onWebTranslate = { text ->
-                        if (OcrAndLensEngine.launchWebTranslate(context, text, selectedTargetLang)) {
+                        if (
+                            OcrAndLensEngine.launchGoogleTranslateFallback(
+                                context = context,
+                                text = text,
+                                targetLangCode = selectedTargetLang,
+                                sourceLangCodeHint = ocrResult?.detectedLanguageCode
+                            )
+                        ) {
                             onExternalActionLaunched()
                         }
                     }
@@ -602,6 +624,8 @@ private fun CompactLookupSheet(
     onEditableTextChange: (String) -> Unit,
     isAnalyzingOcr: Boolean,
     selectedTargetLang: String,
+    packStatuses: Map<String, ModelPackStatus>,
+    hasGoogleTranslateApp: Boolean,
     translationState: TranslationState,
     copiedLabel: String?,
     onCopy: (label: String, text: String) -> Unit,
@@ -850,6 +874,7 @@ private fun CompactLookupSheet(
                         modifier = Modifier.padding(12.dp),
                         verticalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
+                        val translateLabel = if (hasGoogleTranslateApp) "Google Translate" else "Translate Web"
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.SpaceBetween,
@@ -866,7 +891,7 @@ private fun CompactLookupSheet(
                                     modifier = Modifier.size(15.dp)
                                 )
                                 Text(
-                                    text = "ON-DEVICE TRANSLATE",
+                                    text = "ML KIT TRANSLATE",
                                     color = Color(0xFF9CA3AF),
                                     fontFamily = JetBrainsMonoFamily,
                                     fontSize = 11.sp
@@ -903,14 +928,14 @@ private fun CompactLookupSheet(
                                         horizontalArrangement = Arrangement.spacedBy(4.dp)
                                     ) {
                                         Text(
-                                            text = "Web",
+                                            text = if (hasGoogleTranslateApp) "Translate App" else "Web",
                                             color = Color.White,
                                             fontFamily = SpaceGroteskFamily,
                                             fontSize = 11.5.sp
                                         )
                                         Icon(
                                             imageVector = Icons.AutoMirrored.Rounded.OpenInNew,
-                                            contentDescription = "Open Google Translate in browser",
+                                            contentDescription = "Open $translateLabel",
                                             tint = ElectricCyan,
                                             modifier = Modifier.size(12.dp)
                                         )
@@ -919,7 +944,7 @@ private fun CompactLookupSheet(
                             }
                         }
 
-                        // Compact Target Language Chips
+                        // Compact Target Language Chips with Offline Pack Indicators
                         Row(
                             modifier = Modifier
                                 .fillMaxWidth()
@@ -928,6 +953,7 @@ private fun CompactLookupSheet(
                         ) {
                             SupportedTargetLanguages.forEach { lang ->
                                 val selected = lang.code == selectedTargetLang
+                                val st = packStatuses[lang.code] ?: ModelPackStatus.NOT_DOWNLOADED
                                 Surface(
                                     color = if (selected) Color.White else Color(0xFF22222B),
                                     shape = RoundedCornerShape(8.dp),
@@ -935,23 +961,54 @@ private fun CompactLookupSheet(
                                         .clickable { onSelectTargetLanguage(lang.code) }
                                         .testTag("lang_chip_${lang.code}")
                                 ) {
-                                    Text(
-                                        text = lang.shortCode,
-                                        color = if (selected) Color(0xFF0B0B0E) else Color(0xFFD1D5DB),
-                                        fontFamily = JetBrainsMonoFamily,
-                                        fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
-                                        fontSize = 11.5.sp,
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(5.dp),
                                         modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
-                                    )
+                                    ) {
+                                        when (st) {
+                                            ModelPackStatus.DOWNLOADING -> {
+                                                CircularProgressIndicator(
+                                                    color = if (selected) Color(0xFF0B0B0E) else ElectricCyan,
+                                                    strokeWidth = 1.6.dp,
+                                                    modifier = Modifier.size(9.dp)
+                                                )
+                                            }
+                                            ModelPackStatus.DOWNLOADED -> {
+                                                Box(
+                                                    modifier = Modifier
+                                                        .size(6.dp)
+                                                        .clip(CircleShape)
+                                                        .background(EmeraldActive)
+                                                )
+                                            }
+                                            ModelPackStatus.ERROR -> {
+                                                Box(
+                                                    modifier = Modifier
+                                                        .size(6.dp)
+                                                        .clip(CircleShape)
+                                                        .background(CoralError)
+                                                )
+                                            }
+                                            ModelPackStatus.NOT_DOWNLOADED -> Unit
+                                        }
+                                        Text(
+                                            text = lang.shortCode,
+                                            color = if (selected) Color(0xFF0B0B0E) else Color(0xFFD1D5DB),
+                                            fontFamily = JetBrainsMonoFamily,
+                                            fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
+                                            fontSize = 11.5.sp
+                                        )
+                                    }
                                 }
                             }
                         }
 
                         when (val tState = translationState) {
                             is TranslationState.DownloadingModel -> {
-                                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                     Text(
-                                        text = "Downloading offline ${tState.languagePairLabel} dictionary…",
+                                        text = "Downloading ${tState.engineLabel} pack: ${tState.missingPacksLabel} (~30 MB each)…",
                                         color = Color(0xFFD1D5DB),
                                         fontFamily = InterFamily,
                                         fontSize = 12.5.sp
@@ -961,6 +1018,31 @@ private fun CompactLookupSheet(
                                         trackColor = Color(0xFF2B2B36),
                                         modifier = Modifier.fillMaxWidth()
                                     )
+                                    OutlinedButton(
+                                        onClick = { onWebTranslate(editableText) },
+                                        border = BorderStroke(1.dp, ElectricCyan.copy(alpha = 0.7f)),
+                                        colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.White),
+                                        shape = RoundedCornerShape(10.dp),
+                                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .heightIn(min = 48.dp)
+                                            .testTag("fallback_google_translate_button")
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.AutoMirrored.Rounded.OpenInNew,
+                                            contentDescription = null,
+                                            tint = ElectricCyan,
+                                            modifier = Modifier.size(16.dp)
+                                        )
+                                        Spacer(Modifier.width(6.dp))
+                                        Text(
+                                            text = "Use $translateLabel Now",
+                                            fontFamily = SpaceGroteskFamily,
+                                            fontWeight = FontWeight.Medium,
+                                            fontSize = 12.5.sp
+                                        )
+                                    }
                                 }
                             }
 
@@ -1050,12 +1132,66 @@ private fun CompactLookupSheet(
                             }
 
                             is TranslationState.Error -> {
-                                Text(
-                                    text = tState.message,
-                                    color = Color(0xFFFCA5A5),
-                                    fontFamily = InterFamily,
-                                    fontSize = 12.5.sp
-                                )
+                                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    Text(
+                                        text = tState.message,
+                                        color = Color(0xFFFCA5A5),
+                                        fontFamily = InterFamily,
+                                        fontSize = 12.5.sp
+                                    )
+                                    if (tState.canFallbackToGoogleTranslate) {
+                                        Row(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                        ) {
+                                            OutlinedButton(
+                                                onClick = onRetranslate,
+                                                border = BorderStroke(1.dp, Color(0xFF3A3A46)),
+                                                colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.White),
+                                                shape = RoundedCornerShape(10.dp),
+                                                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
+                                                modifier = Modifier
+                                                    .weight(1f)
+                                                    .heightIn(min = 48.dp)
+                                                    .testTag("retry_offline_translate_button")
+                                            ) {
+                                                Text(
+                                                    text = "Retry Offline",
+                                                    fontFamily = SpaceGroteskFamily,
+                                                    fontSize = 12.sp
+                                                )
+                                            }
+                                            Button(
+                                                onClick = { onWebTranslate(editableText) },
+                                                colors = ButtonDefaults.buttonColors(
+                                                    containerColor = ElectricCyan,
+                                                    contentColor = Color.Black
+                                                ),
+                                                shape = RoundedCornerShape(10.dp),
+                                                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
+                                                modifier = Modifier
+                                                    .weight(1.3f)
+                                                    .heightIn(min = 48.dp)
+                                                    .testTag("error_fallback_translate_button")
+                                            ) {
+                                                Icon(
+                                                    imageVector = Icons.AutoMirrored.Rounded.OpenInNew,
+                                                    contentDescription = null,
+                                                    modifier = Modifier.size(15.dp)
+                                                )
+                                                Spacer(Modifier.width(5.dp))
+                                                Text(
+                                                    text = translateLabel,
+                                                    fontFamily = SpaceGroteskFamily,
+                                                    fontWeight = FontWeight.SemiBold,
+                                                    fontSize = 12.sp,
+                                                    maxLines = 1,
+                                                    overflow = TextOverflow.Ellipsis
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
                             }
 
                             TranslationState.Idle -> Unit

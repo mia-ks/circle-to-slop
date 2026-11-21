@@ -26,19 +26,25 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowForward
 import androidx.compose.material.icons.rounded.AccessibilityNew
 import androidx.compose.material.icons.rounded.CheckCircle
+import androidx.compose.material.icons.rounded.CloudDownload
 import androidx.compose.material.icons.rounded.CropFree
-import androidx.compose.material.icons.rounded.ImageSearch
+import androidx.compose.material.icons.rounded.DeleteOutline
+import androidx.compose.material.icons.rounded.ExpandLess
+import androidx.compose.material.icons.rounded.ExpandMore
 import androidx.compose.material.icons.rounded.Settings
 import androidx.compose.material.icons.rounded.TouchApp
 import androidx.compose.material.icons.rounded.Translate
 import androidx.compose.material.icons.rounded.Tune
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
@@ -47,6 +53,10 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -70,7 +80,9 @@ import com.example.data.EdgeAnchor
 import com.example.data.GestureZoneConfig
 import com.example.data.OcrScriptMode
 import com.example.data.SupportedTargetLanguages
+import com.example.engine.ModelPackStatus
 import com.example.ui.theme.AmberWarn
+import com.example.ui.theme.CoralError
 import com.example.ui.theme.ElectricCyan
 import com.example.ui.theme.EmeraldActive
 import com.example.ui.theme.InterFamily
@@ -81,14 +93,19 @@ import com.example.ui.theme.SpaceGroteskFamily
 fun DashboardScreen(
     config: GestureZoneConfig,
     isAccessibilityEnabled: Boolean,
+    packStatuses: Map<String, ModelPackStatus>,
+    packErrors: Map<String, String>,
     onOpenZoneEditor: () -> Unit,
     onOpenSandbox: () -> Unit,
     onToggleTriggerEnabled: (Boolean) -> Unit,
     onToggleHaptic: (Boolean) -> Unit,
     onSelectTargetLanguage: (String) -> Unit,
-    onSelectScriptMode: (OcrScriptMode) -> Unit
+    onSelectScriptMode: (OcrScriptMode) -> Unit,
+    onDownloadLanguagePack: (String) -> Unit,
+    onDeleteLanguagePack: (String) -> Unit
 ) {
     val context = LocalContext.current
+    var showPackManager by remember { mutableStateOf(false) }
 
     Scaffold(
         containerColor = MaterialTheme.colorScheme.background
@@ -447,21 +464,80 @@ fun DashboardScreen(
                         modifier = Modifier.padding(16.dp),
                         verticalArrangement = Arrangement.spacedBy(14.dp)
                     ) {
+                        val downloadedCount = SupportedTargetLanguages.count {
+                            packStatuses[it.code] == ModelPackStatus.DOWNLOADED
+                        }
+                        val downloadingCount = packStatuses.values.count {
+                            it == ModelPackStatus.DOWNLOADING
+                        }
+
                         Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Icon(
-                                imageVector = Icons.Rounded.Translate,
-                                contentDescription = null,
-                                tint = ElectricCyan,
-                                modifier = Modifier.size(18.dp)
-                            )
-                            Text(
-                                text = "OCR & Translation Defaults",
-                                style = MaterialTheme.typography.titleMedium,
-                                color = MaterialTheme.colorScheme.onSurface
-                            )
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Rounded.Translate,
+                                    contentDescription = null,
+                                    tint = ElectricCyan,
+                                    modifier = Modifier.size(18.dp)
+                                )
+                                Column {
+                                    Text(
+                                        text = "OCR & Translation Defaults",
+                                        style = MaterialTheme.typography.titleMedium,
+                                        color = MaterialTheme.colorScheme.onSurface
+                                    )
+                                    Text(
+                                        text = "Engine: Google ML Kit Offline (~30 MB/pack)",
+                                        fontFamily = InterFamily,
+                                        fontSize = 11.5.sp,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                            }
+
+                            Surface(
+                                shape = RoundedCornerShape(999.dp),
+                                color = if (downloadingCount > 0) {
+                                    ElectricCyan.copy(alpha = 0.16f)
+                                } else {
+                                    MaterialTheme.colorScheme.surfaceVariant
+                                },
+                                border = BorderStroke(
+                                    1.dp,
+                                    if (downloadingCount > 0) ElectricCyan else MaterialTheme.colorScheme.outline
+                                )
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
+                                    if (downloadingCount > 0) {
+                                        CircularProgressIndicator(
+                                            color = ElectricCyan,
+                                            strokeWidth = 1.8.dp,
+                                            modifier = Modifier.size(11.dp)
+                                        )
+                                    }
+                                    Text(
+                                        text = if (downloadingCount > 0) {
+                                            "Downloading ($downloadingCount)…"
+                                        } else {
+                                            "$downloadedCount/${SupportedTargetLanguages.size} packs"
+                                        },
+                                        fontFamily = JetBrainsMonoFamily,
+                                        fontSize = 10.5.sp,
+                                        color = if (downloadingCount > 0) ElectricCyan else MaterialTheme.colorScheme.onSurface
+                                    )
+                                }
+                            }
                         }
 
                         Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -478,6 +554,7 @@ fun DashboardScreen(
                             ) {
                                 SupportedTargetLanguages.forEach { lang ->
                                     val selected = lang.code == config.targetLanguageCode
+                                    val packStatus = packStatuses[lang.code] ?: ModelPackStatus.NOT_DOWNLOADED
                                     Surface(
                                         shape = RoundedCornerShape(10.dp),
                                         color = if (selected) {
@@ -486,14 +563,41 @@ fun DashboardScreen(
                                             MaterialTheme.colorScheme.surfaceVariant
                                         },
                                         modifier = Modifier
-                                            .heightIn(min = 38.dp)
+                                            .heightIn(min = 48.dp)
                                             .clickable { onSelectTargetLanguage(lang.code) }
                                             .testTag("pref_lang_${lang.code}")
                                     ) {
-                                        Box(
-                                            contentAlignment = Alignment.Center,
+                                        Row(
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            horizontalArrangement = Arrangement.spacedBy(6.dp),
                                             modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
                                         ) {
+                                            when (packStatus) {
+                                                ModelPackStatus.DOWNLOADING -> {
+                                                    CircularProgressIndicator(
+                                                        color = if (selected) MaterialTheme.colorScheme.onPrimary else ElectricCyan,
+                                                        strokeWidth = 1.8.dp,
+                                                        modifier = Modifier.size(10.dp)
+                                                    )
+                                                }
+                                                ModelPackStatus.DOWNLOADED -> {
+                                                    Box(
+                                                        modifier = Modifier
+                                                            .size(7.dp)
+                                                            .clip(CircleShape)
+                                                            .background(EmeraldActive)
+                                                    )
+                                                }
+                                                ModelPackStatus.ERROR -> {
+                                                    Box(
+                                                        modifier = Modifier
+                                                            .size(7.dp)
+                                                            .clip(CircleShape)
+                                                            .background(CoralError)
+                                                    )
+                                                }
+                                                ModelPackStatus.NOT_DOWNLOADED -> Unit
+                                            }
                                             Text(
                                                 text = "${lang.shortCode} · ${lang.label}",
                                                 fontFamily = InterFamily,
@@ -507,6 +611,241 @@ fun DashboardScreen(
                                                 maxLines = 1,
                                                 overflow = TextOverflow.Ellipsis
                                             )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Selected Target Pack Status & All-Pack Manager
+                        val selectedLang = SupportedTargetLanguages.firstOrNull {
+                            it.code == config.targetLanguageCode
+                        } ?: SupportedTargetLanguages.first()
+                        val selectedStatus = packStatuses[selectedLang.code] ?: ModelPackStatus.NOT_DOWNLOADED
+                        val selectedError = packErrors[selectedLang.code]
+
+                        Surface(
+                            shape = RoundedCornerShape(12.dp),
+                            color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.65f),
+                            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .testTag("offline_pack_status_card")
+                        ) {
+                            Column(
+                                modifier = Modifier.padding(12.dp),
+                                verticalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            text = "${selectedLang.label} (${selectedLang.shortCode}) Offline Pack",
+                                            fontFamily = SpaceGroteskFamily,
+                                            fontWeight = FontWeight.Medium,
+                                            fontSize = 13.sp,
+                                            color = MaterialTheme.colorScheme.onSurface
+                                        )
+                                        Text(
+                                            text = when (selectedStatus) {
+                                                ModelPackStatus.DOWNLOADED -> "Ready offline via Google ML Kit"
+                                                ModelPackStatus.DOWNLOADING -> "Downloading via Google Play Services…"
+                                                ModelPackStatus.ERROR -> selectedError ?: "Download failed. Check network / Play Services."
+                                                ModelPackStatus.NOT_DOWNLOADED -> "Not cached yet · Downloads on first use or tap Download"
+                                            },
+                                            fontFamily = InterFamily,
+                                            fontSize = 11.5.sp,
+                                            color = when (selectedStatus) {
+                                                ModelPackStatus.DOWNLOADED -> EmeraldActive
+                                                ModelPackStatus.DOWNLOADING -> ElectricCyan
+                                                ModelPackStatus.ERROR -> CoralError
+                                                ModelPackStatus.NOT_DOWNLOADED -> MaterialTheme.colorScheme.onSurfaceVariant
+                                            }
+                                        )
+                                    }
+
+                                    when (selectedStatus) {
+                                        ModelPackStatus.DOWNLOADED -> {
+                                            OutlinedButton(
+                                                onClick = { onDeleteLanguagePack(selectedLang.code) },
+                                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
+                                                shape = RoundedCornerShape(10.dp),
+                                                modifier = Modifier
+                                                    .heightIn(min = 48.dp)
+                                                    .testTag("delete_selected_pack_button")
+                                            ) {
+                                                Icon(
+                                                    imageVector = Icons.Rounded.DeleteOutline,
+                                                    contentDescription = "Remove offline pack",
+                                                    modifier = Modifier.size(16.dp)
+                                                )
+                                                Spacer(Modifier.width(4.dp))
+                                                Text("Remove", fontSize = 12.sp)
+                                            }
+                                        }
+                                        ModelPackStatus.DOWNLOADING -> {
+                                            CircularProgressIndicator(
+                                                color = ElectricCyan,
+                                                strokeWidth = 2.2.dp,
+                                                modifier = Modifier
+                                                    .padding(horizontal = 12.dp)
+                                                    .size(20.dp)
+                                            )
+                                        }
+                                        ModelPackStatus.NOT_DOWNLOADED, ModelPackStatus.ERROR -> {
+                                            Button(
+                                                onClick = { onDownloadLanguagePack(selectedLang.code) },
+                                                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
+                                                shape = RoundedCornerShape(10.dp),
+                                                modifier = Modifier
+                                                    .heightIn(min = 48.dp)
+                                                    .testTag("download_selected_pack_button")
+                                            ) {
+                                                Icon(
+                                                    imageVector = Icons.Rounded.CloudDownload,
+                                                    contentDescription = null,
+                                                    modifier = Modifier.size(16.dp)
+                                                )
+                                                Spacer(Modifier.width(6.dp))
+                                                Text(
+                                                    text = if (selectedStatus == ModelPackStatus.ERROR) "Retry" else "Download",
+                                                    fontSize = 12.sp,
+                                                    fontFamily = SpaceGroteskFamily
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+
+                                if (selectedStatus == ModelPackStatus.DOWNLOADING) {
+                                    LinearProgressIndicator(
+                                        color = ElectricCyan,
+                                        trackColor = MaterialTheme.colorScheme.outline,
+                                        modifier = Modifier.fillMaxWidth()
+                                    )
+                                }
+
+                                Text(
+                                    text = "Offline translation needs both source & target ML Kit packs cached. If a pack is still downloading or fails, the overlay offers 1-tap Google Translate fallback (app or web).",
+                                    fontFamily = InterFamily,
+                                    fontSize = 11.5.sp,
+                                    lineHeight = 15.5.sp,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .heightIn(min = 48.dp)
+                                        .clip(RoundedCornerShape(10.dp))
+                                        .clickable { showPackManager = !showPackManager }
+                                        .padding(horizontal = 4.dp, vertical = 6.dp)
+                                        .testTag("toggle_pack_manager_button"),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Text(
+                                        text = if (showPackManager) {
+                                            "Hide All 12 Offline Packs"
+                                        } else {
+                                            "Manage All 12 Offline Packs ($downloadedCount/${SupportedTargetLanguages.size} Ready)"
+                                        },
+                                        fontFamily = SpaceGroteskFamily,
+                                        fontWeight = FontWeight.Medium,
+                                        fontSize = 12.5.sp,
+                                        color = ElectricCyan
+                                    )
+                                    Icon(
+                                        imageVector = if (showPackManager) Icons.Rounded.ExpandLess else Icons.Rounded.ExpandMore,
+                                        contentDescription = null,
+                                        tint = ElectricCyan
+                                    )
+                                }
+
+                                AnimatedVisibility(visible = showPackManager) {
+                                    Column(
+                                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                                        modifier = Modifier.padding(top = 4.dp)
+                                    ) {
+                                        SupportedTargetLanguages.forEach { lang ->
+                                            val st = packStatuses[lang.code] ?: ModelPackStatus.NOT_DOWNLOADED
+                                            Row(
+                                                modifier = Modifier
+                                                    .fillMaxWidth()
+                                                    .heightIn(min = 48.dp)
+                                                    .clip(RoundedCornerShape(10.dp))
+                                                    .background(MaterialTheme.colorScheme.surface)
+                                                    .padding(horizontal = 10.dp, vertical = 6.dp),
+                                                horizontalArrangement = Arrangement.SpaceBetween,
+                                                verticalAlignment = Alignment.CenterVertically
+                                            ) {
+                                                Column(modifier = Modifier.weight(1f)) {
+                                                    Text(
+                                                        text = "${lang.label} (${lang.shortCode})",
+                                                        fontFamily = InterFamily,
+                                                        fontWeight = FontWeight.Medium,
+                                                        fontSize = 13.sp,
+                                                        color = MaterialTheme.colorScheme.onSurface
+                                                    )
+                                                    Text(
+                                                        text = when (st) {
+                                                            ModelPackStatus.DOWNLOADED -> "Downloaded offline"
+                                                            ModelPackStatus.DOWNLOADING -> "Downloading…"
+                                                            ModelPackStatus.ERROR -> packErrors[lang.code] ?: "Failed"
+                                                            ModelPackStatus.NOT_DOWNLOADED -> "Not downloaded"
+                                                        },
+                                                        fontFamily = JetBrainsMonoFamily,
+                                                        fontSize = 10.5.sp,
+                                                        color = when (st) {
+                                                            ModelPackStatus.DOWNLOADED -> EmeraldActive
+                                                            ModelPackStatus.DOWNLOADING -> ElectricCyan
+                                                            ModelPackStatus.ERROR -> CoralError
+                                                            ModelPackStatus.NOT_DOWNLOADED -> MaterialTheme.colorScheme.onSurfaceVariant
+                                                        },
+                                                        maxLines = 1,
+                                                        overflow = TextOverflow.Ellipsis
+                                                    )
+                                                }
+                                                when (st) {
+                                                    ModelPackStatus.DOWNLOADED -> {
+                                                        OutlinedButton(
+                                                            onClick = { onDeleteLanguagePack(lang.code) },
+                                                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                                                            modifier = Modifier
+                                                                .heightIn(min = 48.dp)
+                                                                .testTag("pack_delete_${lang.code}")
+                                                        ) {
+                                                            Text("Remove", fontSize = 11.5.sp)
+                                                        }
+                                                    }
+                                                    ModelPackStatus.DOWNLOADING -> {
+                                                        CircularProgressIndicator(
+                                                            color = ElectricCyan,
+                                                            strokeWidth = 2.dp,
+                                                            modifier = Modifier
+                                                                .padding(end = 10.dp)
+                                                                .size(18.dp)
+                                                        )
+                                                    }
+                                                    ModelPackStatus.NOT_DOWNLOADED, ModelPackStatus.ERROR -> {
+                                                        OutlinedButton(
+                                                            onClick = { onDownloadLanguagePack(lang.code) },
+                                                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                                                            modifier = Modifier
+                                                                .heightIn(min = 48.dp)
+                                                                .testTag("pack_download_${lang.code}")
+                                                        ) {
+                                                            Text(
+                                                                text = if (st == ModelPackStatus.ERROR) "Retry" else "Get",
+                                                                fontSize = 11.5.sp
+                                                            )
+                                                        }
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                 }
@@ -641,11 +980,13 @@ fun MiniPhoneZonePreview(
             val scaleY = size.height / 844f
             val w = (config.widthDp * scaleX).coerceAtLeast(6.dp.toPx())
             val h = (config.heightDp * scaleY).coerceAtLeast(6.dp.toPx())
+            val insetX = config.edgeInsetDp * scaleX
+            val insetY = config.edgeInsetDp * scaleY
 
             val (left, top) = when (config.anchor) {
-                EdgeAnchor.LEFT_EDGE -> 0f to ((size.height - h) * config.offsetYFraction)
-                EdgeAnchor.RIGHT_EDGE -> (size.width - w) to ((size.height - h) * config.offsetYFraction)
-                EdgeAnchor.BOTTOM_BAR -> ((size.width - w) * config.offsetYFraction) to (size.height - h)
+                EdgeAnchor.LEFT_EDGE -> insetX to ((size.height - h) * config.offsetYFraction)
+                EdgeAnchor.RIGHT_EDGE -> (size.width - w - insetX) to ((size.height - h) * config.offsetYFraction)
+                EdgeAnchor.BOTTOM_BAR -> ((size.width - w) * config.offsetYFraction) to (size.height - h - insetY)
                 EdgeAnchor.FREE -> ((size.width - w) * config.offsetXFraction) to ((size.height - h) * config.offsetYFraction)
             }
 

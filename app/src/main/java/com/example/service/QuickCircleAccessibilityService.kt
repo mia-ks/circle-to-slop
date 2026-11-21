@@ -8,6 +8,7 @@ import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.PixelFormat
+import android.graphics.Rect
 import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.os.Handler
@@ -119,7 +120,7 @@ class QuickCircleAccessibilityService : AccessibilityService() {
         val widthPx = (config.widthDp * density).roundToInt().coerceAtLeast((18f * density).roundToInt())
         val heightPx = (config.heightDp * density).roundToInt().coerceAtLeast((18f * density).roundToInt())
 
-        val (xPos, yPos) = computeWindowPosition(config, screenW, screenH, widthPx, heightPx)
+        val (xPos, yPos) = computeWindowPosition(config, screenW, screenH, widthPx, heightPx, density)
 
         val params = WindowManager.LayoutParams(
             widthPx,
@@ -136,12 +137,18 @@ class QuickCircleAccessibilityService : AccessibilityService() {
         }
 
         val view = triggerView ?: createTriggerView().also { created ->
+            created.addOnLayoutChangeListener { v, _, _, _, _, _, _, _, _ ->
+                if (v.width > 0 && v.height > 0) {
+                    applySystemGestureExclusion(v, v.width, v.height, currentConfig, density)
+                }
+            }
             triggerView = created
             windowManager.addView(created, params)
         }
 
         triggerLayoutParams = params
         styleTriggerView(view, config, density)
+        applySystemGestureExclusion(view, widthPx, heightPx, config, density)
         if (view.parent != null) {
             try {
                 windowManager.updateViewLayout(view, params)
@@ -151,34 +158,61 @@ class QuickCircleAccessibilityService : AccessibilityService() {
         }
     }
 
+    private fun applySystemGestureExclusion(
+        view: View,
+        widthPx: Int,
+        heightPx: Int,
+        config: GestureZoneConfig,
+        density: Float
+    ) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return
+        if (!config.excludeSystemBack) {
+            view.systemGestureExclusionRects = emptyList()
+            return
+        }
+        // Android caps side-edge gesture exclusion to 200dp vertically per edge; center if taller
+        val maxExcludedHeightPx = (200f * density).roundToInt()
+        val rectTop = if (heightPx > maxExcludedHeightPx) (heightPx - maxExcludedHeightPx) / 2 else 0
+        val rectBottom = (rectTop + maxExcludedHeightPx).coerceAtMost(heightPx)
+        view.systemGestureExclusionRects = listOf(Rect(0, rectTop, widthPx, rectBottom))
+    }
+
     private fun computeWindowPosition(
         config: GestureZoneConfig,
         screenW: Int,
         screenH: Int,
         widthPx: Int,
-        heightPx: Int
+        heightPx: Int,
+        density: Float
     ): Pair<Int, Int> {
+        val insetPx = (config.edgeInsetDp * density).roundToInt().coerceAtLeast(0)
         return when (config.anchor) {
             EdgeAnchor.LEFT_EDGE -> {
-                val y = ((screenH - heightPx) * config.offsetYFraction).roundToInt().coerceIn(0, (screenH - heightPx).coerceAtLeast(0))
-                0 to y
+                val x = insetPx.coerceIn(0, (screenW - widthPx).coerceAtLeast(0))
+                val y = ((screenH - heightPx) * config.offsetYFraction).roundToInt()
+                    .coerceIn(0, (screenH - heightPx).coerceAtLeast(0))
+                x to y
             }
 
             EdgeAnchor.RIGHT_EDGE -> {
-                val x = (screenW - widthPx).coerceAtLeast(0)
-                val y = ((screenH - heightPx) * config.offsetYFraction).roundToInt().coerceIn(0, (screenH - heightPx).coerceAtLeast(0))
+                val x = (screenW - widthPx - insetPx).coerceIn(0, (screenW - widthPx).coerceAtLeast(0))
+                val y = ((screenH - heightPx) * config.offsetYFraction).roundToInt()
+                    .coerceIn(0, (screenH - heightPx).coerceAtLeast(0))
                 x to y
             }
 
             EdgeAnchor.BOTTOM_BAR -> {
-                val x = ((screenW - widthPx) * config.offsetYFraction).roundToInt().coerceIn(0, (screenW - widthPx).coerceAtLeast(0))
-                val y = (screenH - heightPx).coerceAtLeast(0)
+                val x = ((screenW - widthPx) * config.offsetYFraction).roundToInt()
+                    .coerceIn(0, (screenW - widthPx).coerceAtLeast(0))
+                val y = (screenH - heightPx - insetPx).coerceIn(0, (screenH - heightPx).coerceAtLeast(0))
                 x to y
             }
 
             EdgeAnchor.FREE -> {
-                val x = ((screenW - widthPx) * config.offsetXFraction).roundToInt().coerceIn(0, (screenW - widthPx).coerceAtLeast(0))
-                val y = ((screenH - heightPx) * config.offsetYFraction).roundToInt().coerceIn(0, (screenH - heightPx).coerceAtLeast(0))
+                val x = ((screenW - widthPx) * config.offsetXFraction).roundToInt()
+                    .coerceIn(0, (screenW - widthPx).coerceAtLeast(0))
+                val y = ((screenH - heightPx) * config.offsetYFraction).roundToInt()
+                    .coerceIn(0, (screenH - heightPx).coerceAtLeast(0))
                 x to y
             }
         }

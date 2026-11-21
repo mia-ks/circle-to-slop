@@ -43,9 +43,11 @@ val SupportedTargetLanguages = listOf(
 data class GestureZoneConfig(
     val anchor: EdgeAnchor = EdgeAnchor.RIGHT_EDGE,
     val offsetXFraction: Float = 0.96f,
-    val offsetYFraction: Float = 0.52f,
+    val offsetYFraction: Float = 0.44f,
     val widthDp: Float = 28f,
-    val heightDp: Float = 136f,
+    val heightDp: Float = 120f,
+    val edgeInsetDp: Float = 0f,
+    val excludeSystemBack: Boolean = true,
     val triggerMode: TriggerMode = TriggerMode.SWIPE_IN,
     val handleOpacity: Float = 0.28f,
     val hapticFeedback: Boolean = true,
@@ -57,6 +59,7 @@ data class GestureZoneConfig(
     fun summaryLine(): String {
         val w = widthDp.toInt()
         val h = heightDp.toInt()
-        return "${anchor.label} · ${w}×${h} dp · ${triggerMode.label}"
+        val insetSuffix = if (edgeInsetDp >= 1f) " · +${edgeInsetDp.toInt()}dp inset" else ""
+        return "${anchor.label} · ${w}×${h} dp$insetSuffix · ${triggerMode.label}"
     }
 }
