@@ -64,6 +64,29 @@ class ExampleRobolectricTest {
     }
 
     @Test
+    fun `google translate uri preserves text source and target languages`() {
+        val uri = OcrAndLensEngine.buildGoogleTranslateWebUri(
+            text = "東京駅へようこそ",
+            targetLangCode = "en",
+            sourceLangCodeHint = "ja"
+        )
+        assertEquals("translate.google.com", uri.host)
+        assertEquals("ja", uri.getQueryParameter("sl"))
+        assertEquals("en", uri.getQueryParameter("tl"))
+        assertEquals("東京駅へようこそ", uri.getQueryParameter("text"))
+        assertEquals("translate", uri.getQueryParameter("op"))
+
+        val autoZhUri = OcrAndLensEngine.buildGoogleTranslateWebUri(
+            text = "Привет мир",
+            targetLangCode = "zh",
+            sourceLangCodeHint = null
+        )
+        assertEquals("auto", autoZhUri.getQueryParameter("sl"))
+        assertEquals("zh-CN", autoZhUri.getQueryParameter("tl"))
+        assertEquals("Привет мир", autoZhUri.getQueryParameter("text"))
+    }
+
+    @Test
     fun `lens word hit testing and range text joining work cleanly`() {
         val words = listOf(
             RecognizedTextWord(0, 0, 0, "Coffee", Rect(10, 10, 90, 40)),
@@ -76,6 +99,19 @@ class ExampleRobolectricTest {
         assertEquals("Shop", hit?.text)
         assertEquals("Shop\nOpen Daily", buildSelectedText(words, TextSelectionRange(1, 3)))
         assertEquals("Coffee Shop", buildSelectedText(words, TextSelectionRange(1, 0)))
+
+        val brushed = com.example.overlay.matchTextBrushToWordRange(
+            screenPoints = listOf(
+                androidx.compose.ui.geometry.Offset(30f, 25f),
+                androidx.compose.ui.geometry.Offset(130f, 25f),
+                androidx.compose.ui.geometry.Offset(120f, 65f)
+            ),
+            words = words,
+            sx = 1f,
+            sy = 1f,
+            density = androidx.compose.ui.unit.Density(1f)
+        )
+        assertEquals(TextSelectionRange(0, 3), brushed)
     }
 
     @Test

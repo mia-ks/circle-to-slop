@@ -30,6 +30,9 @@ import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.Fill
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.LayoutCoordinates
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.positionInParent
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.TextStyle
@@ -182,20 +185,33 @@ fun matchTextBrushToWordRange(
     val startEndDist = (screenPoints.last() - screenPoints.first()).getDistance()
     val maxSpan = max(spanW, spanH).coerceAtLeast(1f)
 
-    // Closed loops stay as circle/lasso object cutouts; open horizontal/linear sweeps snap to words
-    val isOpenBrushStroke = startEndDist > maxSpan * 0.42f
-    val flatSweepHeight = with(density) { 44.dp.toPx() }
-    if (!isOpenBrushStroke && spanH > flatSweepHeight) {
-        return null
+    // Densify segments slightly so fast finger swipes never skip short words
+    val sampledPoints = buildList {
+        val stepPx = with(density) { 8.dp.toPx() }
+        for (i in screenPoints.indices) {
+            val cur = screenPoints[i]
+            if (i > 0) {
+                val prev = screenPoints[i - 1]
+                val dist = (cur - prev).getDistance()
+                val steps = (dist / stepPx).toInt().coerceIn(0, 12)
+                for (s in 1 until steps) {
+                    val t = s.toFloat() / steps.toFloat()
+                    add(Offset(prev.x + (cur.x - prev.x) * t, prev.y + (cur.y - prev.y) * t))
+                }
+            }
+            add(cur)
+        }
     }
 
-    val padX = with(density) { 10.dp.toPx() } / sx
-    val padY = with(density) { 8.dp.toPx() } / sy
+    val padX = with(density) { 12.dp.toPx() } / sx
+    val padY = with(density) { 10.dp.toPx() } / sy
 
     val hitIndices = mutableListOf<Int>()
-    for (pt in screenPoints) {
+    var pointsOnWords = 0
+    for (pt in sampledPoints) {
         val bx = pt.x / sx
         val by = pt.y / sy
+        var hitThisPoint = false
         for (w in words) {
             val r = w.boundingBox
             if (bx >= (r.left - padX) &&
@@ -204,10 +220,22 @@ fun matchTextBrushToWordRange(
                 by <= (r.bottom + padY)
             ) {
                 hitIndices.add(w.globalIndex)
+                hitThisPoint = true
             }
         }
+        if (hitThisPoint) pointsOnWords++
     }
     if (hitIndices.isEmpty()) return null
+
+    // Open brush strokes (including multi-line diagonal drags) OR strokes that mostly trace text snap to words;
+    // tall closed loops around empty/image regions stay as Freehand object cutouts.
+    val isOpenBrushStroke = startEndDist > maxSpan * 0.34f
+    val flatSweepHeight = with(density) { 48.dp.toPx() }
+    val wordHitRatio = pointsOnWords.toFloat() / sampledPoints.size.coerceAtLeast(1)
+    if (!isOpenBrushStroke && spanH > flatSweepHeight && wordHitRatio < 0.45f) {
+        return null
+    }
+
     val first = hitIndices.first()
     val last = hitIndices.last()
     return TextSelectionRange(min(first, last), max(first, last))
@@ -247,28 +275,41 @@ fun LensTeardropHandle(
 
     val currentOnDragDelta by rememberUpdatedState(onDragDeltaScreen)
     val currentOnDragStateChanged by rememberUpdatedState(onDragStateChanged)
-    val currentAnchor by rememberUpdatedState(anchorOffset)
-    val currentBoxLeft by rememberUpdatedState(boxLeft)
-    val currentBoxTop by rememberUpdatedState(boxTop)
+    val tipAlignYOffsetPx = with(density) { 14.dp.toPx() }
+    val handleCoordsState = remember { androidx.compose.runtime.mutableStateOf<LayoutCoordinates?>(null) }
 
     Box(
         modifier = Modifier
             .offset { IntOffset(boxLeft.roundToInt(), boxTop.roundToInt()) }
             .size(48.dp)
+            .onGloballyPositioned { coords ->
+                handleCoordsState.value = coords
+            }
             .pointerInput(isStartHandle) {
-                var pointerScreenPos = currentAnchor
                 detectDragGestures(
                     onDragStart = { localOffset ->
-                        pointerScreenPos = Offset(
-                            currentBoxLeft + localOffset.x,
-                            currentBoxTop + localOffset.y - with(density) { 14.dp.toPx() }
-                        )
                         currentOnDragStateChanged(true)
+                        val origin = handleCoordsState.value?.let {
+                            if (it.isAttached) it.positionInParent() else Offset(boxLeft, boxTop)
+                        } ?: Offset(boxLeft, boxTop)
+                        currentOnDragDelta(
+                            Offset(
+                                origin.x + localOffset.x,
+                                origin.y + localOffset.y - tipAlignYOffsetPx
+                            )
+                        )
                     },
-                    onDrag = { change, dragAmount ->
+                    onDrag = { change, _ ->
                         change.consume()
-                        pointerScreenPos += dragAmount
-                        currentOnDragDelta(pointerScreenPos)
+                        val origin = handleCoordsState.value?.let {
+                            if (it.isAttached) it.positionInParent() else Offset(boxLeft, boxTop)
+                        } ?: Offset(boxLeft, boxTop)
+                        currentOnDragDelta(
+                            Offset(
+                                origin.x + change.position.x,
+                                origin.y + change.position.y - tipAlignYOffsetPx
+                            )
+                        )
                     },
                     onDragEnd = {
                         currentOnDragStateChanged(false)

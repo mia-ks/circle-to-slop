@@ -264,6 +264,26 @@ object OcrAndLensEngine {
     ): List<RecognizedTextLine> = analyzeFullScreen(context, bitmap, scriptMode).lines
 
     /**
+     * Ultra-fast first-pass Latin scan (~80-160ms): returns selectable words & lines immediately
+     * using only the prewarmed Latin model without running MoE or blocking on LanguageID.
+     */
+    suspend fun analyzeFullScreenFastLatin(
+        bitmap: Bitmap
+    ): ScreenOcrAnalysis = withContext(Dispatchers.Default) {
+        try {
+            val candidates = MoEOcrRouter.recognizeFastLatin(bitmap)
+            buildScreenAnalysisFromCandidates(
+                bitmap = bitmap,
+                candidates = candidates,
+                enrichLanguagesAndColors = false
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "Fast Latin full-screen OCR failed", e)
+            ScreenOcrAnalysis()
+        }
+    }
+
+    /**
      * Progressive screen OCR:
      * Emits Stage 1 (fast ML Kit word/line geometry without blocking on LanguageID/pixel sampling)
      * in ~100–250ms, then emits Stage 2 once any extra Tesseract scripts finish merging.
@@ -543,9 +563,10 @@ object OcrAndLensEngine {
         cropBitmap: Bitmap,
         cropRectInScreen: Rect,
         fullScreenLines: List<RecognizedTextLine>,
-        scriptMode: OcrScriptMode
+        scriptMode: OcrScriptMode,
+        useMoE: Boolean = false
     ): OcrRegionResult = withContext(Dispatchers.Default) {
-        // 1. Run high-precision MoE OCR directly on the cropped bitmap (upscale small crops for crispness)
+        // 1. Run fast Latin OCR (or full MoE when requested/explicit non-Latin script selected)
         val workingBitmap = if (cropBitmap.width < 540 || cropBitmap.height < 220) {
             val scale = 2.0f
             Bitmap.createScaledBitmap(
@@ -558,8 +579,14 @@ object OcrAndLensEngine {
             cropBitmap
         }
 
+        val runFullMoE = useMoE || (scriptMode != OcrScriptMode.LATIN && scriptMode != OcrScriptMode.AUTO_MOE)
         val directTextLines = try {
-            MoEOcrRouter.recognizeWithMoE(context, workingBitmap, scriptMode).map { it.text }
+            val candidates = if (runFullMoE) {
+                MoEOcrRouter.recognizeWithMoE(context, workingBitmap, scriptMode)
+            } else {
+                MoEOcrRouter.recognizeFastLatin(workingBitmap)
+            }
+            candidates.map { it.text }
         } catch (e: Exception) {
             Log.e(TAG, "Cropped OCR failed", e)
             emptyList()
@@ -801,6 +828,61 @@ object OcrAndLensEngine {
         return sendCheck.resolveActivity(pm) != null
     }
 
+    fun buildGoogleTranslateWebUri(
+        text: String,
+        targetLangCode: String,
+        sourceLangCodeHint: String? = null
+    ): Uri {
+        val safeText = text.trim().take(1800)
+        val sl = normalizeTranslateWebLang(sourceLangCodeHint, fallback = "auto")
+        val tl = normalizeTranslateWebLang(targetLangCode, fallback = "en")
+        return Uri.Builder()
+            .scheme("https")
+            .authority("translate.google.com")
+            .path("/")
+            .appendQueryParameter("sl", sl)
+            .appendQueryParameter("tl", tl)
+            .appendQueryParameter("text", safeText)
+            .appendQueryParameter("op", "translate")
+            .build()
+    }
+
+    private fun normalizeTranslateWebLang(code: String?, fallback: String): String {
+        val clean = code?.trim()?.lowercase(Locale.ROOT).orEmpty()
+        if (clean.isBlank() || clean == "und" || clean == "auto") return fallback
+        return when (clean) {
+            "zh", "zh-hans", "zh-cn" -> "zh-CN"
+            "zh-hant", "zh-tw", "zh-hk" -> "zh-TW"
+            else -> clean.substringBefore("-")
+        }
+    }
+
+    private fun resolvePreferredBrowserPackage(context: Context): String? {
+        val pm = context.packageManager
+        val probe = Intent(Intent.ACTION_VIEW, Uri.parse("https://example.org/"))
+            .addCategory(Intent.CATEGORY_BROWSABLE)
+
+        val defaultMatch = pm.resolveActivity(probe, android.content.pm.PackageManager.MATCH_DEFAULT_ONLY)
+            ?.activityInfo?.packageName
+        if (!defaultMatch.isNullOrBlank() &&
+            defaultMatch != "android" &&
+            defaultMatch != GOOGLE_TRANSLATE_PACKAGE &&
+            !defaultMatch.contains("resolver", ignoreCase = true)
+        ) {
+            return defaultMatch
+        }
+
+        val candidates = pm.queryIntentActivities(probe, android.content.pm.PackageManager.MATCH_DEFAULT_ONLY)
+        return candidates
+            .mapNotNull { it.activityInfo?.packageName }
+            .firstOrNull { pkg ->
+                pkg.isNotBlank() &&
+                    pkg != "android" &&
+                    pkg != GOOGLE_TRANSLATE_PACKAGE &&
+                    !pkg.contains("resolver", ignoreCase = true)
+            }
+    }
+
     fun launchGoogleTranslateFallback(
         context: Context,
         text: String,
@@ -810,29 +892,49 @@ object OcrAndLensEngine {
         val trimmed = text.trim()
         if (trimmed.isBlank()) return false
 
-        val sl = sourceLangCodeHint?.substringBefore("-")?.lowercase(Locale.ROOT)?.ifBlank { "auto" } ?: "auto"
-        val tl = targetLangCode.substringBefore("-").lowercase(Locale.ROOT).ifBlank { "en" }
-        val translateUri = Uri.parse(
-            "https://translate.google.com/?sl=${Uri.encode(sl)}&tl=${Uri.encode(tl)}&text=${Uri.encode(trimmed)}&op=translate"
+        val translateUri = buildGoogleTranslateWebUri(
+            text = trimmed,
+            targetLangCode = targetLangCode,
+            sourceLangCodeHint = sourceLangCodeHint
         )
 
-        val pm = context.packageManager
+        // 1. Target the user's browser explicitly so Android App Links do NOT open the native
+        // Google Translate app (whose ACTION_VIEW drops sl/tl/text URL parameters).
+        val browserPkg = try {
+            resolvePreferredBrowserPackage(context)
+        } catch (_: Exception) {
+            null
+        }
+        if (browserPkg != null) {
+            try {
+                val browserIntent = Intent(Intent.ACTION_VIEW, translateUri).apply {
+                    addCategory(Intent.CATEGORY_BROWSABLE)
+                    setPackage(browserPkg)
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                context.startActivity(browserIntent)
+                return true
+            } catch (e: Exception) {
+                Log.w(TAG, "Browser-targeted Translate Web failed ($browserPkg): ${e.message}")
+            }
+        }
 
-        // 1. Prefer Google Translate app deep link (preserves both source and target languages)
+        // 2. Fallback to system VIEW (no Translate app package pinning)
         try {
-            val appViewIntent = Intent(Intent.ACTION_VIEW, translateUri).apply {
-                setPackage(GOOGLE_TRANSLATE_PACKAGE)
+            val webIntent = Intent(Intent.ACTION_VIEW, translateUri).apply {
+                addCategory(Intent.CATEGORY_BROWSABLE)
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             }
-            if (appViewIntent.resolveActivity(pm) != null) {
-                context.startActivity(appViewIntent)
+            if (webIntent.resolveActivity(context.packageManager) != null) {
+                context.startActivity(webIntent)
                 return true
             }
         } catch (e: Exception) {
-            Log.w(TAG, "Google Translate app ACTION_VIEW failed: ${e.message}")
+            Log.w(TAG, "Generic ACTION_VIEW Translate failed: ${e.message}")
         }
 
-        // 2. Fallback to Google Translate app ACTION_PROCESS_TEXT / ACTION_SEND
+        // 3. Final fallback: Google Translate native PROCESS_TEXT / SEND (preserves text)
+        val pm = context.packageManager
         try {
             val processTextIntent = Intent(Intent.ACTION_PROCESS_TEXT).apply {
                 type = "text/plain"
@@ -857,20 +959,9 @@ object OcrAndLensEngine {
                 return true
             }
         } catch (e: Exception) {
-            Log.w(TAG, "Google Translate app share intent failed: ${e.message}")
+            Log.e(TAG, "Failed to open Google Translate", e)
         }
-
-        // 3. Final fallback: Google Translate in the system web browser
-        return try {
-            val browserIntent = Intent(Intent.ACTION_VIEW, translateUri).apply {
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            }
-            context.startActivity(browserIntent)
-            true
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to open Google Translate in browser", e)
-            false
-        }
+        return false
     }
 
     fun launchWebTranslate(

@@ -36,6 +36,16 @@ jobs:
             echo "$SECRET_KS" | base64 -d > "$KS_PATH"
             echo "STORE_PASSWORD=$SECRET_STORE_PW" >> "$GITHUB_ENV"
             echo "KEY_PASSWORD=$SECRET_KEY_PW" >> "$GITHUB_ENV"
+          elif [ -f debug.keystore.base64 ]; then
+            # Reuse the repo's deterministic OSS signing key so every CI build updates cleanly in-place
+            OSS_SRC="${{ runner.temp }}/oss-src.keystore"
+            base64 -d debug.keystore.base64 > "$OSS_SRC"
+            keytool -importkeystore -noprompt \
+              -srckeystore "$OSS_SRC" -srcstorepass android -srcalias androiddebugkey -srckeypass android \
+              -destkeystore "$KS_PATH" -deststoretype PKCS12 -deststorepass quickcircle-oss -destalias upload -destkeypass quickcircle-oss
+            rm -f "$OSS_SRC"
+            echo "STORE_PASSWORD=quickcircle-oss" >> "$GITHUB_ENV"
+            echo "KEY_PASSWORD=quickcircle-oss" >> "$GITHUB_ENV"
           else
             keytool -genkeypair -noprompt \
               -keystore "$KS_PATH" \

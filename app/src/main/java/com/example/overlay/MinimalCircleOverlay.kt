@@ -46,6 +46,7 @@ import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.ContentCopy
 import androidx.compose.material.icons.rounded.ImageSearch
+import androidx.compose.material.icons.rounded.Language
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material.icons.rounded.SelectAll
@@ -68,6 +69,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -155,6 +157,15 @@ fun MinimalCircleOverlay(
     var isScanningInitialWords by remember(screenshotBitmap) {
         mutableStateOf(true)
     }
+    var isRunningMoE by remember(screenshotBitmap) {
+        mutableStateOf(false)
+    }
+    var isMoEApplied by remember(screenshotBitmap) {
+        mutableStateOf(false)
+    }
+    var moeJob by remember(screenshotBitmap) {
+        mutableStateOf<Job?>(null)
+    }
     var hasEnrichedInline by remember(screenshotBitmap) {
         mutableStateOf(false)
     }
@@ -167,6 +178,7 @@ fun MinimalCircleOverlay(
     var isDraggingTextHandle by remember { mutableStateOf(false) }
 
     var croppedBitmap by remember { mutableStateOf<Bitmap?>(null) }
+    var lastCropRect by remember { mutableStateOf<Rect?>(null) }
     var ocrResult by remember { mutableStateOf<OcrRegionResult?>(null) }
     var editableText by remember { mutableStateOf("") }
     var isAnalyzingOcr by remember { mutableStateOf(false) }
@@ -190,24 +202,20 @@ fun MinimalCircleOverlay(
         OcrAndLensEngine.isGoogleTranslateAppInstalled(context)
     }
 
-    // Progressive two-stage OCR: Stage 1 (ML Kit) lands in ~100-220ms; Stage 2 (Tesseract MoE) merges in background
-    LaunchedEffect(screenshotBitmap, scriptMode) {
+    // Ultra-fast Latin first pass (~80-160ms) while keeping MoE prewarmed for the MoE button
+    LaunchedEffect(screenshotBitmap) {
         isScanningInitialWords = true
+        isRunningMoE = false
+        isMoEApplied = false
         hasEnrichedInline = false
         pendingRefinedAnalysis = null
-        OcrAndLensEngine.refreshDownloadedPacksAsync()
-        MoEOcrRouter.refreshAllOcrPacksAsync(context)
-        OcrAndLensEngine.analyzeFullScreenProgressive(context, screenshotBitmap, scriptMode) { next, isFinal ->
-            if (selection == null && !isDrawing && !isDraggingTextHandle) {
-                screenAnalysis = next
-                if (isInlineTranslateMode && next.blocks.isNotEmpty()) {
-                    hasEnrichedInline = false
-                }
+        OcrAndLensEngine.prewarm(context)
+        val fastLatin = OcrAndLensEngine.analyzeFullScreenFastLatin(screenshotBitmap)
+        if (!isMoEApplied && !isRunningMoE) {
+            if (selection !is SelectionGeometry.LensWords && !isDraggingTextHandle) {
+                screenAnalysis = fastLatin
             } else {
-                pendingRefinedAnalysis = next
-            }
-            if (!isFinal || next.words.isNotEmpty() || isFinal) {
-                isScanningInitialWords = false
+                pendingRefinedAnalysis = fastLatin
             }
         }
         isScanningInitialWords = false
@@ -283,19 +291,22 @@ fun MinimalCircleOverlay(
     }
 
     fun applyLensWordSelection(range: TextSelectionRange, runOcrTranslationNow: Boolean) {
+        val activeWords = screenAnalysis.words
+        val activeBlocks = screenAnalysis.blocks
         selection = SelectionGeometry.LensWords(range)
-        if (!runOcrTranslationNow) return
+        if (!runOcrTranslationNow || activeWords.isEmpty()) return
 
-        val selectedWords = selectedWordsForRange(fullScreenWords, range)
-        val text = buildSelectedText(fullScreenWords, range)
-        val bounds = computeSelectionBitmapBounds(fullScreenWords, range) ?: return
+        val selectedWords = selectedWordsForRange(activeWords, range)
+        val text = buildSelectedText(activeWords, range)
+        val bounds = computeSelectionBitmapBounds(activeWords, range) ?: return
 
         val padPx = (8 * density.density).toInt()
-        val l = (bounds.left - padPx).coerceIn(0, screenshotBitmap.width - 1)
-        val t = (bounds.top - padPx).coerceIn(0, screenshotBitmap.height - 1)
-        val r = (bounds.right + padPx).coerceIn(l + 1, screenshotBitmap.width)
-        val b = (bounds.bottom + padPx).coerceIn(t + 1, screenshotBitmap.height)
+        val l = (bounds.left - padPx).coerceIn(0, (screenshotBitmap.width - 1).coerceAtLeast(0))
+        val t = (bounds.top - padPx).coerceIn(0, (screenshotBitmap.height - 1).coerceAtLeast(0))
+        val r = (bounds.right + padPx).coerceIn((l + 1).coerceAtMost(screenshotBitmap.width), screenshotBitmap.width)
+        val b = (bounds.bottom + padPx).coerceIn((t + 1).coerceAtMost(screenshotBitmap.height), screenshotBitmap.height)
 
+        lastCropRect = Rect(l, t, r, b)
         croppedBitmap = Bitmap.createBitmap(
             screenshotBitmap,
             l,
@@ -307,7 +318,7 @@ fun MinimalCircleOverlay(
         isAnalyzingOcr = false
 
         val firstBlockId = selectedWords.firstOrNull()?.blockId
-        val blockLangHint = fullScreenBlocks.firstOrNull { it.id == firstBlockId }?.detectedLanguageCode
+        val blockLangHint = activeBlocks.firstOrNull { it.id == firstBlockId }?.detectedLanguageCode
         val lineCount = selectedWords.map { it.lineIndex }.distinct().size.coerceAtLeast(1)
 
         scope.launch {
@@ -345,10 +356,10 @@ fun MinimalCircleOverlay(
         val scaleY = screenshotBitmap.height / canvasHeight
         val padPx = with(density) { 8.dp.toPx() }
 
-        val bmpLeft = ((leftPx - padPx) * scaleX).toInt().coerceIn(0, screenshotBitmap.width - 1)
-        val bmpTop = ((topPx - padPx) * scaleY).toInt().coerceIn(0, screenshotBitmap.height - 1)
-        val bmpRight = ((rightPx + padPx) * scaleX).toInt().coerceIn(bmpLeft + 1, screenshotBitmap.width)
-        val bmpBottom = ((bottomPx + padPx) * scaleY).toInt().coerceIn(bmpTop + 1, screenshotBitmap.height)
+        val bmpLeft = ((leftPx - padPx) * scaleX).toInt().coerceIn(0, (screenshotBitmap.width - 1).coerceAtLeast(0))
+        val bmpTop = ((topPx - padPx) * scaleY).toInt().coerceIn(0, (screenshotBitmap.height - 1).coerceAtLeast(0))
+        val bmpRight = ((rightPx + padPx) * scaleX).toInt().coerceIn((bmpLeft + 1).coerceAtMost(screenshotBitmap.width), screenshotBitmap.width)
+        val bmpBottom = ((bottomPx + padPx) * scaleY).toInt().coerceIn((bmpTop + 1).coerceAtMost(screenshotBitmap.height), screenshotBitmap.height)
 
         val cropRect = Rect(bmpLeft, bmpTop, bmpRight, bmpBottom)
         val crop = Bitmap.createBitmap(
@@ -359,6 +370,7 @@ fun MinimalCircleOverlay(
             cropRect.height().coerceAtLeast(1)
         )
 
+        lastCropRect = cropRect
         croppedBitmap = crop
         isAnalyzingOcr = true
         translationState = TranslationState.Idle
@@ -368,8 +380,9 @@ fun MinimalCircleOverlay(
                 context = context,
                 cropBitmap = crop,
                 cropRectInScreen = cropRect,
-                fullScreenLines = fullScreenLines,
-                scriptMode = scriptMode
+                fullScreenLines = screenAnalysis.lines,
+                scriptMode = scriptMode,
+                useMoE = isMoEApplied
             )
             ocrResult = result
             editableText = result.extractedText
@@ -381,9 +394,60 @@ fun MinimalCircleOverlay(
         }
     }
 
+    fun triggerMoEScan() {
+        if (isRunningMoE) return
+        moeJob?.cancel()
+        isRunningMoE = true
+        val effectiveMode = if (scriptMode == OcrScriptMode.LATIN) OcrScriptMode.AUTO_MOE else scriptMode
+        moeJob = scope.launch {
+            try {
+                OcrAndLensEngine.analyzeFullScreenProgressive(context, screenshotBitmap, effectiveMode) { next, isFinal ->
+                    val lockWordIndices = selection is SelectionGeometry.LensWords || isDraggingTextHandle
+                    if (!lockWordIndices) {
+                        screenAnalysis = next
+                        hasEnrichedInline = false
+                    } else {
+                        pendingRefinedAnalysis = next
+                    }
+                    if (isFinal) {
+                        isMoEApplied = true
+                        isRunningMoE = false
+                        if (isInlineTranslateMode && next.blocks.isNotEmpty()) {
+                            runInlineScreenTranslation(selectedTargetLang)
+                        }
+                        val activeCrop = croppedBitmap
+                        val activeRect = lastCropRect
+                        if (activeCrop != null && activeRect != null &&
+                            selection != null && selection !is SelectionGeometry.LensWords
+                        ) {
+                            isAnalyzingOcr = true
+                            val reRead = OcrAndLensEngine.extractRegionOcr(
+                                context = context,
+                                cropBitmap = activeCrop,
+                                cropRectInScreen = activeRect,
+                                fullScreenLines = next.lines,
+                                scriptMode = effectiveMode,
+                                useMoE = true
+                            )
+                            ocrResult = reRead
+                            editableText = reRead.extractedText
+                            isAnalyzingOcr = false
+                            if (reRead.extractedText.isNotBlank()) {
+                                runTranslation(reRead.extractedText, reRead.detectedLanguageCode, selectedTargetLang)
+                            }
+                        }
+                    }
+                }
+            } finally {
+                isRunningMoE = false
+            }
+        }
+    }
+
     fun resetSelection() {
         selection = null
         croppedBitmap = null
+        lastCropRect = null
         ocrResult = null
         editableText = ""
         isAnalyzingOcr = false
@@ -420,18 +484,26 @@ fun MinimalCircleOverlay(
 
         // 2. Lens-style word selection highlights OR pure white circle cutout for objects
         if (!isInlineTranslateMode) {
+            val latestWords by rememberUpdatedState(fullScreenWords)
+            val latestCanvasW by rememberUpdatedState(canvasWidthPx)
+            val latestCanvasH by rememberUpdatedState(canvasHeightPx)
+
             Canvas(
                 modifier = Modifier
                     .fillMaxSize()
                     .graphicsLayer { compositingStrategy = CompositingStrategy.Offscreen }
-                    .pointerInput(screenshotBitmap, fullScreenWords) {
+                    .pointerInput(screenshotBitmap) {
                         detectTapGestures { tapOffset ->
-                            val bitmapX = tapOffset.x * screenshotBitmap.width / canvasWidthPx
-                            val bitmapY = tapOffset.y * screenshotBitmap.height / canvasHeightPx
-                            val hitPad = with(density) { 10.dp.toPx() } *
-                                (screenshotBitmap.width / canvasWidthPx)
+                            val w = latestCanvasW
+                            val h = latestCanvasH
+                            if (w <= 0f || h <= 0f) return@detectTapGestures
+                            val wordsSnapshot = latestWords
+                            val bitmapX = tapOffset.x * screenshotBitmap.width / w
+                            val bitmapY = tapOffset.y * screenshotBitmap.height / h
+                            val hitPad = with(density) { 12.dp.toPx() } *
+                                (screenshotBitmap.width / w)
 
-                            val tappedWord = hitTestWord(fullScreenWords, bitmapX, bitmapY, hitPad)
+                            val tappedWord = hitTestWord(wordsSnapshot, bitmapX, bitmapY, hitPad)
                             if (tappedWord != null) {
                                 if (hapticEnabled) {
                                     haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
@@ -445,19 +517,20 @@ fun MinimalCircleOverlay(
                                 val radius = with(density) { 54.dp.toPx() }
                                 val l = (tapOffset.x - radius).coerceAtLeast(0f)
                                 val t = (tapOffset.y - radius).coerceAtLeast(0f)
-                                val r = (tapOffset.x + radius).coerceAtMost(canvasWidthPx)
-                                val b = (tapOffset.y + radius).coerceAtMost(canvasHeightPx)
+                                val r = (tapOffset.x + radius).coerceAtMost(w)
+                                val b = (tapOffset.y + radius).coerceAtMost(h)
                                 selection = SelectionGeometry.BoxRect(l, t, r, b)
-                                completeRegionSelection(canvasWidthPx, canvasHeightPx, l, t, r, b)
+                                completeRegionSelection(w, h, l, t, r, b)
                             }
                         }
                     }
-                    .pointerInput(screenshotBitmap, fullScreenWords) {
+                    .pointerInput(screenshotBitmap) {
                         var currentPoints = mutableListOf<Offset>()
                         detectDragGestures(
                             onDragStart = { startOffset ->
                                 isDrawing = true
                                 croppedBitmap = null
+                                lastCropRect = null
                                 ocrResult = null
                                 translationJob?.cancel()
                                 translationState = TranslationState.Idle
@@ -475,18 +548,26 @@ fun MinimalCircleOverlay(
                             },
                             onDragEnd = {
                                 isDrawing = false
-                                if (currentPoints.size < 3) {
+                                val w = latestCanvasW
+                                val h = latestCanvasH
+                                val wordsSnapshot = latestWords
+                                if (currentPoints.isEmpty() || w <= 0f || h <= 0f) {
+                                    resetSelection()
                                     return@detectDragGestures
                                 }
-                                val sx = canvasWidthPx / screenshotBitmap.width
-                                val sy = canvasHeightPx / screenshotBitmap.height
-                                val matchedWords = matchTextBrushToWordRange(
-                                    screenPoints = currentPoints,
-                                    words = fullScreenWords,
-                                    sx = sx,
-                                    sy = sy,
-                                    density = density
-                                )
+
+                                val sx = w / screenshotBitmap.width
+                                val sy = h / screenshotBitmap.height
+                                val matchedWords = if (currentPoints.size >= 2) {
+                                    matchTextBrushToWordRange(
+                                        screenPoints = currentPoints,
+                                        words = wordsSnapshot,
+                                        sx = sx,
+                                        sy = sy,
+                                        density = density
+                                    )
+                                } else null
+
                                 if (matchedWords != null) {
                                     if (hapticEnabled) {
                                         haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
@@ -508,7 +589,18 @@ fun MinimalCircleOverlay(
 
                                 val width = maxX - minX
                                 val height = maxY - minY
-                                if (width < tapSlopPx && height < tapSlopPx) {
+                                if (currentPoints.size < 3 || (width < tapSlopPx && height < tapSlopPx)) {
+                                    val firstPt = currentPoints.first()
+                                    val hitPad = with(density) { 12.dp.toPx() } / sx.coerceAtLeast(0.001f)
+                                    val hitWord = hitTestWord(wordsSnapshot, firstPt.x / sx, firstPt.y / sy, hitPad)
+                                    if (hitWord != null) {
+                                        applyLensWordSelection(
+                                            TextSelectionRange(hitWord.globalIndex, hitWord.globalIndex),
+                                            runOcrTranslationNow = true
+                                        )
+                                    } else {
+                                        resetSelection()
+                                    }
                                     return@detectDragGestures
                                 }
 
@@ -516,19 +608,19 @@ fun MinimalCircleOverlay(
                                     val cy = (minY + maxY) / 2f
                                     val l = minX.coerceAtLeast(0f)
                                     val t = (cy - minBoxHalfHeightPx).coerceAtLeast(0f)
-                                    val r = maxX.coerceAtMost(canvasWidthPx)
-                                    val b = (cy + minBoxHalfHeightPx).coerceAtMost(canvasHeightPx)
+                                    val r = maxX.coerceAtMost(w)
+                                    val b = (cy + minBoxHalfHeightPx).coerceAtMost(h)
                                     selection = SelectionGeometry.BoxRect(l, t, r, b)
-                                    completeRegionSelection(canvasWidthPx, canvasHeightPx, l, t, r, b)
+                                    completeRegionSelection(w, h, l, t, r, b)
                                 } else {
                                     selection = SelectionGeometry.Freehand(currentPoints.toList(), isClosed = true)
                                     completeRegionSelection(
-                                        canvasWidthPx,
-                                        canvasHeightPx,
+                                        w,
+                                        h,
                                         minX.coerceAtLeast(0f),
                                         minY.coerceAtLeast(0f),
-                                        maxX.coerceAtMost(canvasWidthPx),
-                                        maxY.coerceAtMost(canvasHeightPx)
+                                        maxX.coerceAtMost(w),
+                                        maxY.coerceAtMost(h)
                                     )
                                 }
                             },
@@ -547,6 +639,24 @@ fun MinimalCircleOverlay(
                     else -> 0.68f
                 }
                 drawRect(color = Color.Black.copy(alpha = tintAlpha))
+
+                // Whisper-subtle Lens baseline underlines on indexed words so selectable text is obvious without clutter
+                if ((activeSel == null || activeSel is SelectionGeometry.LensWords) && fullScreenWords.isNotEmpty()) {
+                    val sx = size.width / screenshotBitmap.width
+                    val sy = size.height / screenshotBitmap.height
+                    val underlineStroke = 1.2.dp.toPx()
+                    for (line in fullScreenLines) {
+                        val b = line.boundingBox
+                        val y = b.bottom * sy + 1.5f
+                        drawLine(
+                            color = Color.White.copy(alpha = 0.28f),
+                            start = Offset(b.left * sx, y),
+                            end = Offset(b.right * sx, y),
+                            strokeWidth = underlineStroke,
+                            cap = StrokeCap.Round
+                        )
+                    }
+                }
 
                 when (activeSel) {
                     is SelectionGeometry.LensWords -> {
@@ -580,12 +690,12 @@ fun MinimalCircleOverlay(
                             )
                             drawPath(
                                 path = pillPath,
-                                color = ElectricCyan.copy(alpha = 0.26f)
+                                color = ElectricCyan.copy(alpha = 0.28f)
                             )
                             drawPath(
                                 path = pillPath,
-                                color = ElectricCyan.copy(alpha = 0.88f),
-                                style = Stroke(width = 1.2.dp.toPx())
+                                color = ElectricCyan.copy(alpha = 0.90f),
+                                style = Stroke(width = 1.3.dp.toPx())
                             )
                         }
                     }
@@ -844,10 +954,11 @@ fun MinimalCircleOverlay(
                             )
                         }
                         Text(
-                            text = if (isScanningInitialWords) "Scanning text…" else "Tap text or circle",
+                            text = if (isScanningInitialWords) "Scanning…" else "Tap or circle",
                             color = Color.White,
                             fontFamily = InterFamily,
-                            fontSize = 12.5.sp
+                            fontSize = 12.5.sp,
+                            maxLines = 1
                         )
                     }
                 }
@@ -855,8 +966,60 @@ fun MinimalCircleOverlay(
 
             Row(
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
             ) {
+                // On-demand MoE Multi-Script button (keeps Latin Fast first pass instant)
+                Surface(
+                    color = when {
+                        isMoEApplied -> Color(0xCC16303D)
+                        isRunningMoE -> Color(0xCC1B2230)
+                        else -> Color(0xCC121216)
+                    },
+                    shape = RoundedCornerShape(999.dp),
+                    border = BorderStroke(
+                        1.dp,
+                        when {
+                            isMoEApplied -> ElectricCyan
+                            isRunningMoE -> ElectricCyan.copy(alpha = 0.7f)
+                            else -> Color(0x44FFFFFF)
+                        }
+                    ),
+                    modifier = Modifier
+                        .heightIn(min = 44.dp)
+                        .clip(RoundedCornerShape(999.dp))
+                        .clickable(enabled = !isRunningMoE) { triggerMoEScan() }
+                        .testTag("overlay_moe_button")
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 11.dp, vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(5.dp)
+                    ) {
+                        if (isRunningMoE) {
+                            CircularProgressIndicator(
+                                color = ElectricCyan,
+                                strokeWidth = 1.8.dp,
+                                modifier = Modifier.size(13.dp)
+                            )
+                        } else {
+                            Icon(
+                                imageVector = if (isMoEApplied) Icons.Rounded.Check else Icons.Rounded.Language,
+                                contentDescription = "Run multi-script MoE OCR",
+                                tint = ElectricCyan,
+                                modifier = Modifier.size(15.dp)
+                            )
+                        }
+                        Text(
+                            text = if (isRunningMoE) "MoE…" else "MoE",
+                            color = if (isMoEApplied) ElectricCyan else Color.White,
+                            fontFamily = SpaceGroteskFamily,
+                            fontWeight = FontWeight.SemiBold,
+                            fontSize = 12.sp,
+                            maxLines = 1
+                        )
+                    }
+                }
+
                 val targetShort = SupportedTargetLanguages.firstOrNull {
                     it.code == selectedTargetLang
                 }?.shortCode ?: selectedTargetLang.uppercase()
@@ -870,6 +1033,7 @@ fun MinimalCircleOverlay(
                     ),
                     modifier = Modifier
                         .heightIn(min = 44.dp)
+                        .clip(RoundedCornerShape(999.dp))
                         .clickable {
                             val next = !isInlineTranslateMode
                             isInlineTranslateMode = next
@@ -1397,7 +1561,7 @@ private fun CompactLookupSheet(
                                         horizontalArrangement = Arrangement.spacedBy(4.dp)
                                     ) {
                                         Text(
-                                            text = if (hasGoogleTranslateApp) "Translate App" else "Web",
+                                            text = "Translate Web",
                                             color = Color.White,
                                             fontFamily = SpaceGroteskFamily,
                                             fontSize = 11.5.sp

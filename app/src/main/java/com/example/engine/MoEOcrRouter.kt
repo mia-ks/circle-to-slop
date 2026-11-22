@@ -479,6 +479,26 @@ object MoEOcrRouter {
     }
 
     /**
+     * Ultra-fast first-pass Latin OCR (~80-160ms): runs ONLY the prewarmed bundled Latin model
+     * on a downscaled frame so text is selectable almost immediately while MoE stays warmed
+     * and ready for an explicit user tap on the MoE button.
+     */
+    suspend fun recognizeFastLatin(
+        bitmap: Bitmap
+    ): List<CandidateOcrLine> = withContext(Dispatchers.Default) {
+        val (mlBitmap, mlScaleBack) = scaleDownForOcr(bitmap, maxLongSide = 1280)
+        val inputImage = InputImage.fromBitmap(mlBitmap, 0)
+        val raw = try {
+            runMlKitExpert("latin", inputImage, mlScaleBack)
+        } finally {
+            if (mlBitmap !== bitmap) {
+                mlBitmap.recycle()
+            }
+        }
+        fuseMoECandidates(raw)
+    }
+
+    /**
      * Progressive two-stage MoE OCR:
      * - Stage 1 emits fast ML Kit detections immediately (typically 80–220ms) so tapping words works right away.
      * - Stage 2 (only if Tesseract extra script packs like Arabic/Cyrillic are downloaded) runs asynchronously
@@ -624,13 +644,14 @@ object MoEOcrRouter {
                         val wRawBox = el.boundingBox ?: return@mapNotNull null
                         if (el.text.isBlank()) null else CandidateOcrWord(el.text, rescaleRect(wRawBox, scaleBack))
                     }
+                    val confPct = if (line.confidence > 0f) (line.confidence * 100f).coerceIn(1f, 100f) else 90f
                     out.add(
                         CandidateOcrLine(
                             expert = expertKind,
                             text = line.text.trim(),
                             boundingBox = box,
                             words = words.ifEmpty { listOf(CandidateOcrWord(line.text.trim(), box)) },
-                            confidence = line.confidence * 100f
+                            confidence = confPct
                         )
                     )
                 }
