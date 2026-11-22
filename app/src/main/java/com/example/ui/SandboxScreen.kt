@@ -183,10 +183,9 @@ fun SandboxScreen(
                 modifier = Modifier
                     .weight(1f)
                     .fillMaxWidth()
-                    .padding(horizontal = 14.dp)
+                    .padding(horizontal = 12.dp)
                     .clip(RoundedCornerShape(18.dp))
-                    .background(Color(0xFF15151B))
-                    .border(1.dp, Color(0xFF2B2B36), RoundedCornerShape(18.dp))
+                    .background(Color(0xFF101218))
             ) {
                 val customBmp = pickedBitmap
                 if (customBmp != null) {

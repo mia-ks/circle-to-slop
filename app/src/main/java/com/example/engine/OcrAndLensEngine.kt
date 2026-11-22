@@ -143,7 +143,7 @@ object OcrAndLensEngine {
             languageIdentifier
             refreshDownloadedPacksAsync()
             MoEOcrRouter.prewarm(context.applicationContext)
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
             Log.w(TAG, "ML Kit prewarm skipped: ${e.message}")
         }
     }
@@ -263,6 +263,32 @@ object OcrAndLensEngine {
         scriptMode: OcrScriptMode
     ): List<RecognizedTextLine> = analyzeFullScreen(context, bitmap, scriptMode).lines
 
+    /**
+     * Progressive screen OCR:
+     * Emits Stage 1 (fast ML Kit word/line geometry without blocking on LanguageID/pixel sampling)
+     * in ~100–250ms, then emits Stage 2 once any extra Tesseract scripts finish merging.
+     */
+    suspend fun analyzeFullScreenProgressive(
+        context: Context,
+        bitmap: Bitmap,
+        scriptMode: OcrScriptMode,
+        onUpdate: suspend (analysis: ScreenOcrAnalysis, isFinal: Boolean) -> Unit
+    ) = withContext(Dispatchers.Default) {
+        try {
+            MoEOcrRouter.recognizeWithMoEProgressive(context, bitmap, scriptMode) { candidates, isFinal ->
+                val fastAnalysis = buildScreenAnalysisFromCandidates(
+                    bitmap = bitmap,
+                    candidates = candidates,
+                    enrichLanguagesAndColors = false
+                )
+                onUpdate(fastAnalysis, isFinal)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Progressive full-screen OCR failed", e)
+            onUpdate(ScreenOcrAnalysis(), true)
+        }
+    }
+
     suspend fun analyzeFullScreen(
         context: Context,
         bitmap: Bitmap,
@@ -270,11 +296,55 @@ object OcrAndLensEngine {
     ): ScreenOcrAnalysis = withContext(Dispatchers.Default) {
         try {
             val candidates = MoEOcrRouter.recognizeWithMoE(context, bitmap, scriptMode)
-            buildScreenAnalysisFromCandidates(bitmap, candidates)
+            buildScreenAnalysisFromCandidates(
+                bitmap = bitmap,
+                candidates = candidates,
+                enrichLanguagesAndColors = false
+            )
         } catch (e: Exception) {
             Log.e(TAG, "Full-screen OCR analysis failed", e)
             ScreenOcrAnalysis()
         }
+    }
+
+    /**
+     * Computes perimeter-matched card colors and parallel language tags only when Inline Translate runs.
+     */
+    suspend fun enrichAnalysisForInlineTranslate(
+        bitmap: Bitmap,
+        analysis: ScreenOcrAnalysis
+    ): ScreenOcrAnalysis = withContext(Dispatchers.Default) {
+        if (analysis.blocks.isEmpty()) return@withContext analysis
+
+        val langResults = kotlinx.coroutines.coroutineScope {
+            analysis.blocks.map { block ->
+                async(Dispatchers.Default) {
+                    val existing = block.detectedLanguageCode
+                    val lang = existing
+                        ?: fastScriptLangHint(block.text)
+                        ?: if (block.text.length >= 3) detectLanguageCode(block.text) else null
+                    val colors = sampleBlockColors(bitmap, block.boundingBox)
+                    Triple(block.id, lang, colors)
+                }
+            }.map { it.await() }
+        }.associateBy { it.first }
+
+        val fullScreenSample = analysis.blocks.take(8).joinToString(" ") { it.text }
+        val dominantLang = analysis.dominantLanguageCode
+            ?: fastScriptLangHint(fullScreenSample)
+            ?: if (fullScreenSample.isNotBlank()) detectLanguageCode(fullScreenSample) else null
+
+        val updatedBlocks = analysis.blocks.map { block ->
+            val info = langResults[block.id]
+            val resolvedLang = info?.second ?: dominantLang
+            val colors = info?.third
+            block.copy(
+                detectedLanguageCode = resolvedLang,
+                backgroundColorArgb = colors?.first ?: block.backgroundColorArgb,
+                foregroundColorArgb = colors?.second ?: block.foregroundColorArgb
+            )
+        }
+        analysis.copy(blocks = updatedBlocks, dominantLanguageCode = dominantLang)
     }
 
     suspend fun translateBlocksInline(
@@ -302,13 +372,29 @@ object OcrAndLensEngine {
         val sourcePerBlock = mutableMapOf<Int, String>()
         val uniqueMissingSources = linkedSetOf<String>()
 
-        // Resolve source language per block
+        // Resolve source language per block in parallel (using 0ms script heuristics first)
+        val detectedTags = kotlinx.coroutines.coroutineScope {
+            blocks.map { block ->
+                async(Dispatchers.Default) {
+                    val tag = if (!block.text.any { it.isLetter() }) {
+                        null
+                    } else {
+                        block.detectedLanguageCode
+                            ?: fastScriptLangHint(block.text)
+                            ?: detectLanguageCode(block.text)
+                            ?: dominantLangHint
+                    }
+                    block.id to tag
+                }
+            }.map { it.await() }.toMap()
+        }
+
         for (block in blocks) {
             if (!block.text.any { it.isLetter() }) {
                 currentStates[block.id] = InlineBlockStatus.SameLanguage
                 continue
             }
-            val rawTag = block.detectedLanguageCode ?: detectLanguageCode(block.text) ?: dominantLangHint
+            val rawTag = detectedTags[block.id] ?: dominantLangHint
             val mlSource = rawTag?.let { resolveMlKitTag(it) }
             when {
                 mlSource == null -> {
@@ -809,9 +895,41 @@ object OcrAndLensEngine {
                 .ifBlank { clean.uppercase(Locale.ROOT) }
     }
 
+    private fun fastScriptLangHint(text: String): String? {
+        var kana = 0
+        var hangul = 0
+        var arabic = 0
+        var devanagari = 0
+        var han = 0
+        var cyrillic = 0
+        var latin = 0
+        for (ch in text) {
+            val c = ch.code
+            when {
+                c in 0x3040..0x30FF -> kana++
+                c in 0xAC00..0xD7AF -> hangul++
+                c in 0x0600..0x06FF || c in 0x0750..0x077F -> arabic++
+                c in 0x0900..0x097F -> devanagari++
+                c in 0x4E00..0x9FFF || c in 0x3400..0x4DBF -> han++
+                c in 0x0400..0x04FF -> cyrillic++
+                ch.isLetter() && c < 0x0250 -> latin++
+            }
+        }
+        return when {
+            kana > 0 -> "ja"
+            hangul > 0 -> "ko"
+            arabic > 0 -> "ar"
+            devanagari > 0 -> "hi"
+            han > 0 && latin == 0 -> "zh"
+            cyrillic > 0 && text.length <= 5 -> "ru"
+            else -> null
+        }
+    }
+
     private suspend fun buildScreenAnalysisFromCandidates(
         bitmap: Bitmap,
-        candidates: List<CandidateOcrLine>
+        candidates: List<CandidateOcrLine>,
+        enrichLanguagesAndColors: Boolean = true
     ): ScreenOcrAnalysis {
         if (candidates.isEmpty()) return ScreenOcrAnalysis()
 
@@ -893,8 +1011,16 @@ object OcrAndLensEngine {
             }
 
             val blockText = joinLinesIntelligently(joinedPieces)
-            val langTag = if (blockText.length >= 3) detectLanguageCode(blockText) else null
-            val (bgArgb, fgArgb) = sampleBlockColors(bitmap, blockBounds)
+            val langTag = if (enrichLanguagesAndColors && blockText.length >= 3) {
+                fastScriptLangHint(blockText) ?: detectLanguageCode(blockText)
+            } else {
+                fastScriptLangHint(blockText)
+            }
+            val (bgArgb, fgArgb) = if (enrichLanguagesAndColors) {
+                sampleBlockColors(bitmap, blockBounds)
+            } else {
+                0xFF141419.toInt() to 0xFFF8FAFC.toInt()
+            }
             blocksOut.add(
                 InlineTextBlock(
                     id = blockId,
@@ -909,21 +1035,29 @@ object OcrAndLensEngine {
             )
         }
 
-        val fullScreenSample = blocksOut.take(8).joinToString(" ") { it.text }
-        val dominantLang = if (fullScreenSample.isNotBlank()) detectLanguageCode(fullScreenSample) else null
-
-        val enrichedBlocks = blocksOut.map { b ->
-            if (b.detectedLanguageCode == null && dominantLang != null) {
-                b.copy(detectedLanguageCode = dominantLang)
+        val dominantLang = if (enrichLanguagesAndColors) {
+            val fullScreenSample = blocksOut.take(8).joinToString(" ") { it.text }
+            if (fullScreenSample.isNotBlank()) {
+                fastScriptLangHint(fullScreenSample) ?: detectLanguageCode(fullScreenSample)
             } else {
-                b
+                null
             }
+        } else {
+            null
+        }
+
+        val finalBlocks = if (dominantLang != null) {
+            blocksOut.map { b ->
+                if (b.detectedLanguageCode == null) b.copy(detectedLanguageCode = dominantLang) else b
+            }
+        } else {
+            blocksOut
         }
 
         return ScreenOcrAnalysis(
             lines = linesOut,
             words = wordsOut,
-            blocks = enrichedBlocks,
+            blocks = finalBlocks,
             dominantLanguageCode = dominantLang
         )
     }

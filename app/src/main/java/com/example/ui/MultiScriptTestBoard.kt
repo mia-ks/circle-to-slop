@@ -103,11 +103,10 @@ fun MultiScriptTestBoard(
             .padding(14.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
-        // Crisp Board Header + Geometric Lens Test Emblem
+        // Clean Header + Geometric Lens Test Emblem
         Surface(
             color = Color(0xFF171A24),
-            shape = RoundedCornerShape(14.dp),
-            border = BorderStroke(1.dp, Color(0xFF2B3042)),
+            shape = RoundedCornerShape(16.dp),
             modifier = Modifier.fillMaxWidth()
         ) {
             Row(
@@ -119,22 +118,16 @@ fun MultiScriptTestBoard(
             ) {
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
-                        text = "MULTI-SCRIPT OCR & TRANSLATE BOARD",
-                        fontFamily = JetBrainsMonoFamily,
-                        fontSize = 10.5.sp,
-                        color = ElectricCyan
-                    )
-                    Text(
                         text = "World Transit Departure Info",
                         fontFamily = SpaceGroteskFamily,
                         fontWeight = FontWeight.Bold,
-                        fontSize = 16.sp,
+                        fontSize = 17.sp,
                         color = Color.White
                     )
                     Text(
-                        text = "Tap any word, circle the camera icon, or toggle Translate above",
+                        text = "Tap any word, circle the camera, or switch to Translate",
                         fontFamily = InterFamily,
-                        fontSize = 11.5.sp,
+                        fontSize = 12.sp,
                         color = Color(0xFF9CA3AF)
                     )
                 }
@@ -143,8 +136,7 @@ fun MultiScriptTestBoard(
                 Surface(
                     color = Color(0xFF0E1016),
                     shape = RoundedCornerShape(12.dp),
-                    border = BorderStroke(1.dp, Color(0xFF343A50)),
-                    modifier = Modifier.size(54.dp)
+                    modifier = Modifier.size(52.dp)
                 ) {
                     Canvas(modifier = Modifier.fillMaxSize().padding(10.dp)) {
                         val w = size.width
@@ -179,8 +171,7 @@ fun MultiScriptTestBoard(
         }
 
         MultiScriptSamples.forEach { sample ->
-            val bg = if (sample.isDarkCard) Color(0xFF161922) else Color(0xFFF3F5F8)
-            val borderCol = if (sample.isDarkCard) Color(0xFF282D3E) else Color(0xFFD5DCE6)
+            val bg = if (sample.isDarkCard) Color(0xFF171A24) else Color(0xFFF3F5F8)
             val titleCol = if (sample.isDarkCard) Color.White else Color(0xFF0F172A)
             val bodyCol = if (sample.isDarkCard) Color(0xFFCBD5E1) else Color(0xFF334155)
             val badgeBg = if (sample.isDarkCard) sample.accent.copy(alpha = 0.16f) else Color(0xFF0F172A)
@@ -188,12 +179,11 @@ fun MultiScriptTestBoard(
 
             Surface(
                 color = bg,
-                shape = RoundedCornerShape(12.dp),
-                border = BorderStroke(1.dp, borderCol),
+                shape = RoundedCornerShape(14.dp),
                 modifier = Modifier.fillMaxWidth()
             ) {
                 Column(
-                    modifier = Modifier.padding(horizontal = 13.dp, vertical = 10.dp),
+                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 11.dp),
                     verticalArrangement = Arrangement.spacedBy(4.dp)
                 ) {
                     Surface(

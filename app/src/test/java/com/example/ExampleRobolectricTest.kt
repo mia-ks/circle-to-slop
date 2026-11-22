@@ -135,6 +135,70 @@ class ExampleRobolectricTest {
     }
 
     @Test
+    fun `russian module does not confuse clean english ui text with cyrillic`() {
+        val mixedHomoglyphBox = Rect(20, 20, 320, 60)
+        val pureHomoglyphBox = Rect(20, 80, 240, 120)
+        val realRussianBox = Rect(20, 140, 360, 180)
+
+        val candidates = listOf(
+            // Case 1: Tesseract-rus outputs mixed Latin+Cyrillic letters on English "Boarding Gate"
+            CandidateOcrLine(
+                expert = OcrExpertKind.TESSERACT,
+                text = "Воаrding Gаtе",
+                boundingBox = mixedHomoglyphBox,
+                words = listOf(CandidateOcrWord("Воаrding", mixedHomoglyphBox)),
+                confidence = 89f
+            ),
+            CandidateOcrLine(
+                expert = OcrExpertKind.MLKIT_LATIN,
+                text = "Boarding Gate",
+                boundingBox = mixedHomoglyphBox,
+                words = listOf(CandidateOcrWord("Boarding", mixedHomoglyphBox)),
+                confidence = 95f
+            ),
+            // Case 2: Tesseract-rus coerces English "SETTINGS" into all-Cyrillic homoglyph lookalike
+            CandidateOcrLine(
+                expert = OcrExpertKind.TESSERACT,
+                text = "ЗЕТТIНGС",
+                boundingBox = pureHomoglyphBox,
+                words = listOf(CandidateOcrWord("ЗЕТТIНGС", pureHomoglyphBox)),
+                confidence = 78f
+            ),
+            CandidateOcrLine(
+                expert = OcrExpertKind.MLKIT_LATIN,
+                text = "SETTINGS",
+                boundingBox = pureHomoglyphBox,
+                words = listOf(CandidateOcrWord("SETTINGS", pureHomoglyphBox)),
+                confidence = 96f
+            ),
+            // Case 3: Genuine Russian text mangled by ML Kit Latin wins cleanly for Tesseract-rus
+            CandidateOcrLine(
+                expert = OcrExpertKind.MLKIT_LATIN,
+                text = "MockoBCKNN BoK3aJI",
+                boundingBox = realRussianBox,
+                words = listOf(CandidateOcrWord("MockoBCKNN", realRussianBox)),
+                confidence = 76f
+            ),
+            CandidateOcrLine(
+                expert = OcrExpertKind.TESSERACT,
+                text = "Московский вокзал",
+                boundingBox = realRussianBox,
+                words = listOf(CandidateOcrWord("Московский", realRussianBox)),
+                confidence = 89f
+            )
+        )
+
+        val fused = MoEOcrRouter.fuseMoECandidates(candidates)
+        assertEquals(3, fused.size)
+        assertEquals(OcrExpertKind.MLKIT_LATIN, fused[0].expert)
+        assertEquals("Boarding Gate", fused[0].text)
+        assertEquals(OcrExpertKind.MLKIT_LATIN, fused[1].expert)
+        assertEquals("SETTINGS", fused[1].text)
+        assertEquals(OcrExpertKind.TESSERACT, fused[2].expert)
+        assertEquals("Московский вокзал", fused[2].text)
+    }
+
+    @Test
     fun `dashboard shows offline pack status and navigates to zone editor and sandbox`() {
         composeRule.onNodeWithTag("launch_sandbox_button").performScrollTo().assertIsDisplayed()
         composeRule.onNodeWithTag("open_zone_editor_button").performScrollTo().assertIsDisplayed()

@@ -128,11 +128,85 @@ object MoEOcrRouter {
         else -> OcrExpertKind.MLKIT_LATIN
     }
 
+    @Volatile
+    private var isWarmedUp = false
+
     fun prewarm(context: Context) {
         val appCtx = context.applicationContext
-        // Touch recognizers off UI thread & inspect local/Play Services OCR module availability
-        latinRecognizer
         refreshAllOcrPacksAsync(appCtx)
+        if (isWarmedUp) return
+        routerScope.launch {
+            try {
+                // Force Play Services ML Kit OCR TFLite runtime + binder hot in memory
+                val warmupBmp = Bitmap.createBitmap(64, 64, Bitmap.Config.ARGB_8888).apply {
+                    eraseColor(android.graphics.Color.WHITE)
+                }
+                try {
+                    val img = InputImage.fromBitmap(warmupBmp, 0)
+                    try {
+                        latinRecognizer.process(img).awaitGmsTask()
+                    } catch (_: Throwable) {
+                    }
+                    // Warm any already-installed dynamic Play Services OCR scripts too
+                    val client = try {
+                        ModuleInstall.getClient(appCtx)
+                    } catch (_: Throwable) {
+                        null
+                    }
+                    for (key in listOf("japanese", "chinese", "korean", "devanagari")) {
+                        val rec = recognizerForKey(key) ?: continue
+                        val ready = try {
+                            client?.areModulesAvailable(rec)?.awaitGmsTask()?.areModulesAvailable() == true
+                        } catch (_: Throwable) {
+                            false
+                        }
+                        if (ready) {
+                            try {
+                                rec.process(img).awaitGmsTask()
+                            } catch (_: Throwable) {
+                            }
+                        }
+                    }
+                } finally {
+                    warmupBmp.recycle()
+                }
+
+                // Pre-initialize Tesseract native engine + LSTM weights if any packs are downloaded
+                val downloadedTess = getDownloadedTesseractLangs(appCtx)
+                if (downloadedTess.isNotEmpty()) {
+                    prewarmTesseract(appCtx, downloadedTess)
+                }
+                isWarmedUp = true
+            } catch (e: Throwable) {
+                Log.w(TAG, "OCR prewarm skipped: ${e.message}")
+            }
+        }
+    }
+
+    private fun getDownloadedTesseractLangs(appCtx: Context): List<String> {
+        val tessDir = File(appCtx.filesDir, "tessdata")
+        return SupportedTesseractOcrPacks
+            .map { it.code }
+            .filter { File(tessDir, "$it.traineddata").let { f -> f.exists() && f.length() > 10_000L } }
+    }
+
+    private suspend fun prewarmTesseract(appCtx: Context, langCodes: List<String>) = tessMutex.withLock {
+        if (langCodes.isEmpty()) return@withLock
+        val combo = langCodes.sorted().joinToString("+")
+        if (cachedTessApi != null && cachedTessLangCombo == combo) return@withLock
+        try {
+            cachedTessApi?.recycle()
+            val created = TessBaseAPI()
+            if (created.init(appCtx.filesDir.absolutePath, combo)) {
+                created.pageSegMode = TessBaseAPI.PageSegMode.PSM_SPARSE_TEXT
+                cachedTessApi = created
+                cachedTessLangCombo = combo
+            } else {
+                created.recycle()
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "Tesseract prewarm skipped: ${t.message}")
+        }
     }
 
     fun refreshAllOcrPacksAsync(context: Context) {
@@ -380,21 +454,7 @@ object MoEOcrRouter {
         }
     }
 
-    suspend fun recognizeWithMoE(
-        context: Context,
-        bitmap: Bitmap,
-        scriptMode: OcrScriptMode
-    ): List<CandidateOcrLine> = withContext(Dispatchers.Default) {
-        val appCtx = context.applicationContext
-        val inputImage = InputImage.fromBitmap(bitmap, 0)
-
-        // Refresh local Tesseract availability quickly
-        val tessDir = File(appCtx.filesDir, "tessdata")
-        val downloadedTessLangs = SupportedTesseractOcrPacks
-            .map { it.code }
-            .filter { File(tessDir, "$it.traineddata").let { f -> f.exists() && f.length() > 10_000L } }
-
-        // Determine active ML Kit script experts
+    private fun resolveMlKitKeys(appCtx: Context, scriptMode: OcrScriptMode): List<String> {
         val mlKitKeys = when (scriptMode) {
             OcrScriptMode.LATIN -> listOf("latin")
             OcrScriptMode.JAPANESE_AND_LATIN -> listOf("latin", "japanese")
@@ -409,41 +469,146 @@ object MoEOcrRouter {
             }
         }.distinct()
 
-        // If user explicitly picked a non-Latin single mode whose Play Services module isn't downloaded yet,
-        // trigger ModuleInstall check cleanly
         if (scriptMode != OcrScriptMode.AUTO_MOE && scriptMode != OcrScriptMode.LATIN) {
             val primaryKey = mlKitKeys.lastOrNull()
             if (primaryKey != null && _mlKitOcrStatusFlow.value[primaryKey] != ModelPackStatus.DOWNLOADED) {
                 routerScope.launch { ensureMlKitScriptInstalled(appCtx, primaryKey) }
             }
         }
+        return mlKitKeys
+    }
 
-        val allCandidateLists = coroutineScope {
+    /**
+     * Progressive two-stage MoE OCR:
+     * - Stage 1 emits fast ML Kit detections immediately (typically 80–220ms) so tapping words works right away.
+     * - Stage 2 (only if Tesseract extra script packs like Arabic/Cyrillic are downloaded) runs asynchronously
+     *   on a downscaled bitmap and merges non-Latin lines cleanly without blocking the UI.
+     */
+    suspend fun recognizeWithMoEProgressive(
+        context: Context,
+        bitmap: Bitmap,
+        scriptMode: OcrScriptMode,
+        onStageResult: suspend (candidates: List<CandidateOcrLine>, isFinal: Boolean) -> Unit
+    ) = withContext(Dispatchers.Default) {
+        val appCtx = context.applicationContext
+        val downloadedTessLangs = getDownloadedTesseractLangs(appCtx)
+        val mlKitKeys = resolveMlKitKeys(appCtx, scriptMode)
+
+        // Downscale full-screen captures so ML Kit & Tesseract process ~3-4x fewer pixels without losing legibility
+        val (mlBitmap, mlScaleBack) = scaleDownForOcr(bitmap, maxLongSide = 1280)
+        val inputImage = InputImage.fromBitmap(mlBitmap, 0)
+
+        val stage1Raw = try {
+            coroutineScope {
+                mlKitKeys.map { key ->
+                    async(Dispatchers.Default) {
+                        runMlKitExpert(key, inputImage, mlScaleBack)
+                    }
+                }.awaitAll().flatten()
+            }
+        } finally {
+            if (mlBitmap !== bitmap) {
+                mlBitmap.recycle()
+            }
+        }
+
+        val stage1Fused = fuseMoECandidates(stage1Raw)
+        val hasTesseractStage = downloadedTessLangs.isNotEmpty()
+        onStageResult(stage1Fused, !hasTesseractStage)
+
+        if (!hasTesseractStage) return@withContext
+
+        val (tessBitmap, tessScaleBack) = scaleDownForOcr(bitmap, maxLongSide = 1024)
+        val tessCandidates = try {
+            withContext(Dispatchers.IO) {
+                runTesseractExpert(appCtx, tessBitmap, downloadedTessLangs, tessScaleBack)
+            }
+        } finally {
+            if (tessBitmap !== bitmap) {
+                tessBitmap.recycle()
+            }
+        }
+
+        if (tessCandidates.isEmpty()) {
+            onStageResult(stage1Fused, true)
+            return@withContext
+        }
+
+        val combinedFused = fuseMoECandidates(stage1Raw + tessCandidates)
+        onStageResult(combinedFused, true)
+    }
+
+    suspend fun recognizeWithMoE(
+        context: Context,
+        bitmap: Bitmap,
+        scriptMode: OcrScriptMode
+    ): List<CandidateOcrLine> = withContext(Dispatchers.Default) {
+        val appCtx = context.applicationContext
+        val downloadedTessLangs = getDownloadedTesseractLangs(appCtx)
+        val mlKitKeys = resolveMlKitKeys(appCtx, scriptMode)
+
+        val (mlBitmap, mlScaleBack) = scaleDownForOcr(bitmap, maxLongSide = 1280)
+        val inputImage = InputImage.fromBitmap(mlBitmap, 0)
+
+        val allCandidates = coroutineScope {
             val mlKitJobs = mlKitKeys.map { key ->
                 async(Dispatchers.Default) {
-                    runMlKitExpert(key, inputImage)
+                    runMlKitExpert(key, inputImage, mlScaleBack)
                 }
             }
             val tessJob = if (downloadedTessLangs.isNotEmpty()) {
+                val (tessBitmap, tessScaleBack) = scaleDownForOcr(bitmap, maxLongSide = 1024)
                 async(Dispatchers.IO) {
-                    runTesseractExpert(appCtx, bitmap, downloadedTessLangs)
+                    try {
+                        runTesseractExpert(appCtx, tessBitmap, downloadedTessLangs, tessScaleBack)
+                    } finally {
+                        if (tessBitmap !== bitmap) tessBitmap.recycle()
+                    }
                 }
             } else {
                 null
             }
 
-            val results = mlKitJobs.awaitAll().toMutableList()
-            if (tessJob != null) {
-                results.add(tessJob.await())
+            val mlRes = try {
+                mlKitJobs.awaitAll().flatten()
+            } finally {
+                if (mlBitmap !== bitmap) mlBitmap.recycle()
             }
-            results
+            val tessRes = tessJob?.await().orEmpty()
+            mlRes + tessRes
         }
 
-        val flattened = allCandidateLists.flatten()
-        fuseMoECandidates(flattened)
+        fuseMoECandidates(allCandidates)
     }
 
-    private suspend fun runMlKitExpert(key: String, inputImage: InputImage): List<CandidateOcrLine> {
+    private fun scaleDownForOcr(bitmap: Bitmap, maxLongSide: Int): Pair<Bitmap, Float> {
+        val longSide = maxOf(bitmap.width, bitmap.height)
+        if (longSide <= maxLongSide || bitmap.width <= 0 || bitmap.height <= 0) {
+            return bitmap to 1f
+        }
+        val ratio = maxLongSide.toFloat() / longSide.toFloat()
+        val dstW = (bitmap.width * ratio).toInt().coerceAtLeast(1)
+        val dstH = (bitmap.height * ratio).toInt().coerceAtLeast(1)
+        val scaled = Bitmap.createScaledBitmap(bitmap, dstW, dstH, true)
+        val scaleBack = bitmap.width.toFloat() / dstW.toFloat()
+        return scaled to scaleBack
+    }
+
+    private fun rescaleRect(r: Rect, scaleBack: Float): Rect {
+        if (scaleBack == 1f) return r
+        return Rect(
+            (r.left * scaleBack).toInt(),
+            (r.top * scaleBack).toInt(),
+            (r.right * scaleBack).toInt(),
+            (r.bottom * scaleBack).toInt()
+        )
+    }
+
+    private suspend fun runMlKitExpert(
+        key: String,
+        inputImage: InputImage,
+        scaleBack: Float = 1f
+    ): List<CandidateOcrLine> {
         val recognizer = recognizerForKey(key) ?: return emptyList()
         val expertKind = expertForMlKitKey(key)
         return try {
@@ -452,11 +617,12 @@ object MoEOcrRouter {
             val out = mutableListOf<CandidateOcrLine>()
             for (block in visionText.textBlocks) {
                 for (line in block.lines) {
-                    val box = line.boundingBox ?: continue
+                    val rawBox = line.boundingBox ?: continue
                     if (line.text.isBlank()) continue
+                    val box = rescaleRect(rawBox, scaleBack)
                     val words = line.elements.mapNotNull { el ->
-                        val wBox = el.boundingBox ?: return@mapNotNull null
-                        if (el.text.isBlank()) null else CandidateOcrWord(el.text, wBox)
+                        val wRawBox = el.boundingBox ?: return@mapNotNull null
+                        if (el.text.isBlank()) null else CandidateOcrWord(el.text, rescaleRect(wRawBox, scaleBack))
                     }
                     out.add(
                         CandidateOcrLine(
@@ -464,7 +630,7 @@ object MoEOcrRouter {
                             text = line.text.trim(),
                             boundingBox = box,
                             words = words.ifEmpty { listOf(CandidateOcrWord(line.text.trim(), box)) },
-                            confidence = (line.confidence ?: 0.90f) * 100f
+                            confidence = line.confidence * 100f
                         )
                     )
                 }
@@ -479,7 +645,8 @@ object MoEOcrRouter {
     private suspend fun runTesseractExpert(
         appCtx: Context,
         bitmap: Bitmap,
-        langCodes: List<String>
+        langCodes: List<String>,
+        scaleBack: Float = 1f
     ): List<CandidateOcrLine> = tessMutex.withLock {
         if (langCodes.isEmpty()) return@withLock emptyList()
         val combo = langCodes.sorted().joinToString("+")
@@ -516,8 +683,8 @@ object MoEOcrRouter {
                     val wText = iter.getUTF8Text(TessBaseAPI.PageIteratorLevel.RIL_WORD)?.trim().orEmpty()
                     val wBox = iter.getBoundingBox(TessBaseAPI.PageIteratorLevel.RIL_WORD)
                     val wConf = iter.confidence(TessBaseAPI.PageIteratorLevel.RIL_WORD)
-                    if (wText.isNotEmpty() && wBox != null && wBox.size >= 4 && wConf >= 35f) {
-                        val rect = Rect(wBox[0], wBox[1], wBox[2], wBox[3])
+                    if (wText.isNotEmpty() && wBox != null && wBox.size >= 4 && wConf >= 40f) {
+                        val rect = rescaleRect(Rect(wBox[0], wBox[1], wBox[2], wBox[3]), scaleBack)
                         if (rect.width() > 2 && rect.height() > 4) {
                             words.add(CandidateOcrWord(wText, rect) to wConf)
                         }
@@ -530,8 +697,8 @@ object MoEOcrRouter {
                     val lText = iter.getUTF8Text(TessBaseAPI.PageIteratorLevel.RIL_TEXTLINE)?.trim().orEmpty()
                     val lBox = iter.getBoundingBox(TessBaseAPI.PageIteratorLevel.RIL_TEXTLINE)
                     val lConf = iter.confidence(TessBaseAPI.PageIteratorLevel.RIL_TEXTLINE)
-                    if (lText.isNotEmpty() && lBox != null && lBox.size >= 4 && lConf >= 40f) {
-                        val rect = Rect(lBox[0], lBox[1], lBox[2], lBox[3])
+                    if (lText.isNotEmpty() && lBox != null && lBox.size >= 4 && lConf >= 48f) {
+                        val rect = rescaleRect(Rect(lBox[0], lBox[1], lBox[2], lBox[3]), scaleBack)
                         if (rect.width() > 4 && rect.height() > 6 && lText.any { it.isLetterOrDigit() }) {
                             val lineWords = words
                                 .filter { (w, _) ->
@@ -563,25 +730,58 @@ object MoEOcrRouter {
     }
 
     /**
-     * Fuses detections from multiple OCR script experts using script-affinity scoring + NMS,
-     * keeping the highest-fidelity script expert per region without overlapping duplicates.
+     * Fuses detections from multiple OCR script experts using script-affinity scoring,
+     * anti-homoglyph arbitration against clean ML Kit Latin reads, and NMS.
      */
     fun fuseMoECandidates(candidates: List<CandidateOcrLine>): List<CandidateOcrLine> {
         if (candidates.isEmpty()) return emptyList()
-        val scored = candidates
-            .filter { it.text.isNotBlank() }
+        val nonBlank = candidates.filter { it.text.isNotBlank() }
+        val cleanLatinLines = nonBlank.filter {
+            it.expert == OcrExpertKind.MLKIT_LATIN && isStrongCleanLatinLine(it)
+        }
+
+        val filtered = nonBlank.filter { cand ->
+            if (cand.expert != OcrExpertKind.TESSERACT) return@filter true
+            val stats = analyzeScriptStats(cand.text)
+            // Discard Tesseract tokens mixing Latin & Cyrillic letters inside the same word (homoglyph noise)
+            if (stats.hasMixedLatinCyrillicWord) return@filter false
+
+            val isCyrillicDominant = stats.cyrillicCount > stats.arabicCount && stats.cyrillicCount > 0
+            if (!isCyrillicDominant) return@filter true
+
+            val cyrillicPurity = if (stats.totalLetters > 0) {
+                stats.cyrillicCount.toFloat() / stats.totalLetters
+            } else {
+                0f
+            }
+            if (cyrillicPurity < 0.72f) return@filter false
+
+            // If a clean, high-confidence ML Kit Latin read overlaps the same region, reject
+            // low-confidence or homoglyph-ambiguous Cyrillic hallucinations (e.g. "rus" misreading English UI).
+            val overlappingCleanLatin = cleanLatinLines.firstOrNull { latinLine ->
+                linesOverlapSignificantly(latinLine.boundingBox, cand.boundingBox)
+            }
+            if (overlappingCleanLatin != null) {
+                val keepCyrillicOverCleanLatin =
+                    cand.confidence >= 84f &&
+                        cyrillicPurity >= 0.88f &&
+                        stats.distinctiveCyrillicCount >= 2 &&
+                        overlappingCleanLatin.confidence < 88f
+                if (!keepCyrillicOverCleanLatin) {
+                    return@filter false
+                }
+            }
+            true
+        }
+
+        val scored = filtered
             .map { it to scoreCandidateLine(it) }
             .sortedByDescending { it.second }
 
         val kept = mutableListOf<CandidateOcrLine>()
         for ((cand, _) in scored) {
             val overlapsExisting = kept.any { existing ->
-                val iou = intersectionOverUnion(existing.boundingBox, cand.boundingBox)
-                val minOverlap = maxOf(
-                    boxOverlapRatio(existing.boundingBox, cand.boundingBox),
-                    boxOverlapRatio(cand.boundingBox, existing.boundingBox)
-                )
-                iou >= 0.28f || minOverlap >= 0.45f
+                linesOverlapSignificantly(existing.boundingBox, cand.boundingBox)
             }
             if (!overlapsExisting) {
                 kept.add(cand)
@@ -594,65 +794,202 @@ object MoEOcrRouter {
         )
     }
 
-    fun scoreCandidateLine(candidate: CandidateOcrLine): Float {
-        val text = candidate.text
+    private fun linesOverlapSignificantly(a: Rect, b: Rect): Boolean {
+        val iou = intersectionOverUnion(a, b)
+        val minOverlap = maxOf(boxOverlapRatio(a, b), boxOverlapRatio(b, a))
+        return iou >= 0.28f || minOverlap >= 0.45f
+    }
+
+    private data class ScriptStats(
+        val arabicCount: Int = 0,
+        val cyrillicCount: Int = 0,
+        val distinctiveCyrillicCount: Int = 0,
+        val kanaCount: Int = 0,
+        val hangulCount: Int = 0,
+        val devanagariCount: Int = 0,
+        val hanCount: Int = 0,
+        val latinLetterCount: Int = 0,
+        val digitCount: Int = 0,
+        val symbolGarbageCount: Int = 0,
+        val hasMixedLatinCyrillicWord: Boolean = false
+    ) {
+        val totalLetters: Int
+            get() = arabicCount + cyrillicCount + kanaCount + hangulCount + devanagariCount + hanCount + latinLetterCount
+    }
+
+    private fun analyzeScriptStats(text: String): ScriptStats {
         var arabicCount = 0
         var cyrillicCount = 0
+        var distinctiveCyrillicCount = 0
         var kanaCount = 0
         var hangulCount = 0
         var devanagariCount = 0
         var hanCount = 0
-        var latinOrDigitCount = 0
+        var latinLetterCount = 0
+        var digitCount = 0
         var symbolGarbageCount = 0
 
         for (ch in text) {
             val c = ch.code
             when {
                 c in 0x0600..0x06FF || c in 0x0750..0x077F -> arabicCount++
-                c in 0x0400..0x04FF -> cyrillicCount++
+                c in 0x0400..0x04FF -> {
+                    cyrillicCount++
+                    if (ch !in CYRILLIC_LATIN_HOMOGLYPHS) {
+                        distinctiveCyrillicCount++
+                    }
+                }
                 c in 0x3040..0x30FF -> kanaCount++
                 c in 0xAC00..0xD7AF -> hangulCount++
                 c in 0x0900..0x097F -> devanagariCount++
                 c in 0x4E00..0x9FFF || c in 0x3400..0x4DBF -> hanCount++
-                ch.isLetterOrDigit() -> latinOrDigitCount++
-                !ch.isWhitespace() && ch !in ".,:;!?-_/()€¥$£%·" -> symbolGarbageCount++
+                ch.isLetter() -> latinLetterCount++
+                ch.isDigit() -> digitCount++
+                !ch.isWhitespace() && ch !in ".,:;!?-_/()€¥$£%·&+'\"" -> symbolGarbageCount++
             }
         }
 
+        val mixedWord = text.split(Regex("\\s+")).any { token ->
+            var hasLatin = false
+            var hasCyrillic = false
+            for (ch in token) {
+                if (ch.code in 0x0400..0x04FF) hasCyrillic = true
+                else if (ch.isLetter() && ch.code < 0x0250) hasLatin = true
+                if (hasLatin && hasCyrillic) break
+            }
+            hasLatin && hasCyrillic
+        }
+
+        return ScriptStats(
+            arabicCount = arabicCount,
+            cyrillicCount = cyrillicCount,
+            distinctiveCyrillicCount = distinctiveCyrillicCount,
+            kanaCount = kanaCount,
+            hangulCount = hangulCount,
+            devanagariCount = devanagariCount,
+            hanCount = hanCount,
+            latinLetterCount = latinLetterCount,
+            digitCount = digitCount,
+            symbolGarbageCount = symbolGarbageCount,
+            hasMixedLatinCyrillicWord = mixedWord
+        )
+    }
+
+    /**
+     * Checks whether an MLKIT_LATIN detection looks like genuine clean English/Latin UI text
+     * rather than a mangled transliteration of Cyrillic or Arabic glyphs (e.g., "MockoBCKNN BoK3aJI").
+     */
+    fun isStrongCleanLatinLine(candidate: CandidateOcrLine): Boolean {
+        if (candidate.expert != OcrExpertKind.MLKIT_LATIN) return false
+        val text = candidate.text.trim()
+        if (text.isEmpty() || candidate.confidence < 72f) return false
+
+        val stats = analyzeScriptStats(text)
+        val totalAlphaNum = stats.latinLetterCount + stats.digitCount
+        if (totalAlphaNum == 0 || stats.symbolGarbageCount > 1) return false
+        if (stats.symbolGarbageCount * 4 > totalAlphaNum) return false
+
+        val tokens = text.split(Regex("\\s+")).filter { it.isNotBlank() }
+        if (tokens.isEmpty()) return false
+
+        var suspiciousTokens = 0
+        for (token in tokens) {
+            // Check digits embedded directly inside alphabetic word (e.g. "BoK3aJI", "npuBeT", "3aJI")
+            var hasLetterDigitLetter = false
+            var upperAfterLowerCount = 0
+            var prevIsLetter = false
+            var prevIsDigit = false
+            var prevIsLower = false
+
+            for (ch in token) {
+                val isLetter = ch.isLetter()
+                val isDigit = ch.isDigit()
+                if (prevIsDigit && isLetter && token.any { it.isLetter() } && token.indexOf(ch) > 0) {
+                    // e.g. "3aJI" or "BoK3aJI" — exclude common short ordinals like "1st", "2nd", "3rd", "4th", "4G", "24h"
+                    val lower = token.lowercase()
+                    val benignOrdinalOrUnit = lower.endsWith("st") || lower.endsWith("nd") ||
+                        lower.endsWith("rd") || lower.endsWith("th") ||
+                        lower.endsWith("px") || lower.endsWith("dp") ||
+                        lower.endsWith("mb") || lower.endsWith("gb") ||
+                        lower.endsWith("ms") || lower.endsWith("km") ||
+                        lower.endsWith("am") || lower.endsWith("pm") ||
+                        lower.endsWith("h") || lower.endsWith("m") ||
+                        lower.endsWith("g")
+                    if (!benignOrdinalOrUnit && prevIsLetter) {
+                        hasLetterDigitLetter = true
+                    }
+                }
+                if (isDigit && prevIsLetter) {
+                    // Track transition into digit so next char can catch letter-digit-letter
+                    prevIsDigit = true
+                } else {
+                    if (isLetter && prevIsLower && ch.isUpperCase()) {
+                        upperAfterLowerCount++
+                    }
+                    prevIsDigit = isDigit
+                }
+                if (isLetter) prevIsLetter = true
+                prevIsLower = isLetter && ch.isLowerCase()
+            }
+
+            // Classic Cyrillic->Latin OCR garble has >=2 mid-word case jumps ("MockoBCKNN") or letter-digit-letter ("BoK3aJI")
+            if (hasLetterDigitLetter || upperAfterLowerCount >= 2) {
+                suspiciousTokens++
+            }
+        }
+
+        // Reject if any multi-token line is heavily mangled
+        return suspiciousTokens == 0 || (tokens.size >= 3 && suspiciousTokens * 3 < tokens.size)
+    }
+
+    fun scoreCandidateLine(candidate: CandidateOcrLine): Float {
+        val stats = analyzeScriptStats(candidate.text)
+        val totalLetters = stats.totalLetters
+        val latinOrDigitCount = stats.latinLetterCount + stats.digitCount
+
         val scriptAffinity = when (candidate.expert) {
             OcrExpertKind.TESSERACT -> {
+                val arabicRatio = if (totalLetters > 0) stats.arabicCount.toFloat() / totalLetters else 0f
+                val cyrillicRatio = if (totalLetters > 0) stats.cyrillicCount.toFloat() / totalLetters else 0f
                 when {
-                    arabicCount > 0 || cyrillicCount > 0 -> 72f + (arabicCount + cyrillicCount) * 2f
-                    symbolGarbageCount > latinOrDigitCount -> 5f
-                    else -> 24f // Defer Latin/CJK to specialized ML Kit models when present
+                    stats.hasMixedLatinCyrillicWord -> 10f
+                    stats.arabicCount > 0 && arabicRatio >= 0.60f -> 76f + stats.arabicCount * 2f
+                    stats.cyrillicCount > 0 && cyrillicRatio >= 0.78f && candidate.confidence >= 68f ->
+                        68f + stats.distinctiveCyrillicCount * 2.2f
+                    stats.cyrillicCount > 0 -> 34f
+                    stats.symbolGarbageCount > latinOrDigitCount -> 5f
+                    else -> 22f // Defer Latin/CJK to specialized ML Kit models
                 }
             }
             OcrExpertKind.MLKIT_JAPANESE -> when {
-                kanaCount > 0 -> 78f + kanaCount * 2f
-                hanCount > 0 -> 60f + hanCount
+                stats.kanaCount > 0 -> 80f + stats.kanaCount * 2f
+                stats.hanCount > 0 -> 62f + stats.hanCount
                 else -> 40f
             }
             OcrExpertKind.MLKIT_CHINESE -> when {
-                hanCount > 0 && kanaCount == 0 -> 68f + hanCount
+                stats.hanCount > 0 && stats.kanaCount == 0 -> 70f + stats.hanCount
                 else -> 38f
             }
             OcrExpertKind.MLKIT_KOREAN -> when {
-                hangulCount > 0 -> 78f + hangulCount * 2f
+                stats.hangulCount > 0 -> 80f + stats.hangulCount * 2f
                 else -> 38f
             }
             OcrExpertKind.MLKIT_DEVANAGARI -> when {
-                devanagariCount > 0 -> 78f + devanagariCount * 2f
+                stats.devanagariCount > 0 -> 80f + stats.devanagariCount * 2f
                 else -> 38f
             }
             OcrExpertKind.MLKIT_LATIN -> when {
-                latinOrDigitCount > 0 && symbolGarbageCount <= latinOrDigitCount -> 56f
+                isStrongCleanLatinLine(candidate) -> 68f
+                latinOrDigitCount > 0 && stats.symbolGarbageCount <= latinOrDigitCount -> 46f
                 else -> 12f
             }
         }
 
-        val penalty = symbolGarbageCount * 5f
-        return scriptAffinity + (candidate.confidence.coerceIn(0f, 100f) * 0.2f) - penalty
+        val penalty = stats.symbolGarbageCount * 5f
+        return scriptAffinity + (candidate.confidence.coerceIn(0f, 100f) * 0.22f) - penalty
     }
+
+    private const val CYRILLIC_LATIN_HOMOGLYPHS = "АВЕКМНОРСТХаеорсухіІЈЅ"
 
     private fun boxOverlapRatio(a: Rect, b: Rect): Float {
         val left = maxOf(a.left, b.left)

@@ -249,11 +249,51 @@ fun ZoneEditorScreen(
                         }
                     )
 
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(16.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(8.dp)
+                                    .clip(CircleShape)
+                                    .background(ElectricCyan)
+                            )
+                            Text(
+                                text = "Trigger zone",
+                                fontFamily = InterFamily,
+                                fontSize = 12.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(8.dp)
+                                    .clip(CircleShape)
+                                    .background(AmberWarn)
+                            )
+                            Text(
+                                text = "OS Assistant / Back area",
+                                fontFamily = InterFamily,
+                                fontSize = 12.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+
                     Text(
                         text = if (isLiveTestMode) {
-                            "Perform \"${config.triggerMode.label}\" inside the highlighted zone to test launch."
+                            "Perform \"${config.triggerMode.label}\" inside the green zone to test launch."
                         } else {
-                            "Drag the zone to reposition. Drag the cyan corner handle to resize. Amber corners mark OS Assistant & nav gesture zones."
+                            "Drag the zone to reposition or drag the corner grip to resize."
                         },
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -309,10 +349,9 @@ fun ZoneEditorScreen(
                         }
                     }
 
-                    // Anchor Edge Selector
+                    // Anchor Edge & Launch Gesture Tonal Section
                     Surface(
-                        shape = RoundedCornerShape(16.dp),
-                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+                        shape = RoundedCornerShape(18.dp),
                         color = MaterialTheme.colorScheme.surface,
                         modifier = Modifier.fillMaxWidth()
                     ) {
@@ -321,9 +360,11 @@ fun ZoneEditorScreen(
                             verticalArrangement = Arrangement.spacedBy(12.dp)
                         ) {
                             Text(
-                                text = "EDGE ANCHOR",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                                text = "Edge anchor",
+                                fontFamily = SpaceGroteskFamily,
+                                fontWeight = FontWeight.Medium,
+                                fontSize = 13.sp,
+                                color = MaterialTheme.colorScheme.onSurface
                             )
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
@@ -356,7 +397,7 @@ fun ZoneEditorScreen(
                                                 color = if (selected) {
                                                     MaterialTheme.colorScheme.onPrimary
                                                 } else {
-                                                    MaterialTheme.colorScheme.onSurfaceVariant
+                                                    MaterialTheme.colorScheme.onSurface
                                                 },
                                                 maxLines = 1
                                             )
@@ -366,9 +407,11 @@ fun ZoneEditorScreen(
                             }
 
                             Text(
-                                text = "LAUNCH GESTURE",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                                text = "Launch gesture",
+                                fontFamily = SpaceGroteskFamily,
+                                fontWeight = FontWeight.Medium,
+                                fontSize = 13.sp,
+                                color = MaterialTheme.colorScheme.onSurface
                             )
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
@@ -401,7 +444,7 @@ fun ZoneEditorScreen(
                                                 color = if (selected) {
                                                     MaterialTheme.colorScheme.onPrimary
                                                 } else {
-                                                    MaterialTheme.colorScheme.onSurfaceVariant
+                                                    MaterialTheme.colorScheme.onSurface
                                                 },
                                                 maxLines = 1
                                             )
@@ -414,8 +457,7 @@ fun ZoneEditorScreen(
 
                     // Fine Dimension & Visibility Sliders
                     Surface(
-                        shape = RoundedCornerShape(16.dp),
-                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+                        shape = RoundedCornerShape(18.dp),
                         color = MaterialTheme.colorScheme.surface,
                         modifier = Modifier.fillMaxWidth()
                     ) {
@@ -918,7 +960,7 @@ private fun DimensionSlider(
             onValueChange = onValueChange,
             valueRange = valueRange,
             colors = SliderDefaults.colors(
-                thumbColor = Color.White,
+                thumbColor = ElectricCyan,
                 activeTrackColor = ElectricCyan,
                 inactiveTrackColor = MaterialTheme.colorScheme.surfaceVariant
             )

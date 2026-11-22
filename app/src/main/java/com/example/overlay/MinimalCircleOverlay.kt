@@ -149,6 +149,15 @@ fun MinimalCircleOverlay(
     var screenAnalysis by remember(screenshotBitmap) {
         mutableStateOf(ScreenOcrAnalysis())
     }
+    var pendingRefinedAnalysis by remember(screenshotBitmap) {
+        mutableStateOf<ScreenOcrAnalysis?>(null)
+    }
+    var isScanningInitialWords by remember(screenshotBitmap) {
+        mutableStateOf(true)
+    }
+    var hasEnrichedInline by remember(screenshotBitmap) {
+        mutableStateOf(false)
+    }
     val fullScreenLines = screenAnalysis.lines
     val fullScreenWords = screenAnalysis.words
     val fullScreenBlocks = screenAnalysis.blocks
@@ -181,11 +190,27 @@ fun MinimalCircleOverlay(
         OcrAndLensEngine.isGoogleTranslateAppInstalled(context)
     }
 
-    // Pre-scan full screen text (words + visual blocks + color sampling) & refresh pack cache
+    // Progressive two-stage OCR: Stage 1 (ML Kit) lands in ~100-220ms; Stage 2 (Tesseract MoE) merges in background
     LaunchedEffect(screenshotBitmap, scriptMode) {
+        isScanningInitialWords = true
+        hasEnrichedInline = false
+        pendingRefinedAnalysis = null
         OcrAndLensEngine.refreshDownloadedPacksAsync()
         MoEOcrRouter.refreshAllOcrPacksAsync(context)
-        screenAnalysis = OcrAndLensEngine.analyzeFullScreen(context, screenshotBitmap, scriptMode)
+        OcrAndLensEngine.analyzeFullScreenProgressive(context, screenshotBitmap, scriptMode) { next, isFinal ->
+            if (selection == null && !isDrawing && !isDraggingTextHandle) {
+                screenAnalysis = next
+                if (isInlineTranslateMode && next.blocks.isNotEmpty()) {
+                    hasEnrichedInline = false
+                }
+            } else {
+                pendingRefinedAnalysis = next
+            }
+            if (!isFinal || next.words.isNotEmpty() || isFinal) {
+                isScanningInitialWords = false
+            }
+        }
+        isScanningInitialWords = false
     }
 
     // Clear copied indicator quickly
@@ -223,18 +248,33 @@ fun MinimalCircleOverlay(
     fun runInlineScreenTranslation(targetLang: String) {
         inlineTranslationJob?.cancel()
         inlineTranslationJob = scope.launch {
+            val baseAnalysis = pendingRefinedAnalysis?.also {
+                screenAnalysis = it
+                pendingRefinedAnalysis = null
+                hasEnrichedInline = false
+            } ?: screenAnalysis
+
+            val readyAnalysis = if (!hasEnrichedInline && baseAnalysis.blocks.isNotEmpty()) {
+                OcrAndLensEngine.enrichAnalysisForInlineTranslate(screenshotBitmap, baseAnalysis).also {
+                    screenAnalysis = it
+                    hasEnrichedInline = true
+                }
+            } else {
+                baseAnalysis
+            }
+
             OcrAndLensEngine.translateBlocksInline(
-                blocks = screenAnalysis.blocks,
+                blocks = readyAnalysis.blocks,
                 targetLangCode = targetLang,
-                dominantLangHint = screenAnalysis.dominantLanguageCode
+                dominantLangHint = readyAnalysis.dominantLanguageCode
             ) { state ->
                 inlineTranslationState = state
             }
         }
     }
 
-    // If user enabled Inline Translate before fullScreenAnalysis finished, trigger automatically once ready
-    LaunchedEffect(isInlineTranslateMode, screenAnalysis.blocks) {
+    // If user enabled Inline Translate while OCR stage is completing, kick off inline translate automatically
+    LaunchedEffect(isInlineTranslateMode, screenAnalysis.blocks.size) {
         if (isInlineTranslateMode && screenAnalysis.blocks.isNotEmpty() &&
             inlineTranslationState.blockStates.isEmpty() && !inlineTranslationState.isTranslating
         ) {
@@ -351,6 +391,11 @@ fun MinimalCircleOverlay(
         translationJob?.cancel()
         translationState = TranslationState.Idle
         focusedInlineBlock = null
+        pendingRefinedAnalysis?.let {
+            screenAnalysis = it
+            pendingRefinedAnalysis = null
+            hasEnrichedInline = false
+        }
     }
 
     BoxWithConstraints(
@@ -495,41 +540,13 @@ fun MinimalCircleOverlay(
                     }
             ) {
                 val activeSel = selection
-                // Lighter tint for Lens word selection so surrounding context stays crisp; deeper tint for circle cutout
+                // Keep frozen screen crisp & unobstructed before touching; deepen backdrop on active cutouts
                 val tintAlpha = when (activeSel) {
-                    is SelectionGeometry.LensWords -> 0.42f
-                    null -> if (fullScreenWords.isNotEmpty()) 0.34f else 0.74f
-                    else -> 0.74f
+                    is SelectionGeometry.LensWords -> 0.44f
+                    null -> 0.22f
+                    else -> 0.68f
                 }
                 drawRect(color = Color.Black.copy(alpha = tintAlpha))
-
-                // Subtle Lens-like word pills before selection so selectable text is obvious without clutter
-                if (activeSel == null && fullScreenWords.isNotEmpty()) {
-                    val sx = size.width / screenshotBitmap.width
-                    val sy = size.height / screenshotBitmap.height
-                    val wordCorner = 4.dp.toPx()
-                    val pad = 1.5.dp.toPx()
-                    for (word in fullScreenWords) {
-                        val b = word.boundingBox
-                        val left = b.left * sx - pad
-                        val top = b.top * sy - pad
-                        val w = b.width() * sx + pad * 2f
-                        val h = b.height() * sy + pad * 2f
-                        drawRoundRect(
-                            color = Color.Transparent,
-                            topLeft = Offset(left, top),
-                            size = Size(w, h),
-                            cornerRadius = CornerRadius(wordCorner, wordCorner),
-                            blendMode = BlendMode.Clear
-                        )
-                        drawRoundRect(
-                            color = Color.White.copy(alpha = 0.16f),
-                            topLeft = Offset(left, top),
-                            size = Size(w, h),
-                            cornerRadius = CornerRadius(wordCorner, wordCorner)
-                        )
-                    }
-                }
 
                 when (activeSel) {
                     is SelectionGeometry.LensWords -> {
@@ -563,11 +580,11 @@ fun MinimalCircleOverlay(
                             )
                             drawPath(
                                 path = pillPath,
-                                color = ElectricCyan.copy(alpha = 0.28f)
+                                color = ElectricCyan.copy(alpha = 0.26f)
                             )
                             drawPath(
                                 path = pillPath,
-                                color = ElectricCyan.copy(alpha = 0.85f),
+                                color = ElectricCyan.copy(alpha = 0.88f),
                                 style = Stroke(width = 1.2.dp.toPx())
                             )
                         }
@@ -590,8 +607,18 @@ fun MinimalCircleOverlay(
                                 color = Color.Transparent,
                                 blendMode = BlendMode.Clear
                             )
+                            val activePath = if (activeSel.isClosed) closedPath else openPath
                             drawPath(
-                                path = if (activeSel.isClosed) closedPath else openPath,
+                                path = activePath,
+                                color = ElectricCyan.copy(alpha = 0.45f),
+                                style = Stroke(
+                                    width = strokeWidthPx * 2.4f,
+                                    cap = StrokeCap.Round,
+                                    join = StrokeJoin.Round
+                                )
+                            )
+                            drawPath(
+                                path = activePath,
                                 color = Color.White,
                                 style = Stroke(
                                     width = strokeWidthPx,
@@ -618,6 +645,11 @@ fun MinimalCircleOverlay(
                             path = boxPath,
                             color = Color.Transparent,
                             blendMode = BlendMode.Clear
+                        )
+                        drawPath(
+                            path = boxPath,
+                            color = ElectricCyan.copy(alpha = 0.45f),
+                            style = Stroke(width = strokeWidthPx * 2f)
                         )
                         drawPath(
                             path = boxPath,
@@ -776,7 +808,7 @@ fun MinimalCircleOverlay(
                             modifier = Modifier.size(15.dp)
                         )
                         Text(
-                            text = if (showOriginalScreen) "Original screen" else "Inline Translate",
+                            text = if (showOriginalScreen) "Original" else "Translated",
                             color = Color.White,
                             fontFamily = SpaceGroteskFamily,
                             fontWeight = FontWeight.Medium,
@@ -797,14 +829,22 @@ fun MinimalCircleOverlay(
                             fontSize = 12.5.sp
                         )
                     } else {
-                        Box(
-                            modifier = Modifier
-                                .size(8.dp)
-                                .clip(CircleShape)
-                                .background(ElectricCyan)
-                        )
+                        if (isScanningInitialWords) {
+                            CircularProgressIndicator(
+                                color = ElectricCyan,
+                                strokeWidth = 1.8.dp,
+                                modifier = Modifier.size(12.dp)
+                            )
+                        } else {
+                            Box(
+                                modifier = Modifier
+                                    .size(8.dp)
+                                    .clip(CircleShape)
+                                    .background(ElectricCyan)
+                            )
+                        }
                         Text(
-                            text = "Tap text, swipe, or circle",
+                            text = if (isScanningInitialWords) "Scanning text…" else "Tap text or circle",
                             color = Color.White,
                             fontFamily = InterFamily,
                             fontSize = 12.5.sp
@@ -1149,11 +1189,10 @@ private fun CompactLookupSheet(
                 }
             }
 
-            // OCR Extraction Card
+            // OCR Extraction Tonal Block (clean, borderless surface separation)
             Surface(
-                color = Color(0xFF17171D),
+                color = Color(0xFF191B23),
                 shape = RoundedCornerShape(14.dp),
-                border = BorderStroke(1.dp, Color(0xFF282833)),
                 modifier = Modifier.fillMaxWidth()
             ) {
                 Column(
@@ -1170,22 +1209,19 @@ private fun CompactLookupSheet(
                             horizontalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
                             Text(
-                                text = "EXTRACTED TEXT",
-                                color = Color(0xFF9CA3AF),
-                                fontFamily = JetBrainsMonoFamily,
-                                fontSize = 11.sp
+                                text = ocrResult?.detectedLanguageName ?: "Selection Text",
+                                color = Color(0xFFD1D5DB),
+                                fontFamily = SpaceGroteskFamily,
+                                fontWeight = FontWeight.Medium,
+                                fontSize = 12.5.sp
                             )
-                            ocrResult?.detectedLanguageName?.let { lang ->
-                                Surface(
-                                    color = Color(0xFF23232D),
-                                    shape = RoundedCornerShape(6.dp)
-                                ) {
+                            ocrResult?.let { res ->
+                                if (res.lineCount > 0) {
                                     Text(
-                                        text = "$lang · ${ocrResult.lineCount}L",
+                                        text = "${res.lineCount}L",
                                         color = ElectricCyan,
                                         fontFamily = JetBrainsMonoFamily,
-                                        fontSize = 10.5.sp,
-                                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                        fontSize = 10.5.sp
                                     )
                                 }
                             }
@@ -1194,7 +1230,7 @@ private fun CompactLookupSheet(
                         Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                             if (canSelectAllWords) {
                                 Surface(
-                                    color = Color(0xFF252530),
+                                    color = Color(0xFF252834),
                                     shape = RoundedCornerShape(8.dp),
                                     modifier = Modifier
                                         .clickable { onSelectAllWords() }
@@ -1223,7 +1259,7 @@ private fun CompactLookupSheet(
 
                             if (editableText.isNotBlank()) {
                                 Surface(
-                                    color = if (copiedLabel == "ocr") Color(0xFF14532D) else Color(0xFF252530),
+                                    color = if (copiedLabel == "ocr") Color(0xFF14532D) else Color(0xFF252834),
                                     shape = RoundedCornerShape(8.dp),
                                     modifier = Modifier
                                         .clickable { onCopy("ocr", editableText) }
@@ -1283,8 +1319,8 @@ private fun CompactLookupSheet(
                             onValueChange = onEditableTextChange,
                             textStyle = TextStyle(
                                 color = Color.White,
-                                fontFamily = JetBrainsMonoFamily,
-                                fontSize = 13.5.sp,
+                                fontFamily = InterFamily,
+                                fontSize = 14.sp,
                                 lineHeight = 20.sp
                             ),
                             cursorBrush = SolidColor(ElectricCyan),
@@ -1296,12 +1332,11 @@ private fun CompactLookupSheet(
                 }
             }
 
-            // On-Device Instant Translation Card (when text exists)
+            // On-Device Instant Translation Strip (borderless tonal container)
             if (editableText.isNotBlank()) {
                 Surface(
-                    color = Color(0xFF17171D),
+                    color = Color(0xFF191B23),
                     shape = RoundedCornerShape(14.dp),
-                    border = BorderStroke(1.dp, Color(0xFF282833)),
                     modifier = Modifier.fillMaxWidth()
                 ) {
                     Column(
