@@ -33,6 +33,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -129,15 +130,24 @@ object MoEOcrRouter {
     }
 
     @Volatile
-    private var isWarmedUp = false
+    private var isLatinWarmedUp = false
 
-    fun prewarm(context: Context) {
+    @Volatile
+    private var isMoEWarmedUp = false
+
+    @Volatile
+    private var isMoEPrewarming = false
+
+    /**
+     * Lightweight startup/service-connect warmup: refreshes pack metadata and keeps only
+     * the bundled Latin recognizer ready without allocating heavy MoE weights in RAM.
+     */
+    fun prewarmLatinOnly(context: Context) {
         val appCtx = context.applicationContext
         refreshAllOcrPacksAsync(appCtx)
-        if (isWarmedUp) return
+        if (isLatinWarmedUp) return
         routerScope.launch {
             try {
-                // Force Play Services ML Kit OCR TFLite runtime + binder hot in memory
                 val warmupBmp = Bitmap.createBitmap(64, 64, Bitmap.Config.ARGB_8888).apply {
                     eraseColor(android.graphics.Color.WHITE)
                 }
@@ -147,7 +157,42 @@ object MoEOcrRouter {
                         latinRecognizer.process(img).awaitGmsTask()
                     } catch (_: Throwable) {
                     }
-                    // Warm any already-installed dynamic Play Services OCR scripts too
+                } finally {
+                    warmupBmp.recycle()
+                }
+                isLatinWarmedUp = true
+            } catch (e: Throwable) {
+                Log.w(TAG, "Latin OCR prewarm skipped: ${e.message}")
+            }
+        }
+    }
+
+    /**
+     * Triggered only on Circle invoke gesture: warms downloaded Play Services script models
+     * and native Tesseract LSTM weights in the background after yielding to Latin Fast,
+     * without running OCR on the captured screen until MoE or Translate is requested.
+     */
+    fun prewarmMoEOnInvoke(context: Context, delayMs: Long = 160L) {
+        val appCtx = context.applicationContext
+        if (isMoEWarmedUp || isMoEPrewarming) return
+        isMoEPrewarming = true
+        routerScope.launch {
+            try {
+                if (delayMs > 0L) {
+                    delay(delayMs)
+                }
+                val warmupBmp = Bitmap.createBitmap(64, 64, Bitmap.Config.ARGB_8888).apply {
+                    eraseColor(android.graphics.Color.WHITE)
+                }
+                try {
+                    val img = InputImage.fromBitmap(warmupBmp, 0)
+                    if (!isLatinWarmedUp) {
+                        try {
+                            latinRecognizer.process(img).awaitGmsTask()
+                            isLatinWarmedUp = true
+                        } catch (_: Throwable) {
+                        }
+                    }
                     val client = try {
                         ModuleInstall.getClient(appCtx)
                     } catch (_: Throwable) {
@@ -171,16 +216,21 @@ object MoEOcrRouter {
                     warmupBmp.recycle()
                 }
 
-                // Pre-initialize Tesseract native engine + LSTM weights if any packs are downloaded
                 val downloadedTess = getDownloadedTesseractLangs(appCtx)
                 if (downloadedTess.isNotEmpty()) {
                     prewarmTesseract(appCtx, downloadedTess)
                 }
-                isWarmedUp = true
+                isMoEWarmedUp = true
             } catch (e: Throwable) {
-                Log.w(TAG, "OCR prewarm skipped: ${e.message}")
+                Log.w(TAG, "MoE invoke prewarm skipped: ${e.message}")
+            } finally {
+                isMoEPrewarming = false
             }
         }
+    }
+
+    fun prewarm(context: Context) {
+        prewarmLatinOnly(context)
     }
 
     private fun getDownloadedTesseractLangs(appCtx: Context): List<String> {

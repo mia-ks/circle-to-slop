@@ -74,6 +74,7 @@ import androidx.core.view.drawToBitmap
 import com.example.data.EdgeAnchor
 import com.example.data.GestureZoneConfig
 import com.example.data.TriggerMode
+import com.example.engine.OcrAndLensEngine
 import com.example.overlay.MinimalCircleOverlay
 import com.example.ui.theme.ElectricCyan
 import com.example.ui.theme.InterFamily
@@ -112,6 +113,7 @@ fun SandboxScreen(
     }
 
     fun captureSandboxAndLaunch() {
+        OcrAndLensEngine.prewarmMoEOnInvoke(context)
         if (config.hapticFeedback) {
             haptic.performHapticFeedback(HapticFeedbackType.LongPress)
         }

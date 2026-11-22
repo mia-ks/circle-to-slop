@@ -137,15 +137,28 @@ object OcrAndLensEngine {
     private val _packErrorFlow = MutableStateFlow<Map<String, String>>(emptyMap())
     val packErrorFlow: StateFlow<Map<String, String>> = _packErrorFlow.asStateFlow()
 
-    fun prewarm(context: Context) {
+    fun prewarmLatin(context: Context) {
         try {
             com.google.mlkit.common.sdkinternal.MlKitContext.initializeIfNeeded(context.applicationContext)
             languageIdentifier
             refreshDownloadedPacksAsync()
-            MoEOcrRouter.prewarm(context.applicationContext)
+            MoEOcrRouter.prewarmLatinOnly(context.applicationContext)
         } catch (e: Throwable) {
-            Log.w(TAG, "ML Kit prewarm skipped: ${e.message}")
+            Log.w(TAG, "ML Kit Latin prewarm skipped: ${e.message}")
         }
+    }
+
+    fun prewarmMoEOnInvoke(context: Context, delayMs: Long = 160L) {
+        try {
+            com.google.mlkit.common.sdkinternal.MlKitContext.initializeIfNeeded(context.applicationContext)
+            MoEOcrRouter.prewarmMoEOnInvoke(context.applicationContext, delayMs)
+        } catch (e: Throwable) {
+            Log.w(TAG, "MoE invoke prewarm skipped: ${e.message}")
+        }
+    }
+
+    fun prewarm(context: Context) {
+        prewarmLatin(context)
     }
 
     fun refreshDownloadedPacksAsync() {

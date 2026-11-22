@@ -55,7 +55,7 @@ class QuickCircleViewModel(application: Application) : AndroidViewModel(applicat
 
     init {
         viewModelScope.launch(Dispatchers.Default) {
-            OcrAndLensEngine.prewarm(getApplication())
+            OcrAndLensEngine.prewarmLatin(getApplication())
         }
     }
 

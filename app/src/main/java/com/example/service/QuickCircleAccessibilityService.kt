@@ -69,9 +69,9 @@ class QuickCircleAccessibilityService : AccessibilityService() {
         windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         repository = GestureConfigRepository(applicationContext)
 
-        // Prewarm ML Kit OCR engines off the critical launch path
+        // Prewarm only lightweight Latin OCR + pack status on connect
         serviceScope.launch(Dispatchers.Default) {
-            OcrAndLensEngine.prewarm(applicationContext)
+            OcrAndLensEngine.prewarmLatin(applicationContext)
         }
 
         serviceScope.launch {
@@ -398,6 +398,7 @@ class QuickCircleAccessibilityService : AccessibilityService() {
     }
 
     private fun onTriggerActivated() {
+        OcrAndLensEngine.prewarmMoEOnInvoke(applicationContext)
         if (currentConfig.hapticFeedback) {
             performShortHaptic()
         }
@@ -577,6 +578,7 @@ class QuickCircleAccessibilityService : AccessibilityService() {
 
         fun triggerFromTile(): Boolean {
             val instance = activeInstance ?: return false
+            OcrAndLensEngine.prewarmMoEOnInvoke(instance.applicationContext)
             instance.mainHandler.postDelayed({
                 instance.captureAndShowOverlay()
             }, 260L)

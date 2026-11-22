@@ -33,7 +33,6 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
@@ -105,7 +104,6 @@ import com.example.data.SupportedTargetLanguages
 import com.example.engine.InlineBlockStatus
 import com.example.engine.InlineScreenTranslationState
 import com.example.engine.InlineTextBlock
-import com.example.engine.MoEOcrRouter
 import com.example.engine.ModelPackStatus
 import com.example.engine.OcrAndLensEngine
 import com.example.engine.OcrRegionResult
@@ -202,14 +200,14 @@ fun MinimalCircleOverlay(
         OcrAndLensEngine.isGoogleTranslateAppInstalled(context)
     }
 
-    // Ultra-fast Latin first pass (~80-160ms) while keeping MoE prewarmed for the MoE button
+    // Ultra-fast Latin first pass (~80-160ms), then warm MoE weights asynchronously in background without running MoE OCR yet
     LaunchedEffect(screenshotBitmap) {
         isScanningInitialWords = true
         isRunningMoE = false
         isMoEApplied = false
         hasEnrichedInline = false
         pendingRefinedAnalysis = null
-        OcrAndLensEngine.prewarm(context)
+        OcrAndLensEngine.prewarmLatin(context)
         val fastLatin = OcrAndLensEngine.analyzeFullScreenFastLatin(screenshotBitmap)
         if (!isMoEApplied && !isRunningMoE) {
             if (selection !is SelectionGeometry.LensWords && !isDraggingTextHandle) {
@@ -219,6 +217,7 @@ fun MinimalCircleOverlay(
             }
         }
         isScanningInitialWords = false
+        OcrAndLensEngine.prewarmMoEOnInvoke(context, delayMs = 0L)
     }
 
     // Clear copied indicator quickly
@@ -278,15 +277,6 @@ fun MinimalCircleOverlay(
             ) { state ->
                 inlineTranslationState = state
             }
-        }
-    }
-
-    // If user enabled Inline Translate while OCR stage is completing, kick off inline translate automatically
-    LaunchedEffect(isInlineTranslateMode, screenAnalysis.blocks.size) {
-        if (isInlineTranslateMode && screenAnalysis.blocks.isNotEmpty() &&
-            inlineTranslationState.blockStates.isEmpty() && !inlineTranslationState.isTranslating
-        ) {
-            runInlineScreenTranslation(selectedTargetLang)
         }
     }
 
@@ -394,6 +384,24 @@ fun MinimalCircleOverlay(
         }
     }
 
+    fun resetSelection() {
+        selection = null
+        croppedBitmap = null
+        lastCropRect = null
+        ocrResult = null
+        editableText = ""
+        isAnalyzingOcr = false
+        isDraggingTextHandle = false
+        translationJob?.cancel()
+        translationState = TranslationState.Idle
+        focusedInlineBlock = null
+        pendingRefinedAnalysis?.let {
+            screenAnalysis = it
+            pendingRefinedAnalysis = null
+            hasEnrichedInline = false
+        }
+    }
+
     fun triggerMoEScan() {
         if (isRunningMoE) return
         moeJob?.cancel()
@@ -409,11 +417,14 @@ fun MinimalCircleOverlay(
                     } else {
                         pendingRefinedAnalysis = next
                     }
+                    if (isInlineTranslateMode && next.blocks.isNotEmpty()) {
+                        runInlineScreenTranslation(selectedTargetLang)
+                    }
                     if (isFinal) {
                         isMoEApplied = true
                         isRunningMoE = false
-                        if (isInlineTranslateMode && next.blocks.isNotEmpty()) {
-                            runInlineScreenTranslation(selectedTargetLang)
+                        if (isInlineTranslateMode && next.blocks.isEmpty()) {
+                            inlineTranslationState = InlineScreenTranslationState(targetLangCode = selectedTargetLang)
                         }
                         val activeCrop = croppedBitmap
                         val activeRect = lastCropRect
@@ -444,21 +455,26 @@ fun MinimalCircleOverlay(
         }
     }
 
-    fun resetSelection() {
-        selection = null
-        croppedBitmap = null
-        lastCropRect = null
-        ocrResult = null
-        editableText = ""
-        isAnalyzingOcr = false
-        isDraggingTextHandle = false
-        translationJob?.cancel()
-        translationState = TranslationState.Idle
+    fun activateInlineTranslateMode() {
+        isInlineTranslateMode = true
+        showOriginalScreen = false
         focusedInlineBlock = null
-        pendingRefinedAnalysis?.let {
-            screenAnalysis = it
-            pendingRefinedAnalysis = null
-            hasEnrichedInline = false
+        resetSelection()
+        if (isMoEApplied) {
+            runInlineScreenTranslation(selectedTargetLang)
+        } else if (!isRunningMoE) {
+            triggerMoEScan()
+        }
+    }
+
+    fun toggleInlineTranslateMode() {
+        if (isInlineTranslateMode) {
+            isInlineTranslateMode = false
+            showOriginalScreen = false
+            focusedInlineBlock = null
+            inlineTranslationJob?.cancel()
+        } else {
+            activateInlineTranslateMode()
         }
     }
 
@@ -881,99 +897,62 @@ fun MinimalCircleOverlay(
             )
         }
 
-        // 3. Minimalist top controls
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .statusBarsPadding()
-                .padding(horizontal = 16.dp, vertical = 12.dp),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Surface(
-                color = Color(0xCC121216),
-                shape = RoundedCornerShape(999.dp),
-                border = BorderStroke(1.dp, Color(0x33FFFFFF)),
-                modifier = Modifier
-                    .heightIn(min = 44.dp)
-                    .then(
-                        if (selection != null && !isInlineTranslateMode) {
-                            Modifier.clickable { resetSelection() }
-                        } else {
-                            Modifier
-                        }
-                    )
-                    .testTag("overlay_status_pill")
-            ) {
-                Row(
-                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(7.dp)
-                ) {
-                    if (isInlineTranslateMode) {
-                        Icon(
-                            imageVector = Icons.Rounded.Translate,
-                            contentDescription = null,
-                            tint = ElectricCyan,
-                            modifier = Modifier.size(15.dp)
-                        )
-                        Text(
-                            text = if (showOriginalScreen) "Original" else "Translated",
-                            color = Color.White,
-                            fontFamily = SpaceGroteskFamily,
-                            fontWeight = FontWeight.Medium,
-                            fontSize = 12.5.sp
-                        )
-                    } else if (selection != null) {
-                        Icon(
-                            imageVector = Icons.Rounded.Refresh,
-                            contentDescription = "Clear selection",
-                            tint = Color.White,
-                            modifier = Modifier.size(16.dp)
-                        )
-                        Text(
-                            text = "Reset",
-                            color = Color.White,
-                            fontFamily = SpaceGroteskFamily,
-                            fontWeight = FontWeight.Medium,
-                            fontSize = 12.5.sp
-                        )
-                    } else {
-                        if (isScanningInitialWords) {
-                            CircularProgressIndicator(
-                                color = ElectricCyan,
-                                strokeWidth = 1.8.dp,
-                                modifier = Modifier.size(12.dp)
-                            )
-                        } else {
-                            Box(
-                                modifier = Modifier
-                                    .size(8.dp)
-                                    .clip(CircleShape)
-                                    .background(ElectricCyan)
-                            )
-                        }
-                        Text(
-                            text = if (isScanningInitialWords) "Scanning…" else "Tap or circle",
-                            color = Color.White,
-                            fontFamily = InterFamily,
-                            fontSize = 12.5.sp,
-                            maxLines = 1
-                        )
-                    }
-                }
-            }
+        // 3. Bottom-right one-handed thumb controls (top of screen stays completely empty)
+        val showFloatingBottomRightDock = !isInlineTranslateMode &&
+            (croppedBitmap == null || isDrawing || isDraggingTextHandle)
 
+        AnimatedVisibility(
+            visible = showFloatingBottomRightDock,
+            enter = fadeIn(),
+            exit = fadeOut(),
+            modifier = Modifier
+                .align(Alignment.BottomEnd)
+                .navigationBarsPadding()
+                .padding(end = 16.dp, bottom = 18.dp)
+        ) {
             Row(
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                // On-demand MoE Multi-Script button (keeps Latin Fast first pass instant)
+                if (selection != null) {
+                    Surface(
+                        color = Color(0xD9121216),
+                        shape = RoundedCornerShape(999.dp),
+                        border = BorderStroke(1.dp, Color(0x33FFFFFF)),
+                        modifier = Modifier
+                            .heightIn(min = 48.dp)
+                            .clip(RoundedCornerShape(999.dp))
+                            .clickable { resetSelection() }
+                            .testTag("overlay_reset_button")
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(5.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Rounded.Refresh,
+                                contentDescription = "Reset selection",
+                                tint = Color.White,
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Text(
+                                text = "Reset",
+                                color = Color.White,
+                                fontFamily = SpaceGroteskFamily,
+                                fontWeight = FontWeight.Medium,
+                                fontSize = 12.5.sp
+                            )
+                        }
+                    }
+                }
+
+                // On-demand MoE Multi-Script button
                 Surface(
                     color = when {
-                        isMoEApplied -> Color(0xCC16303D)
-                        isRunningMoE -> Color(0xCC1B2230)
-                        else -> Color(0xCC121216)
+                        isMoEApplied -> Color(0xD916303D)
+                        isRunningMoE -> Color(0xD91B2230)
+                        else -> Color(0xD9121216)
                     },
                     shape = RoundedCornerShape(999.dp),
                     border = BorderStroke(
@@ -985,13 +964,13 @@ fun MinimalCircleOverlay(
                         }
                     ),
                     modifier = Modifier
-                        .heightIn(min = 44.dp)
+                        .heightIn(min = 48.dp)
                         .clip(RoundedCornerShape(999.dp))
                         .clickable(enabled = !isRunningMoE) { triggerMoEScan() }
                         .testTag("overlay_moe_button")
                 ) {
                     Row(
-                        modifier = Modifier.padding(horizontal = 11.dp, vertical = 8.dp),
+                        modifier = Modifier.padding(horizontal = 13.dp, vertical = 10.dp),
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(5.dp)
                     ) {
@@ -999,14 +978,14 @@ fun MinimalCircleOverlay(
                             CircularProgressIndicator(
                                 color = ElectricCyan,
                                 strokeWidth = 1.8.dp,
-                                modifier = Modifier.size(13.dp)
+                                modifier = Modifier.size(14.dp)
                             )
                         } else {
                             Icon(
                                 imageVector = if (isMoEApplied) Icons.Rounded.Check else Icons.Rounded.Language,
                                 contentDescription = "Run multi-script MoE OCR",
                                 tint = ElectricCyan,
-                                modifier = Modifier.size(15.dp)
+                                modifier = Modifier.size(16.dp)
                             )
                         }
                         Text(
@@ -1014,54 +993,37 @@ fun MinimalCircleOverlay(
                             color = if (isMoEApplied) ElectricCyan else Color.White,
                             fontFamily = SpaceGroteskFamily,
                             fontWeight = FontWeight.SemiBold,
-                            fontSize = 12.sp,
+                            fontSize = 12.5.sp,
                             maxLines = 1
                         )
                     }
                 }
 
-                val targetShort = SupportedTargetLanguages.firstOrNull {
-                    it.code == selectedTargetLang
-                }?.shortCode ?: selectedTargetLang.uppercase()
-
+                // Translate button (automatically invokes MoE to cover all non-Latin scripts)
                 Surface(
-                    color = if (isInlineTranslateMode) ElectricCyan else Color(0xCC121216),
+                    color = Color(0xD9121216),
                     shape = RoundedCornerShape(999.dp),
-                    border = BorderStroke(
-                        1.dp,
-                        if (isInlineTranslateMode) ElectricCyan else Color(0x44FFFFFF)
-                    ),
+                    border = BorderStroke(1.dp, Color(0x44FFFFFF)),
                     modifier = Modifier
-                        .heightIn(min = 44.dp)
+                        .heightIn(min = 48.dp)
                         .clip(RoundedCornerShape(999.dp))
-                        .clickable {
-                            val next = !isInlineTranslateMode
-                            isInlineTranslateMode = next
-                            showOriginalScreen = false
-                            focusedInlineBlock = null
-                            if (next) {
-                                resetSelection()
-                                runInlineScreenTranslation(selectedTargetLang)
-                            } else {
-                                inlineTranslationJob?.cancel()
-                            }
-                        }
+                        .clickable { activateInlineTranslateMode() }
                         .testTag("overlay_inline_translate_button")
                 ) {
                     Row(
-                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
                         verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(5.dp)
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
                         Icon(
                             imageVector = Icons.Rounded.Translate,
-                            contentDescription = "Toggle inline screen translate",
-                            tint = if (isInlineTranslateMode) Color.Black else ElectricCyan,
+                            contentDescription = "Translate screen inline",
+                            tint = ElectricCyan,
                             modifier = Modifier.size(16.dp)
                         )
                         Text(
-                            text = if (isInlineTranslateMode) "Inline · $targetShort" else "Translate",
-                            color = if (isInlineTranslateMode) Color.Black else Color.White,
+                            text = "Translate",
+                            color = Color.White,
                             fontFamily = SpaceGroteskFamily,
                             fontWeight = FontWeight.SemiBold,
                             fontSize = 12.5.sp
@@ -1070,7 +1032,7 @@ fun MinimalCircleOverlay(
                 }
 
                 Surface(
-                    color = Color(0xCC121216),
+                    color = Color(0xD9121216),
                     shape = CircleShape,
                     border = BorderStroke(1.dp, Color(0x33FFFFFF))
                 ) {
@@ -1090,7 +1052,7 @@ fun MinimalCircleOverlay(
             }
         }
 
-        // 4a. Inline Screen Translation Controls Bar
+        // 4a. Inline Screen Translation Controls Bar (lower-right thumb controls included)
         AnimatedVisibility(
             visible = isInlineTranslateMode,
             enter = slideInVertically { it } + fadeIn(),
@@ -1102,18 +1064,27 @@ fun MinimalCircleOverlay(
                 packStatuses = packStatuses,
                 hasGoogleTranslateApp = hasGoogleTranslateApp,
                 inlineTranslationState = inlineTranslationState,
+                isRunningMoE = isRunningMoE,
                 showOriginal = showOriginalScreen,
                 focusedBlock = focusedInlineBlock,
                 fallbackScreenText = fullScreenBlocks.joinToString("\n") { it.text },
                 dominantLangHint = screenAnalysis.dominantLanguageCode,
                 copiedLabel = copiedLabel,
                 onToggleShowOriginal = { showOriginalScreen = !showOriginalScreen },
+                onExitInlineMode = { toggleInlineTranslateMode() },
+                onDismissOverlay = onDismiss,
                 onSelectTargetLanguage = { code ->
                     selectedTargetLang = code
                     onTargetLanguageChanged(code)
                     runInlineScreenTranslation(code)
                 },
-                onRetryInline = { runInlineScreenTranslation(selectedTargetLang) },
+                onRetryInline = {
+                    if (!isMoEApplied && !isRunningMoE) {
+                        triggerMoEScan()
+                    } else {
+                        runInlineScreenTranslation(selectedTargetLang)
+                    }
+                },
                 onCopy = { label, value -> copyToClipboard(label, value) },
                 onWebSearch = { query ->
                     if (OcrAndLensEngine.launchWebSearch(context, query)) {
@@ -1151,6 +1122,8 @@ fun MinimalCircleOverlay(
                         editableText = updated
                     },
                     isAnalyzingOcr = isAnalyzingOcr,
+                    isRunningMoE = isRunningMoE,
+                    isMoEApplied = isMoEApplied,
                     canSelectAllWords = fullScreenWords.isNotEmpty() &&
                         (selection as? SelectionGeometry.LensWords)?.range !=
                         TextSelectionRange(0, fullScreenWords.lastIndex),
@@ -1162,6 +1135,9 @@ fun MinimalCircleOverlay(
                             )
                         }
                     },
+                    onResetSelection = { resetSelection() },
+                    onTriggerMoE = { triggerMoEScan() },
+                    onDismissOverlay = onDismiss,
                     selectedTargetLang = selectedTargetLang,
                     packStatuses = packStatuses,
                     hasGoogleTranslateApp = hasGoogleTranslateApp,
@@ -1186,12 +1162,7 @@ fun MinimalCircleOverlay(
                             selectedTargetLang
                         )
                     },
-                    onSwitchToInlineTranslate = {
-                        isInlineTranslateMode = true
-                        showOriginalScreen = false
-                        resetSelection()
-                        runInlineScreenTranslation(selectedTargetLang)
-                    },
+                    onSwitchToInlineTranslate = { activateInlineTranslateMode() },
                     onLensLookup = {
                         if (OcrAndLensEngine.launchGoogleLensLookup(context, crop)) {
                             onExternalActionLaunched()
@@ -1227,8 +1198,13 @@ private fun CompactLookupSheet(
     editableText: String,
     onEditableTextChange: (String) -> Unit,
     isAnalyzingOcr: Boolean,
+    isRunningMoE: Boolean,
+    isMoEApplied: Boolean,
     canSelectAllWords: Boolean,
     onSelectAllWords: () -> Unit,
+    onResetSelection: () -> Unit,
+    onTriggerMoE: () -> Unit,
+    onDismissOverlay: () -> Unit,
     selectedTargetLang: String,
     packStatuses: Map<String, ModelPackStatus>,
     hasGoogleTranslateApp: Boolean,
@@ -1259,8 +1235,8 @@ private fun CompactLookupSheet(
             modifier = Modifier
                 .fillMaxWidth()
                 .verticalScroll(scrollState)
-                .padding(horizontal = 16.dp, vertical = 14.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp)
+                .padding(horizontal = 16.dp, vertical = 12.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
             // Drag/sheet indicator
             Box(
@@ -1271,6 +1247,131 @@ private fun CompactLookupSheet(
                     .clip(CircleShape)
                     .background(Color(0xFF3A3A46))
             )
+
+            // Bottom-right reachable utility controls (Reset / MoE / Translate / Close)
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.End,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Surface(
+                        color = Color(0xFF1E2029),
+                        shape = RoundedCornerShape(999.dp),
+                        modifier = Modifier
+                            .heightIn(min = 48.dp)
+                            .clip(RoundedCornerShape(999.dp))
+                            .clickable { onResetSelection() }
+                            .testTag("overlay_reset_button")
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 11.dp, vertical = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Rounded.Refresh,
+                                contentDescription = "Reset selection",
+                                tint = Color.White,
+                                modifier = Modifier.size(15.dp)
+                            )
+                            Text(
+                                text = "Reset",
+                                color = Color.White,
+                                fontFamily = SpaceGroteskFamily,
+                                fontSize = 12.sp
+                            )
+                        }
+                    }
+
+                    Surface(
+                        color = if (isMoEApplied) Color(0xFF16303D) else Color(0xFF1E2029),
+                        shape = RoundedCornerShape(999.dp),
+                        border = if (isMoEApplied) BorderStroke(1.dp, ElectricCyan) else null,
+                        modifier = Modifier
+                            .heightIn(min = 48.dp)
+                            .clip(RoundedCornerShape(999.dp))
+                            .clickable(enabled = !isRunningMoE) { onTriggerMoE() }
+                            .testTag("overlay_moe_button")
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 11.dp, vertical = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            if (isRunningMoE) {
+                                CircularProgressIndicator(
+                                    color = ElectricCyan,
+                                    strokeWidth = 1.8.dp,
+                                    modifier = Modifier.size(13.dp)
+                                )
+                            } else {
+                                Icon(
+                                    imageVector = if (isMoEApplied) Icons.Rounded.Check else Icons.Rounded.Language,
+                                    contentDescription = "Run multi-script MoE OCR",
+                                    tint = ElectricCyan,
+                                    modifier = Modifier.size(15.dp)
+                                )
+                            }
+                            Text(
+                                text = if (isRunningMoE) "MoE…" else "MoE",
+                                color = if (isMoEApplied) ElectricCyan else Color.White,
+                                fontFamily = SpaceGroteskFamily,
+                                fontWeight = FontWeight.SemiBold,
+                                fontSize = 12.sp
+                            )
+                        }
+                    }
+
+                    Surface(
+                        color = Color(0xFF1E2029),
+                        shape = RoundedCornerShape(999.dp),
+                        modifier = Modifier
+                            .heightIn(min = 48.dp)
+                            .clip(RoundedCornerShape(999.dp))
+                            .clickable { onSwitchToInlineTranslate() }
+                            .testTag("overlay_inline_translate_button")
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 11.dp, vertical = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Rounded.Translate,
+                                contentDescription = "Translate screen inline",
+                                tint = ElectricCyan,
+                                modifier = Modifier.size(15.dp)
+                            )
+                            Text(
+                                text = "Translate",
+                                color = Color.White,
+                                fontFamily = SpaceGroteskFamily,
+                                fontWeight = FontWeight.SemiBold,
+                                fontSize = 12.sp
+                            )
+                        }
+                    }
+
+                    IconButton(
+                        onClick = onDismissOverlay,
+                        modifier = Modifier
+                            .size(48.dp)
+                            .clip(CircleShape)
+                            .background(Color(0xFF1E2029))
+                            .testTag("overlay_close_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Rounded.Close,
+                            contentDescription = "Close overlay",
+                            tint = Color.White
+                        )
+                    }
+                }
+            }
 
             // Primary Action Row: Crop preview + Google Lens + Web Search
             Row(
@@ -1869,12 +1970,15 @@ private fun InlineTranslateBottomBar(
     packStatuses: Map<String, ModelPackStatus>,
     hasGoogleTranslateApp: Boolean,
     inlineTranslationState: InlineScreenTranslationState,
+    isRunningMoE: Boolean,
     showOriginal: Boolean,
     focusedBlock: InlineTextBlock?,
     fallbackScreenText: String,
     dominantLangHint: String?,
     copiedLabel: String?,
     onToggleShowOriginal: () -> Unit,
+    onExitInlineMode: () -> Unit,
+    onDismissOverlay: () -> Unit,
     onSelectTargetLanguage: (String) -> Unit,
     onRetryInline: () -> Unit,
     onCopy: (label: String, value: String) -> Unit,
@@ -1911,7 +2015,7 @@ private fun InlineTranslateBottomBar(
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                     modifier = Modifier.weight(1f)
                 ) {
-                    if (inlineTranslationState.isTranslating) {
+                    if (isRunningMoE || inlineTranslationState.isTranslating) {
                         CircularProgressIndicator(
                             color = ElectricCyan,
                             strokeWidth = 2.dp,
@@ -1927,16 +2031,18 @@ private fun InlineTranslateBottomBar(
                     }
                     Text(
                         text = when {
+                            isRunningMoE ->
+                                "Scanning scripts…"
                             inlineTranslationState.isDownloadingPacks ->
                                 "Downloading ${inlineTranslationState.missingPacksLabel}…"
                             inlineTranslationState.isTranslating ->
-                                "Replacing text inline ($translatedCount done)…"
+                                "Translating ($translatedCount)…"
                             inlineTranslationState.errorMessage != null ->
                                 "Offline pack unavailable"
                             translatedCount > 0 ->
-                                "$translatedCount block${if (translatedCount == 1) "" else "s"} replaced inline"
+                                "$translatedCount translated"
                             else ->
-                                "All detected text matches target language"
+                                "Same language"
                         },
                         color = Color.White,
                         fontFamily = SpaceGroteskFamily,
@@ -1947,31 +2053,82 @@ private fun InlineTranslateBottomBar(
                     )
                 }
 
-                Surface(
-                    color = if (showOriginal) ElectricCyan else Color(0xFF252530),
-                    shape = RoundedCornerShape(10.dp),
-                    modifier = Modifier
-                        .heightIn(min = 48.dp)
-                        .clickable { onToggleShowOriginal() }
-                        .testTag("toggle_original_text_button")
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Row(
-                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(5.dp)
+                    Surface(
+                        color = if (showOriginal) ElectricCyan else Color(0xFF252530),
+                        shape = RoundedCornerShape(999.dp),
+                        modifier = Modifier
+                            .heightIn(min = 48.dp)
+                            .clip(RoundedCornerShape(999.dp))
+                            .clickable { onToggleShowOriginal() }
+                            .testTag("toggle_original_text_button")
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 11.dp, vertical = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            Icon(
+                                imageVector = if (showOriginal) Icons.Rounded.VisibilityOff else Icons.Rounded.Visibility,
+                                contentDescription = "Toggle original screen text",
+                                tint = if (showOriginal) Color.Black else Color.White,
+                                modifier = Modifier.size(15.dp)
+                            )
+                            Text(
+                                text = if (showOriginal) "Translated" else "Original",
+                                color = if (showOriginal) Color.Black else Color.White,
+                                fontFamily = SpaceGroteskFamily,
+                                fontWeight = FontWeight.Medium,
+                                fontSize = 12.sp
+                            )
+                        }
+                    }
+
+                    Surface(
+                        color = ElectricCyan,
+                        shape = RoundedCornerShape(999.dp),
+                        modifier = Modifier
+                            .heightIn(min = 48.dp)
+                            .clip(RoundedCornerShape(999.dp))
+                            .clickable { onExitInlineMode() }
+                            .testTag("overlay_inline_translate_button")
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 11.dp, vertical = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Rounded.Translate,
+                                contentDescription = "Return to selection mode",
+                                tint = Color.Black,
+                                modifier = Modifier.size(15.dp)
+                            )
+                            Text(
+                                text = "Select",
+                                color = Color.Black,
+                                fontFamily = SpaceGroteskFamily,
+                                fontWeight = FontWeight.SemiBold,
+                                fontSize = 12.sp
+                            )
+                        }
+                    }
+
+                    IconButton(
+                        onClick = onDismissOverlay,
+                        modifier = Modifier
+                            .size(48.dp)
+                            .clip(CircleShape)
+                            .background(Color(0xFF252530))
+                            .testTag("overlay_close_button")
                     ) {
                         Icon(
-                            imageVector = if (showOriginal) Icons.Rounded.VisibilityOff else Icons.Rounded.Visibility,
-                            contentDescription = "Toggle original screen text",
-                            tint = if (showOriginal) Color.Black else Color.White,
-                            modifier = Modifier.size(15.dp)
-                        )
-                        Text(
-                            text = if (showOriginal) "Translated" else "Original",
-                            color = if (showOriginal) Color.Black else Color.White,
-                            fontFamily = SpaceGroteskFamily,
-                            fontWeight = FontWeight.Medium,
-                            fontSize = 12.sp
+                            imageVector = Icons.Rounded.Close,
+                            contentDescription = "Close overlay",
+                            tint = Color.White
                         )
                     }
                 }
