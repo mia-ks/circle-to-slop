@@ -247,14 +247,14 @@ fun DashboardScreen(
                                     )
                                     Text(
                                         text = if (isAccessibilityEnabled) {
-                                            "Works over any app · Tile supported"
+                                            "Works over any app · Tile ready"
                                         } else {
                                             "Grant Accessibility permission to circle any app"
                                         },
                                         style = MaterialTheme.typography.bodyMedium,
                                         fontSize = 12.sp,
                                         color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                        maxLines = 1,
+                                        maxLines = 2,
                                         overflow = TextOverflow.Ellipsis
                                     )
                                 }
@@ -306,99 +306,95 @@ fun DashboardScreen(
 
                         HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.5f))
 
-                        // Fast Daily Launchers: Test Canvas + Gesture Zone Editor
-                        Row(
+                        // Fast Daily Launchers: Full-width Trigger Zone + Test Canvas (no narrow-column truncation)
+                        Column(
                             modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.spacedBy(10.dp),
-                            verticalAlignment = Alignment.CenterVertically
+                            verticalArrangement = Arrangement.spacedBy(10.dp)
                         ) {
-                            Button(
-                                onClick = onOpenSandbox,
-                                shape = RoundedCornerShape(14.dp),
-                                contentPadding = PaddingValues(horizontal = 16.dp, vertical = 14.dp),
-                                modifier = Modifier
-                                    .weight(1.1f)
-                                    .heightIn(min = 60.dp)
-                                    .testTag("launch_sandbox_button")
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Rounded.CropFree,
-                                    contentDescription = null,
-                                    modifier = Modifier.size(20.dp)
-                                )
-                                Spacer(Modifier.width(8.dp))
-                                Column {
-                                    Text(
-                                        text = "Test Canvas",
-                                        fontFamily = SpaceGroteskFamily,
-                                        fontWeight = FontWeight.SemiBold,
-                                        fontSize = 14.sp
-                                    )
-                                    Text(
-                                        text = "OCR & Translate",
-                                        fontFamily = InterFamily,
-                                        fontSize = 11.sp,
-                                        color = MaterialTheme.colorScheme.onPrimary.copy(alpha = 0.78f)
-                                    )
-                                }
-                            }
-
                             Surface(
                                 shape = RoundedCornerShape(14.dp),
                                 color = MaterialTheme.colorScheme.surfaceVariant,
                                 modifier = Modifier
-                                    .weight(1f)
+                                    .fillMaxWidth()
                                     .heightIn(min = 60.dp)
                                     .clip(RoundedCornerShape(14.dp))
                                     .clickable { onOpenZoneEditor() }
                                     .testTag("open_zone_editor_button")
                             ) {
                                 Row(
-                                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 12.dp),
                                     verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                                    horizontalArrangement = Arrangement.spacedBy(12.dp)
                                 ) {
                                     MiniPhoneZonePreview(
                                         config = config,
-                                        modifier = Modifier.size(width = 28.dp, height = 46.dp)
+                                        modifier = Modifier.size(width = 30.dp, height = 48.dp)
                                     )
                                     Column(modifier = Modifier.weight(1f)) {
                                         Row(
                                             verticalAlignment = Alignment.CenterVertically,
-                                            horizontalArrangement = Arrangement.spacedBy(4.dp)
+                                            horizontalArrangement = Arrangement.spacedBy(5.dp)
                                         ) {
                                             Icon(
                                                 imageVector = Icons.Rounded.Tune,
                                                 contentDescription = null,
                                                 tint = ElectricCyan,
-                                                modifier = Modifier.size(14.dp)
+                                                modifier = Modifier.size(15.dp)
                                             )
                                             Text(
                                                 text = "Trigger Zone",
                                                 fontFamily = SpaceGroteskFamily,
                                                 fontWeight = FontWeight.SemiBold,
-                                                fontSize = 13.5.sp,
-                                                color = MaterialTheme.colorScheme.onSurface,
-                                                maxLines = 1,
-                                                overflow = TextOverflow.Ellipsis
+                                                fontSize = 14.5.sp,
+                                                color = MaterialTheme.colorScheme.onSurface
                                             )
                                         }
                                         Text(
-                                            text = "${config.anchor.label.replace(" Edge", "")} · ${config.triggerMode.label}",
+                                            text = config.summaryLine(),
                                             fontFamily = InterFamily,
-                                            fontSize = 11.sp,
+                                            fontSize = 12.sp,
                                             color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                            maxLines = 1,
+                                            maxLines = 2,
                                             overflow = TextOverflow.Ellipsis
                                         )
                                     }
                                     Icon(
                                         imageVector = Icons.AutoMirrored.Rounded.KeyboardArrowRight,
-                                        contentDescription = null,
+                                        contentDescription = "Configure trigger zone",
                                         tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                                        modifier = Modifier.size(18.dp)
+                                        modifier = Modifier.size(20.dp)
                                     )
                                 }
+                            }
+
+                            Button(
+                                onClick = onOpenSandbox,
+                                shape = RoundedCornerShape(14.dp),
+                                contentPadding = PaddingValues(horizontal = 16.dp, vertical = 14.dp),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .heightIn(min = 54.dp)
+                                    .testTag("launch_sandbox_button")
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Rounded.CropFree,
+                                    contentDescription = null,
+                                    modifier = Modifier.size(19.dp)
+                                )
+                                Spacer(Modifier.width(8.dp))
+                                Text(
+                                    text = "Open Test Canvas",
+                                    fontFamily = SpaceGroteskFamily,
+                                    fontWeight = FontWeight.SemiBold,
+                                    fontSize = 14.5.sp
+                                )
+                                Spacer(Modifier.width(6.dp))
+                                Text(
+                                    text = "· OCR & Translate",
+                                    fontFamily = InterFamily,
+                                    fontSize = 12.5.sp,
+                                    color = MaterialTheme.colorScheme.onPrimary.copy(alpha = 0.78f)
+                                )
                             }
                         }
                     }
@@ -839,7 +835,7 @@ fun DashboardScreen(
                                             color = MaterialTheme.colorScheme.onSurface
                                         )
                                         Text(
-                                            text = "$readyMlKitCount/${SupportedMlKitDynamicScripts.size} ML Kit · $readyTessCount Extra (Arabic/Cyrillic/Greek…)",
+                                            text = "$readyMlKitCount/${SupportedMlKitDynamicScripts.size} ML Kit · $readyTessCount Extra script${if (readyTessCount == 1) "" else "s"}",
                                             fontFamily = InterFamily,
                                             fontSize = 11.5.sp,
                                             color = ElectricCyan
