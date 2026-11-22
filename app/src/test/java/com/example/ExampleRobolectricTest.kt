@@ -1,7 +1,11 @@
 package com.example
 
+import android.app.SearchManager
 import android.content.Context
+import android.content.Intent
 import android.graphics.Rect
+import android.view.Display
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onNodeWithTag
@@ -19,10 +23,15 @@ import com.example.engine.OcrExpertKind
 import com.example.engine.RecognizedTextWord
 import com.example.overlay.TextSelectionRange
 import com.example.overlay.buildSelectedText
+import com.example.overlay.buildSmoothedFreehandPath
 import com.example.overlay.hitTestWord
+import com.example.service.doesTriggerOverlapIme
+import com.example.service.isDeviceLockedOrAodState
+import com.example.ui.computeEdgePinnedResize
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -236,6 +245,7 @@ class ExampleRobolectricTest {
 
     @Test
     fun `dashboard shows offline pack status and navigates to zone editor and sandbox`() {
+        composeRule.onNodeWithTag("header_status_text").assertIsDisplayed()
         composeRule.onNodeWithTag("launch_sandbox_button").performScrollTo().assertIsDisplayed()
         composeRule.onNodeWithTag("open_zone_editor_button").performScrollTo().assertIsDisplayed()
         composeRule.onNodeWithTag("offline_pack_status_card").performScrollTo().assertIsDisplayed()
@@ -253,5 +263,117 @@ class ExampleRobolectricTest {
 
         composeRule.onNodeWithTag("launch_sandbox_button").performScrollTo().performClick()
         composeRule.onNodeWithTag("sandbox_circle_now_button").assertIsDisplayed()
+    }
+
+    @Test
+    fun `zone editor resize pins opposite edge while resizing height`() {
+        // Right edge grip pulls down (+60px -> +60dp at scale=1) and left (-20px -> +20dp width):
+        // top edge at pinnedTopPx=100f must stay pinned at y=100f when frameH=800f.
+        val rightRes = computeEdgePinnedResize(
+            anchor = EdgeAnchor.RIGHT_EDGE,
+            pinnedLeftPx = 350f,
+            pinnedTopPx = 100f,
+            pinnedRightPx = 390f,
+            pinnedBottomPx = 220f,
+            startWidthDp = 40f,
+            startHeightDp = 120f,
+            totalDragPxX = -20f,
+            totalDragPxY = 60f,
+            frameW = 400f,
+            frameH = 800f,
+            scaleX = 1f,
+            scaleY = 1f
+        )
+        assertEquals(60f, rightRes.widthDp, 0.01f)
+        assertEquals(180f, rightRes.heightDp, 0.01f)
+        val recomputedTopPx = (800f - rightRes.heightDp) * (rightRes.offsetYFraction ?: 0f)
+        assertEquals(100f, recomputedTopPx, 0.5f)
+    }
+
+    @Test
+    fun `smoothed freehand spline produces closed non-empty bounds`() {
+        val open = buildSmoothedFreehandPath(
+            listOf(Offset(10f, 10f), Offset(50f, 30f), Offset(90f, 80f)),
+            isClosed = false
+        )
+        assertFalse(open.isEmpty)
+        val closed = buildSmoothedFreehandPath(
+            listOf(Offset(10f, 10f), Offset(80f, 15f), Offset(85f, 90f), Offset(12f, 85f)),
+            isClosed = true
+        )
+        assertFalse(closed.isEmpty)
+        assertTrue(buildSmoothedFreehandPath(emptyList(), isClosed = false).isEmpty)
+    }
+
+    @Test
+    fun `greentext quote helpers strip markers for language id and translate line by line`() {
+        val raw = ">je suis communiste\n>j'aime les communes\n>je n'aime pas les capitales\n>révolution"
+        val cleaned = OcrAndLensEngine.cleanTextForLanguageId(raw)
+        assertEquals(
+            "je suis communiste j'aime les communes je n'aime pas les capitales révolution",
+            cleaned
+        )
+        val lines = raw.split('\n')
+        assertTrue(OcrAndLensEngine.shouldTranslateLineByLine(lines))
+        assertEquals(Pair("> ", "je suis communiste"), OcrAndLensEngine.splitPrefixForTranslation(">je suis communiste"))
+        assertEquals(Pair("", "bonjour"), OcrAndLensEngine.splitPrefixForTranslation("bonjour"))
+    }
+
+    @Test
+    fun `moe router masks clean stage1 ml kit regions before tesseract`() {
+        val cleanLatin = CandidateOcrLine(
+            expert = OcrExpertKind.MLKIT_LATIN,
+            text = "Boarding Gate B14",
+            boundingBox = Rect(10, 10, 220, 40),
+            words = listOf(CandidateOcrWord("Boarding", Rect(10, 10, 100, 40))),
+            confidence = 95f
+        )
+        val garbledArabic = CandidateOcrLine(
+            expert = OcrExpertKind.MLKIT_LATIN,
+            text = "l|o *#",
+            boundingBox = Rect(10, 60, 220, 95),
+            words = listOf(CandidateOcrWord("l|o", Rect(10, 60, 90, 95))),
+            confidence = 68f
+        )
+        val cleanJapanese = CandidateOcrLine(
+            expert = OcrExpertKind.MLKIT_JAPANESE,
+            text = "東京駅",
+            boundingBox = Rect(10, 110, 140, 145),
+            words = listOf(CandidateOcrWord("東京駅", Rect(10, 110, 140, 145))),
+            confidence = 92f
+        )
+
+        val masked = MoEOcrRouter.collectCleanStage1MaskRects(listOf(cleanLatin, garbledArabic, cleanJapanese))
+        assertEquals(2, masked.size)
+        assertTrue(masked.contains(cleanLatin.boundingBox))
+        assertTrue(masked.contains(cleanJapanese.boundingBox))
+    }
+
+    @Test
+    fun `web search intents prefer google popup search before browser url`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val intents = OcrAndLensEngine.buildWebSearchIntents(context, "QuickCircle OCR")
+        assertTrue(intents.size >= 3)
+        assertEquals(Intent.ACTION_WEB_SEARCH, intents[0].action)
+        assertEquals("com.google.android.googlequicksearchbox", intents[0].`package`)
+        assertEquals("QuickCircle OCR", intents[0].getStringExtra(SearchManager.QUERY))
+        assertEquals(Intent.ACTION_WEB_SEARCH, intents[1].action)
+        assertEquals(Intent.ACTION_VIEW, intents.last().action)
+    }
+
+    @Test
+    fun `trigger yields to overlapping ime and suppresses on lockscreen or aod`() {
+        val triggerRect = Rect(1000, 1500, 1080, 1750)
+        val imeBounds = listOf(Rect(0, 1600, 1080, 2400))
+        val nonOverlappingIme = listOf(Rect(0, 1900, 1080, 2400))
+
+        assertTrue(doesTriggerOverlapIme(triggerRect, imeBounds, safetyMarginPx = 16))
+        assertFalse(doesTriggerOverlapIme(triggerRect, nonOverlappingIme, safetyMarginPx = 16))
+
+        assertTrue(isDeviceLockedOrAodState(isKeyguardLocked = true, isDeviceLocked = false, isInteractive = true, displayState = Display.STATE_ON))
+        assertTrue(isDeviceLockedOrAodState(isKeyguardLocked = false, isDeviceLocked = true, isInteractive = true, displayState = Display.STATE_ON))
+        assertTrue(isDeviceLockedOrAodState(isKeyguardLocked = false, isDeviceLocked = false, isInteractive = false, displayState = Display.STATE_ON))
+        assertTrue(isDeviceLockedOrAodState(isKeyguardLocked = false, isDeviceLocked = false, isInteractive = true, displayState = Display.STATE_DOZE_SUSPEND))
+        assertFalse(isDeviceLockedOrAodState(isKeyguardLocked = false, isDeviceLocked = false, isInteractive = true, displayState = Display.STATE_ON))
     }
 }

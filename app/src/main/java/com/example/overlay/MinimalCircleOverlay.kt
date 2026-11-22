@@ -30,6 +30,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -42,7 +43,6 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.OpenInNew
 import androidx.compose.material.icons.rounded.Check
-import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.ContentCopy
 import androidx.compose.material.icons.rounded.ImageSearch
 import androidx.compose.material.icons.rounded.Language
@@ -56,8 +56,8 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -111,7 +111,6 @@ import com.example.engine.RecognizedTextLine
 import com.example.engine.ScreenOcrAnalysis
 import com.example.engine.TranslationState
 import com.example.ui.theme.CoralError
-import com.example.ui.theme.ElectricCyan
 import com.example.ui.theme.EmeraldActive
 import com.example.ui.theme.InterFamily
 import com.example.ui.theme.JetBrainsMonoFamily
@@ -126,6 +125,46 @@ private sealed interface SelectionGeometry {
     data class Freehand(val points: List<Offset>, val isClosed: Boolean) : SelectionGeometry
     data class BoxRect(val left: Float, val top: Float, val right: Float, val bottom: Float) : SelectionGeometry
     data class LensWords(val range: TextSelectionRange) : SelectionGeometry
+}
+
+fun buildSmoothedFreehandPath(points: List<Offset>, isClosed: Boolean): Path {
+    val path = Path()
+    if (points.isEmpty()) return path
+    if (points.size == 1) {
+        path.moveTo(points[0].x, points[0].y)
+        return path
+    }
+    if (points.size == 2) {
+        path.moveTo(points[0].x, points[0].y)
+        path.lineTo(points[1].x, points[1].y)
+        if (isClosed) path.close()
+        return path
+    }
+    if (isClosed) {
+        val last = points.last()
+        val first = points.first()
+        path.moveTo((last.x + first.x) / 2f, (last.y + first.y) / 2f)
+        for (i in points.indices) {
+            val curr = points[i]
+            val next = points[(i + 1) % points.size]
+            val midX = (curr.x + next.x) / 2f
+            val midY = (curr.y + next.y) / 2f
+            path.quadraticTo(curr.x, curr.y, midX, midY)
+        }
+        path.close()
+    } else {
+        path.moveTo(points[0].x, points[0].y)
+        for (i in 1 until points.lastIndex) {
+            val curr = points[i]
+            val next = points[i + 1]
+            val midX = (curr.x + next.x) / 2f
+            val midY = (curr.y + next.y) / 2f
+            path.quadraticTo(curr.x, curr.y, midX, midY)
+        }
+        val tail = points.last()
+        path.lineTo(tail.x, tail.y)
+    }
+    return path
 }
 
 @Composable
@@ -143,6 +182,7 @@ fun MinimalCircleOverlay(
     val density = LocalDensity.current
     val haptic = LocalHapticFeedback.current
     val scope = rememberCoroutineScope()
+    val accentColor = MaterialTheme.colorScheme.primary
 
     val screenImageBitmap = remember(screenshotBitmap) { screenshotBitmap.asImageBitmap() }
 
@@ -706,11 +746,11 @@ fun MinimalCircleOverlay(
                             )
                             drawPath(
                                 path = pillPath,
-                                color = ElectricCyan.copy(alpha = 0.28f)
+                                color = accentColor.copy(alpha = 0.28f)
                             )
                             drawPath(
                                 path = pillPath,
-                                color = ElectricCyan.copy(alpha = 0.90f),
+                                color = accentColor.copy(alpha = 0.90f),
                                 style = Stroke(width = 1.3.dp.toPx())
                             )
                         }
@@ -718,25 +758,20 @@ fun MinimalCircleOverlay(
 
                     is SelectionGeometry.Freehand -> {
                         if (activeSel.points.size >= 2) {
-                            val openPath = Path().apply {
-                                moveTo(activeSel.points.first().x, activeSel.points.first().y)
-                                for (i in 1 until activeSel.points.size) {
-                                    lineTo(activeSel.points[i].x, activeSel.points[i].y)
-                                }
-                            }
-                            val closedPath = Path().apply {
-                                addPath(openPath)
-                                close()
-                            }
+                            val clearPath = buildSmoothedFreehandPath(activeSel.points, isClosed = true)
                             drawPath(
-                                path = closedPath,
+                                path = clearPath,
                                 color = Color.Transparent,
                                 blendMode = BlendMode.Clear
                             )
-                            val activePath = if (activeSel.isClosed) closedPath else openPath
+                            val activePath = if (activeSel.isClosed) {
+                                clearPath
+                            } else {
+                                buildSmoothedFreehandPath(activeSel.points, isClosed = false)
+                            }
                             drawPath(
                                 path = activePath,
-                                color = ElectricCyan.copy(alpha = 0.45f),
+                                color = accentColor.copy(alpha = 0.45f),
                                 style = Stroke(
                                     width = strokeWidthPx * 2.4f,
                                     cap = StrokeCap.Round,
@@ -774,7 +809,7 @@ fun MinimalCircleOverlay(
                         )
                         drawPath(
                             path = boxPath,
-                            color = ElectricCyan.copy(alpha = 0.45f),
+                            color = accentColor.copy(alpha = 0.45f),
                             style = Stroke(width = strokeWidthPx * 2f)
                         )
                         drawPath(
@@ -908,11 +943,12 @@ fun MinimalCircleOverlay(
             modifier = Modifier
                 .align(Alignment.BottomEnd)
                 .navigationBarsPadding()
+                .imePadding()
                 .padding(end = 16.dp, bottom = 18.dp)
         ) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            Column(
+                horizontalAlignment = Alignment.End,
+                verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
                 if (selection != null) {
                     Surface(
@@ -926,9 +962,9 @@ fun MinimalCircleOverlay(
                             .testTag("overlay_reset_button")
                     ) {
                         Row(
-                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                            modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
                             verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(5.dp)
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
                         ) {
                             Icon(
                                 imageVector = Icons.Rounded.Refresh,
@@ -947,10 +983,10 @@ fun MinimalCircleOverlay(
                     }
                 }
 
-                // On-demand MoE Multi-Script button
+                // On-demand MoE Multi-Script pill
                 Surface(
                     color = when {
-                        isMoEApplied -> Color(0xD916303D)
+                        isMoEApplied -> accentColor.copy(alpha = 0.22f)
                         isRunningMoE -> Color(0xD91B2230)
                         else -> Color(0xD9121216)
                     },
@@ -958,8 +994,8 @@ fun MinimalCircleOverlay(
                     border = BorderStroke(
                         1.dp,
                         when {
-                            isMoEApplied -> ElectricCyan
-                            isRunningMoE -> ElectricCyan.copy(alpha = 0.7f)
+                            isMoEApplied -> accentColor
+                            isRunningMoE -> accentColor.copy(alpha = 0.7f)
                             else -> Color(0x44FFFFFF)
                         }
                     ),
@@ -970,13 +1006,13 @@ fun MinimalCircleOverlay(
                         .testTag("overlay_moe_button")
                 ) {
                     Row(
-                        modifier = Modifier.padding(horizontal = 13.dp, vertical = 10.dp),
+                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
                         verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(5.dp)
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
                         if (isRunningMoE) {
                             CircularProgressIndicator(
-                                color = ElectricCyan,
+                                color = accentColor,
                                 strokeWidth = 1.8.dp,
                                 modifier = Modifier.size(14.dp)
                             )
@@ -984,13 +1020,13 @@ fun MinimalCircleOverlay(
                             Icon(
                                 imageVector = if (isMoEApplied) Icons.Rounded.Check else Icons.Rounded.Language,
                                 contentDescription = "Run multi-script MoE OCR",
-                                tint = ElectricCyan,
+                                tint = accentColor,
                                 modifier = Modifier.size(16.dp)
                             )
                         }
                         Text(
                             text = if (isRunningMoE) "MoE…" else "MoE",
-                            color = if (isMoEApplied) ElectricCyan else Color.White,
+                            color = if (isMoEApplied) accentColor else Color.White,
                             fontFamily = SpaceGroteskFamily,
                             fontWeight = FontWeight.SemiBold,
                             fontSize = 12.5.sp,
@@ -999,7 +1035,7 @@ fun MinimalCircleOverlay(
                     }
                 }
 
-                // Translate button (automatically invokes MoE to cover all non-Latin scripts)
+                // Translate pill (automatically invokes MoE to cover all non-Latin scripts)
                 Surface(
                     color = Color(0xD9121216),
                     shape = RoundedCornerShape(999.dp),
@@ -1011,14 +1047,14 @@ fun MinimalCircleOverlay(
                         .testTag("overlay_inline_translate_button")
                 ) {
                     Row(
-                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+                        modifier = Modifier.padding(horizontal = 15.dp, vertical = 10.dp),
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
                         Icon(
                             imageVector = Icons.Rounded.Translate,
                             contentDescription = "Translate screen inline",
-                            tint = ElectricCyan,
+                            tint = accentColor,
                             modifier = Modifier.size(16.dp)
                         )
                         Text(
@@ -1030,29 +1066,10 @@ fun MinimalCircleOverlay(
                         )
                     }
                 }
-
-                Surface(
-                    color = Color(0xD9121216),
-                    shape = CircleShape,
-                    border = BorderStroke(1.dp, Color(0x33FFFFFF))
-                ) {
-                    IconButton(
-                        onClick = onDismiss,
-                        modifier = Modifier
-                            .size(48.dp)
-                            .testTag("overlay_close_button")
-                    ) {
-                        Icon(
-                            imageVector = Icons.Rounded.Close,
-                            contentDescription = "Close overlay",
-                            tint = Color.White
-                        )
-                    }
-                }
             }
         }
 
-        // 4a. Inline Screen Translation Controls Bar (lower-right thumb controls included)
+        // 4a. Inline Screen Translation Controls Bar (system back dismisses)
         AnimatedVisibility(
             visible = isInlineTranslateMode,
             enter = slideInVertically { it } + fadeIn(),
@@ -1072,7 +1089,6 @@ fun MinimalCircleOverlay(
                 copiedLabel = copiedLabel,
                 onToggleShowOriginal = { showOriginalScreen = !showOriginalScreen },
                 onExitInlineMode = { toggleInlineTranslateMode() },
-                onDismissOverlay = onDismiss,
                 onSelectTargetLanguage = { code ->
                     selectedTargetLang = code
                     onTargetLanguageChanged(code)
@@ -1137,7 +1153,6 @@ fun MinimalCircleOverlay(
                     },
                     onResetSelection = { resetSelection() },
                     onTriggerMoE = { triggerMoEScan() },
-                    onDismissOverlay = onDismiss,
                     selectedTargetLang = selectedTargetLang,
                     packStatuses = packStatuses,
                     hasGoogleTranslateApp = hasGoogleTranslateApp,
@@ -1204,7 +1219,6 @@ private fun CompactLookupSheet(
     onSelectAllWords: () -> Unit,
     onResetSelection: () -> Unit,
     onTriggerMoE: () -> Unit,
-    onDismissOverlay: () -> Unit,
     selectedTargetLang: String,
     packStatuses: Map<String, ModelPackStatus>,
     hasGoogleTranslateApp: Boolean,
@@ -1220,6 +1234,8 @@ private fun CompactLookupSheet(
 ) {
     val cropPreview = remember(croppedBitmap) { croppedBitmap.asImageBitmap() }
     val scrollState = rememberScrollState()
+    val accentColor = MaterialTheme.colorScheme.primary
+    val onAccentColor = MaterialTheme.colorScheme.onPrimary
 
     Surface(
         color = Color(0xFF101014),
@@ -1229,6 +1245,7 @@ private fun CompactLookupSheet(
             .fillMaxWidth()
             .heightIn(max = 460.dp)
             .navigationBarsPadding()
+            .imePadding()
             .testTag("compact_lookup_sheet")
     ) {
         Column(
@@ -1248,7 +1265,7 @@ private fun CompactLookupSheet(
                     .background(Color(0xFF3A3A46))
             )
 
-            // Bottom-right reachable utility controls (Reset / MoE / Translate / Close)
+            // Bottom-right reachable utility controls (Reset / MoE / Translate)
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.End,
@@ -1288,9 +1305,9 @@ private fun CompactLookupSheet(
                     }
 
                     Surface(
-                        color = if (isMoEApplied) Color(0xFF16303D) else Color(0xFF1E2029),
+                        color = if (isMoEApplied) accentColor.copy(alpha = 0.22f) else Color(0xFF1E2029),
                         shape = RoundedCornerShape(999.dp),
-                        border = if (isMoEApplied) BorderStroke(1.dp, ElectricCyan) else null,
+                        border = if (isMoEApplied) BorderStroke(1.dp, accentColor) else null,
                         modifier = Modifier
                             .heightIn(min = 48.dp)
                             .clip(RoundedCornerShape(999.dp))
@@ -1304,7 +1321,7 @@ private fun CompactLookupSheet(
                         ) {
                             if (isRunningMoE) {
                                 CircularProgressIndicator(
-                                    color = ElectricCyan,
+                                    color = accentColor,
                                     strokeWidth = 1.8.dp,
                                     modifier = Modifier.size(13.dp)
                                 )
@@ -1312,13 +1329,13 @@ private fun CompactLookupSheet(
                                 Icon(
                                     imageVector = if (isMoEApplied) Icons.Rounded.Check else Icons.Rounded.Language,
                                     contentDescription = "Run multi-script MoE OCR",
-                                    tint = ElectricCyan,
+                                    tint = accentColor,
                                     modifier = Modifier.size(15.dp)
                                 )
                             }
                             Text(
                                 text = if (isRunningMoE) "MoE…" else "MoE",
-                                color = if (isMoEApplied) ElectricCyan else Color.White,
+                                color = if (isMoEApplied) accentColor else Color.White,
                                 fontFamily = SpaceGroteskFamily,
                                 fontWeight = FontWeight.SemiBold,
                                 fontSize = 12.sp
@@ -1343,7 +1360,7 @@ private fun CompactLookupSheet(
                             Icon(
                                 imageVector = Icons.Rounded.Translate,
                                 contentDescription = "Translate screen inline",
-                                tint = ElectricCyan,
+                                tint = accentColor,
                                 modifier = Modifier.size(15.dp)
                             )
                             Text(
@@ -1354,21 +1371,6 @@ private fun CompactLookupSheet(
                                 fontSize = 12.sp
                             )
                         }
-                    }
-
-                    IconButton(
-                        onClick = onDismissOverlay,
-                        modifier = Modifier
-                            .size(48.dp)
-                            .clip(CircleShape)
-                            .background(Color(0xFF1E2029))
-                            .testTag("overlay_close_button")
-                    ) {
-                        Icon(
-                            imageVector = Icons.Rounded.Close,
-                            contentDescription = "Close overlay",
-                            tint = Color.White
-                        )
                     }
                 }
             }
@@ -1427,7 +1429,7 @@ private fun CompactLookupSheet(
                     ),
                     border = BorderStroke(
                         1.dp,
-                        if (editableText.isNotBlank()) ElectricCyan else Color(0xFF2B2B36)
+                        if (editableText.isNotBlank()) accentColor else Color(0xFF2B2B36)
                     ),
                     shape = RoundedCornerShape(12.dp),
                     contentPadding = PaddingValues(horizontal = 14.dp, vertical = 12.dp),
@@ -1439,7 +1441,7 @@ private fun CompactLookupSheet(
                     Icon(
                         imageVector = Icons.Rounded.Search,
                         contentDescription = null,
-                        tint = if (editableText.isNotBlank()) ElectricCyan else Color(0xFF5A5A66),
+                        tint = if (editableText.isNotBlank()) accentColor else Color(0xFF5A5A66),
                         modifier = Modifier.size(18.dp)
                     )
                     Spacer(Modifier.width(6.dp))
@@ -1484,7 +1486,7 @@ private fun CompactLookupSheet(
                                 if (res.lineCount > 0) {
                                     Text(
                                         text = "${res.lineCount}L",
-                                        color = ElectricCyan,
+                                        color = accentColor,
                                         fontFamily = JetBrainsMonoFamily,
                                         fontSize = 10.5.sp
                                     )
@@ -1509,7 +1511,7 @@ private fun CompactLookupSheet(
                                         Icon(
                                             imageVector = Icons.Rounded.SelectAll,
                                             contentDescription = "Select all text on screen",
-                                            tint = ElectricCyan,
+                                            tint = accentColor,
                                             modifier = Modifier.size(14.dp)
                                         )
                                         Text(
@@ -1588,7 +1590,7 @@ private fun CompactLookupSheet(
                                 fontSize = 14.sp,
                                 lineHeight = 20.sp
                             ),
-                            cursorBrush = SolidColor(ElectricCyan),
+                            cursorBrush = SolidColor(accentColor),
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .testTag("ocr_editable_field")
@@ -1621,7 +1623,7 @@ private fun CompactLookupSheet(
                                 Icon(
                                     imageVector = Icons.Rounded.Translate,
                                     contentDescription = null,
-                                    tint = ElectricCyan,
+                                    tint = accentColor,
                                     modifier = Modifier.size(15.dp)
                                 )
                                 Text(
@@ -1670,7 +1672,7 @@ private fun CompactLookupSheet(
                                         Icon(
                                             imageVector = Icons.AutoMirrored.Rounded.OpenInNew,
                                             contentDescription = "Open $translateLabel",
-                                            tint = ElectricCyan,
+                                            tint = accentColor,
                                             modifier = Modifier.size(12.dp)
                                         )
                                     }
@@ -1703,7 +1705,7 @@ private fun CompactLookupSheet(
                                         when (st) {
                                             ModelPackStatus.DOWNLOADING -> {
                                                 CircularProgressIndicator(
-                                                    color = if (selected) Color(0xFF0B0B0E) else ElectricCyan,
+                                                    color = if (selected) Color(0xFF0B0B0E) else accentColor,
                                                     strokeWidth = 1.6.dp,
                                                     modifier = Modifier.size(9.dp)
                                                 )
@@ -1748,13 +1750,13 @@ private fun CompactLookupSheet(
                                         fontSize = 12.5.sp
                                     )
                                     LinearProgressIndicator(
-                                        color = ElectricCyan,
+                                        color = accentColor,
                                         trackColor = Color(0xFF2B2B36),
                                         modifier = Modifier.fillMaxWidth()
                                     )
                                     OutlinedButton(
                                         onClick = { onWebTranslate(editableText) },
-                                        border = BorderStroke(1.dp, ElectricCyan.copy(alpha = 0.7f)),
+                                        border = BorderStroke(1.dp, accentColor.copy(alpha = 0.7f)),
                                         colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.White),
                                         shape = RoundedCornerShape(10.dp),
                                         contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
@@ -1766,7 +1768,7 @@ private fun CompactLookupSheet(
                                         Icon(
                                             imageVector = Icons.AutoMirrored.Rounded.OpenInNew,
                                             contentDescription = null,
-                                            tint = ElectricCyan,
+                                            tint = accentColor,
                                             modifier = Modifier.size(16.dp)
                                         )
                                         Spacer(Modifier.width(6.dp))
@@ -1850,7 +1852,7 @@ private fun CompactLookupSheet(
                                                 Icon(
                                                     imageVector = Icons.Rounded.Search,
                                                     contentDescription = "Search translated text",
-                                                    tint = ElectricCyan,
+                                                    tint = accentColor,
                                                     modifier = Modifier.size(13.dp)
                                                 )
                                                 Text(
@@ -1877,7 +1879,7 @@ private fun CompactLookupSheet(
                                                 Icon(
                                                     imageVector = Icons.Rounded.Translate,
                                                     contentDescription = "Replace inline on screen",
-                                                    tint = ElectricCyan,
+                                                    tint = accentColor,
                                                     modifier = Modifier.size(13.dp)
                                                 )
                                                 Text(
@@ -1925,8 +1927,8 @@ private fun CompactLookupSheet(
                                             Button(
                                                 onClick = { onWebTranslate(editableText) },
                                                 colors = ButtonDefaults.buttonColors(
-                                                    containerColor = ElectricCyan,
-                                                    contentColor = Color.Black
+                                                    containerColor = accentColor,
+                                                    contentColor = onAccentColor
                                                 ),
                                                 shape = RoundedCornerShape(10.dp),
                                                 contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
@@ -1978,7 +1980,6 @@ private fun InlineTranslateBottomBar(
     copiedLabel: String?,
     onToggleShowOriginal: () -> Unit,
     onExitInlineMode: () -> Unit,
-    onDismissOverlay: () -> Unit,
     onSelectTargetLanguage: (String) -> Unit,
     onRetryInline: () -> Unit,
     onCopy: (label: String, value: String) -> Unit,
@@ -1989,6 +1990,8 @@ private fun InlineTranslateBottomBar(
     val translatedCount = inlineTranslationState.blockStates.values.count {
         it is InlineBlockStatus.Translated
     }
+    val accentColor = MaterialTheme.colorScheme.primary
+    val onAccentColor = MaterialTheme.colorScheme.onPrimary
 
     Surface(
         color = Color(0xF2101014),
@@ -1997,6 +2000,7 @@ private fun InlineTranslateBottomBar(
         modifier = Modifier
             .fillMaxWidth()
             .navigationBarsPadding()
+            .imePadding()
             .testTag("inline_translate_bar")
     ) {
         Column(
@@ -2017,7 +2021,7 @@ private fun InlineTranslateBottomBar(
                 ) {
                     if (isRunningMoE || inlineTranslationState.isTranslating) {
                         CircularProgressIndicator(
-                            color = ElectricCyan,
+                            color = accentColor,
                             strokeWidth = 2.dp,
                             modifier = Modifier.size(16.dp)
                         )
@@ -2025,7 +2029,7 @@ private fun InlineTranslateBottomBar(
                         Icon(
                             imageVector = Icons.Rounded.Translate,
                             contentDescription = null,
-                            tint = ElectricCyan,
+                            tint = accentColor,
                             modifier = Modifier.size(17.dp)
                         )
                     }
@@ -2058,7 +2062,7 @@ private fun InlineTranslateBottomBar(
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Surface(
-                        color = if (showOriginal) ElectricCyan else Color(0xFF252530),
+                        color = if (showOriginal) accentColor else Color(0xFF252530),
                         shape = RoundedCornerShape(999.dp),
                         modifier = Modifier
                             .heightIn(min = 48.dp)
@@ -2074,12 +2078,12 @@ private fun InlineTranslateBottomBar(
                             Icon(
                                 imageVector = if (showOriginal) Icons.Rounded.VisibilityOff else Icons.Rounded.Visibility,
                                 contentDescription = "Toggle original screen text",
-                                tint = if (showOriginal) Color.Black else Color.White,
+                                tint = if (showOriginal) onAccentColor else Color.White,
                                 modifier = Modifier.size(15.dp)
                             )
                             Text(
                                 text = if (showOriginal) "Translated" else "Original",
-                                color = if (showOriginal) Color.Black else Color.White,
+                                color = if (showOriginal) onAccentColor else Color.White,
                                 fontFamily = SpaceGroteskFamily,
                                 fontWeight = FontWeight.Medium,
                                 fontSize = 12.sp
@@ -2088,7 +2092,7 @@ private fun InlineTranslateBottomBar(
                     }
 
                     Surface(
-                        color = ElectricCyan,
+                        color = accentColor,
                         shape = RoundedCornerShape(999.dp),
                         modifier = Modifier
                             .heightIn(min = 48.dp)
@@ -2104,39 +2108,24 @@ private fun InlineTranslateBottomBar(
                             Icon(
                                 imageVector = Icons.Rounded.Translate,
                                 contentDescription = "Return to selection mode",
-                                tint = Color.Black,
+                                tint = onAccentColor,
                                 modifier = Modifier.size(15.dp)
                             )
                             Text(
                                 text = "Select",
-                                color = Color.Black,
+                                color = onAccentColor,
                                 fontFamily = SpaceGroteskFamily,
                                 fontWeight = FontWeight.SemiBold,
                                 fontSize = 12.sp
                             )
                         }
                     }
-
-                    IconButton(
-                        onClick = onDismissOverlay,
-                        modifier = Modifier
-                            .size(48.dp)
-                            .clip(CircleShape)
-                            .background(Color(0xFF252530))
-                            .testTag("overlay_close_button")
-                    ) {
-                        Icon(
-                            imageVector = Icons.Rounded.Close,
-                            contentDescription = "Close overlay",
-                            tint = Color.White
-                        )
-                    }
                 }
             }
 
             if (inlineTranslationState.isDownloadingPacks) {
                 LinearProgressIndicator(
-                    color = ElectricCyan,
+                    color = accentColor,
                     trackColor = Color(0xFF2B2B36),
                     modifier = Modifier.fillMaxWidth()
                 )
@@ -2149,7 +2138,7 @@ private fun InlineTranslateBottomBar(
                                 focusedBlock?.detectedLanguageCode ?: dominantLangHint
                             )
                         },
-                        border = BorderStroke(1.dp, ElectricCyan.copy(alpha = 0.7f)),
+                        border = BorderStroke(1.dp, accentColor.copy(alpha = 0.7f)),
                         colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.White),
                         shape = RoundedCornerShape(10.dp),
                         modifier = Modifier
@@ -2160,7 +2149,7 @@ private fun InlineTranslateBottomBar(
                         Icon(
                             imageVector = Icons.AutoMirrored.Rounded.OpenInNew,
                             contentDescription = null,
-                            tint = ElectricCyan,
+                            tint = accentColor,
                             modifier = Modifier.size(16.dp)
                         )
                         Spacer(Modifier.width(6.dp))
@@ -2206,8 +2195,8 @@ private fun InlineTranslateBottomBar(
                         },
                         enabled = (focusedBlock?.text?.isNotBlank() == true) || fallbackScreenText.isNotBlank(),
                         colors = ButtonDefaults.buttonColors(
-                            containerColor = ElectricCyan,
-                            contentColor = Color.Black
+                            containerColor = accentColor,
+                            contentColor = onAccentColor
                         ),
                         shape = RoundedCornerShape(10.dp),
                         modifier = Modifier
@@ -2272,7 +2261,7 @@ private fun InlineTranslateBottomBar(
                             ) {
                                 Text(
                                     text = "Search",
-                                    color = ElectricCyan,
+                                    color = accentColor,
                                     fontFamily = SpaceGroteskFamily,
                                     fontSize = 12.sp,
                                     modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
@@ -2323,7 +2312,7 @@ private fun InlineTranslateBottomBar(
                             when (st) {
                                 ModelPackStatus.DOWNLOADING -> {
                                     CircularProgressIndicator(
-                                        color = if (selected) Color(0xFF0B0B0E) else ElectricCyan,
+                                        color = if (selected) Color(0xFF0B0B0E) else accentColor,
                                         strokeWidth = 1.6.dp,
                                         modifier = Modifier.size(9.dp)
                                     )

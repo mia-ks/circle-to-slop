@@ -2,17 +2,22 @@ package com.example.service
 
 import android.accessibilityservice.AccessibilityService
 import android.annotation.SuppressLint
+import android.app.KeyguardManager
+import android.content.BroadcastReceiver
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.Rect
 import android.graphics.drawable.GradientDrawable
+import android.hardware.display.DisplayManager
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.PowerManager
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
@@ -25,8 +30,11 @@ import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
+import android.view.accessibility.AccessibilityWindowInfo
 import android.widget.FrameLayout
 import android.widget.Toast
+import android.window.OnBackInvokedCallback
+import android.window.OnBackInvokedDispatcher
 import androidx.compose.ui.platform.ComposeView
 import com.example.data.EdgeAnchor
 import com.example.data.GestureConfigRepository
@@ -46,6 +54,34 @@ import kotlinx.coroutines.launch
 import kotlin.math.hypot
 import kotlin.math.roundToInt
 
+internal fun doesTriggerOverlapIme(
+    triggerRect: Rect,
+    imeWindows: List<Rect>,
+    safetyMarginPx: Int
+): Boolean {
+    if (triggerRect.width() <= 0 || triggerRect.height() <= 0) return false
+    val expanded = Rect(
+        triggerRect.left - safetyMarginPx,
+        triggerRect.top - safetyMarginPx,
+        triggerRect.right + safetyMarginPx,
+        triggerRect.bottom + safetyMarginPx
+    )
+    return imeWindows.any { imeRect ->
+        imeRect.width() > 0 && imeRect.height() > 0 && Rect.intersects(expanded, imeRect)
+    }
+}
+
+internal fun isDeviceLockedOrAodState(
+    isKeyguardLocked: Boolean,
+    isDeviceLocked: Boolean,
+    isInteractive: Boolean,
+    displayState: Int?
+): Boolean {
+    if (isKeyguardLocked || isDeviceLocked || !isInteractive) return true
+    if (displayState != null && displayState != Display.STATE_ON) return true
+    return false
+}
+
 class QuickCircleAccessibilityService : AccessibilityService() {
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
@@ -59,7 +95,24 @@ class QuickCircleAccessibilityService : AccessibilityService() {
 
     private var overlayContainer: FrameLayout? = null
     private var overlayLifecycleOwner: OverlayLifecycleOwner? = null
+    private var overlayBackCallback: Any? = null
     private var isCapturing = false
+    private var isScreenReceiverRegistered = false
+
+    private val screenStateReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            when (intent?.action) {
+                Intent.ACTION_SCREEN_OFF -> {
+                    dismissOverlay()
+                    updateTriggerWindowVisibility()
+                }
+                Intent.ACTION_SCREEN_ON, Intent.ACTION_USER_PRESENT -> {
+                    updateTriggerWindowVisibility()
+                    mainHandler.postDelayed({ updateTriggerWindowVisibility() }, 250L)
+                }
+            }
+        }
+    }
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -68,6 +121,8 @@ class QuickCircleAccessibilityService : AccessibilityService() {
 
         windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         repository = GestureConfigRepository(applicationContext)
+
+        registerScreenStateReceiver()
 
         // Prewarm only lightweight Latin OCR + pack status on connect
         serviceScope.launch(Dispatchers.Default) {
@@ -87,7 +142,12 @@ class QuickCircleAccessibilityService : AccessibilityService() {
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        // Not needed; this service solely provides the instant gesture trigger and screenshot overlay
+        val type = event?.eventType ?: return
+        if (type == AccessibilityEvent.TYPE_WINDOWS_CHANGED ||
+            type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
+        ) {
+            updateTriggerWindowVisibility()
+        }
     }
 
     override fun onInterrupt() {
@@ -104,9 +164,36 @@ class QuickCircleAccessibilityService : AccessibilityService() {
         super.onDestroy()
     }
 
+    private fun registerScreenStateReceiver() {
+        if (isScreenReceiverRegistered) return
+        val filter = IntentFilter().apply {
+            addAction(Intent.ACTION_SCREEN_OFF)
+            addAction(Intent.ACTION_SCREEN_ON)
+            addAction(Intent.ACTION_USER_PRESENT)
+        }
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                registerReceiver(screenStateReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+            } else {
+                @Suppress("UnspecifiedRegisterReceiverFlag")
+                registerReceiver(screenStateReceiver, filter)
+            }
+            isScreenReceiverRegistered = true
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed registering screen state receiver", e)
+        }
+    }
+
     private fun cleanupAll() {
         activeInstance = null
         _isServiceConnected.value = false
+        if (isScreenReceiverRegistered) {
+            try {
+                unregisterReceiver(screenStateReceiver)
+            } catch (_: Exception) {
+            }
+            isScreenReceiverRegistered = false
+        }
         dismissOverlay()
         removeTriggerView()
         serviceScope.cancel()
@@ -156,6 +243,7 @@ class QuickCircleAccessibilityService : AccessibilityService() {
                 Log.e(TAG, "Failed updating trigger window layout", e)
             }
         }
+        updateTriggerWindowVisibility()
     }
 
     private fun applySystemGestureExclusion(
@@ -397,7 +485,61 @@ class QuickCircleAccessibilityService : AccessibilityService() {
         triggerView = null
     }
 
+    private fun isDeviceLockedOrAod(): Boolean {
+        val keyguardManager = getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager
+        val powerManager = getSystemService(Context.POWER_SERVICE) as? PowerManager
+        val displayManager = getSystemService(Context.DISPLAY_SERVICE) as? DisplayManager
+        val defaultDisplay = displayManager?.getDisplay(Display.DEFAULT_DISPLAY)
+        return isDeviceLockedOrAodState(
+            isKeyguardLocked = keyguardManager?.isKeyguardLocked == true,
+            isDeviceLocked = keyguardManager?.isDeviceLocked == true,
+            isInteractive = powerManager?.isInteractive ?: true,
+            displayState = defaultDisplay?.state
+        )
+    }
+
+    private fun isImeOverlappingTrigger(): Boolean {
+        val params = triggerLayoutParams ?: return false
+        val triggerRect = Rect(
+            params.x,
+            params.y,
+            params.x + params.width,
+            params.y + params.height
+        )
+        val imeWindows = try {
+            windows.orEmpty().mapNotNull { win ->
+                if (win.type == AccessibilityWindowInfo.TYPE_INPUT_METHOD) {
+                    Rect().also { win.getBoundsInScreen(it) }
+                } else {
+                    null
+                }
+            }
+        } catch (_: Exception) {
+            emptyList()
+        }
+        if (imeWindows.isEmpty()) return false
+        val safetyMarginPx = (8f * resources.displayMetrics.density).roundToInt()
+        return doesTriggerOverlapIme(triggerRect, imeWindows, safetyMarginPx)
+    }
+
+    private fun updateTriggerWindowVisibility() {
+        val view = triggerView ?: return
+        val shouldHide = !currentConfig.triggerEnabled ||
+            isCapturing ||
+            overlayContainer != null ||
+            isDeviceLockedOrAod() ||
+            isImeOverlappingTrigger()
+        val targetVisibility = if (shouldHide) View.GONE else View.VISIBLE
+        if (view.visibility != targetVisibility) {
+            view.visibility = targetVisibility
+        }
+    }
+
     private fun onTriggerActivated() {
+        if (isDeviceLockedOrAod()) {
+            updateTriggerWindowVisibility()
+            return
+        }
         OcrAndLensEngine.prewarmMoEOnInvoke(applicationContext)
         if (currentConfig.hapticFeedback) {
             performShortHaptic()
@@ -427,6 +569,10 @@ class QuickCircleAccessibilityService : AccessibilityService() {
 
     fun captureAndShowOverlay() {
         if (isCapturing || overlayContainer != null) return
+        if (isDeviceLockedOrAod()) {
+            updateTriggerWindowVisibility()
+            return
+        }
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
             Toast.makeText(
                 this,
@@ -437,10 +583,15 @@ class QuickCircleAccessibilityService : AccessibilityService() {
         }
 
         isCapturing = true
-        triggerView?.visibility = View.INVISIBLE
+        updateTriggerWindowVisibility()
 
         // Small frame delay ensures the trigger handle is invisible before screen capture
         mainHandler.postDelayed({
+            if (isDeviceLockedOrAod()) {
+                isCapturing = false
+                updateTriggerWindowVisibility()
+                return@postDelayed
+            }
             takeScreenshot(
                 Display.DEFAULT_DISPLAY,
                 mainExecutor,
@@ -460,9 +611,10 @@ class QuickCircleAccessibilityService : AccessibilityService() {
                             buffer.close()
                         }
 
-                        if (softwareBitmap != null) {
+                        if (softwareBitmap != null && !isDeviceLockedOrAod()) {
                             showOverlay(softwareBitmap)
                         } else {
+                            softwareBitmap?.recycle()
                             restoreTriggerVisibility()
                         }
                     }
@@ -478,9 +630,7 @@ class QuickCircleAccessibilityService : AccessibilityService() {
     }
 
     private fun restoreTriggerVisibility() {
-        if (currentConfig.triggerEnabled) {
-            triggerView?.visibility = View.VISIBLE
-        }
+        updateTriggerWindowVisibility()
     }
 
     private fun showOverlay(screenshotBitmap: Bitmap) {
@@ -497,6 +647,23 @@ class QuickCircleAccessibilityService : AccessibilityService() {
                 }
                 return super.dispatchKeyEvent(event)
             }
+        }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            val callback = OnBackInvokedCallback { dismissOverlay() }
+            overlayBackCallback = callback
+            container.addOnAttachStateChangeListener(object : View.OnAttachStateChangeListener {
+                override fun onViewAttachedToWindow(v: View) {
+                    v.findOnBackInvokedDispatcher()?.registerOnBackInvokedCallback(
+                        OnBackInvokedDispatcher.PRIORITY_OVERLAY,
+                        callback
+                    )
+                }
+
+                override fun onViewDetachedFromWindow(v: View) {
+                    v.findOnBackInvokedDispatcher()?.unregisterOnBackInvokedCallback(callback)
+                }
+            })
         }
 
         val composeView = ComposeView(this).apply {
@@ -532,10 +699,10 @@ class QuickCircleAccessibilityService : AccessibilityService() {
             WindowManager.LayoutParams.MATCH_PARENT,
             WindowManager.LayoutParams.MATCH_PARENT,
             WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
-            WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
             PixelFormat.TRANSLUCENT
         ).apply {
+            softInputMode = WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
                 layoutInDisplayCutoutMode =
                     WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
@@ -545,6 +712,7 @@ class QuickCircleAccessibilityService : AccessibilityService() {
         overlayContainer = container
         try {
             windowManager.addView(container, overlayParams)
+            updateTriggerWindowVisibility()
         } catch (e: Exception) {
             Log.e(TAG, "Failed adding overlay window", e)
             dismissOverlay()
@@ -553,6 +721,15 @@ class QuickCircleAccessibilityService : AccessibilityService() {
 
     fun dismissOverlay() {
         overlayContainer?.let { container ->
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                val callback = overlayBackCallback as? OnBackInvokedCallback
+                if (callback != null) {
+                    try {
+                        container.findOnBackInvokedDispatcher()?.unregisterOnBackInvokedCallback(callback)
+                    } catch (_: Exception) {
+                    }
+                }
+            }
             if (container.parent != null) {
                 try {
                     windowManager.removeViewImmediate(container)
@@ -561,6 +738,7 @@ class QuickCircleAccessibilityService : AccessibilityService() {
                 }
             }
         }
+        overlayBackCallback = null
         overlayContainer = null
         overlayLifecycleOwner?.detach()
         overlayLifecycleOwner = null
@@ -578,6 +756,7 @@ class QuickCircleAccessibilityService : AccessibilityService() {
 
         fun triggerFromTile(): Boolean {
             val instance = activeInstance ?: return false
+            if (instance.isDeviceLockedOrAod()) return false
             OcrAndLensEngine.prewarmMoEOnInvoke(instance.applicationContext)
             instance.mainHandler.postDelayed({
                 instance.captureAndShowOverlay()

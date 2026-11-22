@@ -24,8 +24,11 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -95,6 +98,7 @@ private val MultiScriptSamples = listOf(
 fun MultiScriptTestBoard(
     modifier: Modifier = Modifier
 ) {
+    val density = LocalDensity.current.density
     Column(
         modifier = modifier
             .fillMaxSize()
@@ -215,6 +219,79 @@ fun MultiScriptTestBoard(
                         color = bodyCol
                     )
                 }
+            }
+        }
+
+        // Challenging OCR Case 1: Low-contrast muted slate ticket
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(14.dp))
+                .background(
+                    Brush.linearGradient(
+                        colors = listOf(Color(0xFF343B47), Color(0xFF475060))
+                    )
+                )
+                .padding(horizontal = 14.dp, vertical = 12.dp)
+        ) {
+            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Text(
+                    text = "LOW CONTRAST · DE",
+                    fontFamily = JetBrainsMonoFamily,
+                    fontSize = 10.sp,
+                    color = Color(0xFF6B7789)
+                )
+                Text(
+                    text = "Gleis 9B · Regional-Express RE 104",
+                    fontFamily = FontFamily.SansSerif,
+                    fontWeight = FontWeight.SemiBold,
+                    fontSize = 15.sp,
+                    color = Color(0xFF6E7A8D)
+                )
+                Text(
+                    text = "Verspätung ca. 15 Min wegen Bauarbeiten",
+                    fontFamily = FontFamily.SansSerif,
+                    fontSize = 12.5.sp,
+                    color = Color(0xFF636F81)
+                )
+            }
+        }
+
+        // Challenging OCR Case 2: 3D perspective-tilted bilingual transit sign
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(vertical = 8.dp, horizontal = 6.dp)
+                .graphicsLayer {
+                    rotationX = 22f
+                    rotationY = -14f
+                    rotationZ = -4f
+                    cameraDistance = 12f * density
+                }
+                .clip(RoundedCornerShape(14.dp))
+                .background(Color(0xFF1B2436))
+                .padding(horizontal = 16.dp, vertical = 13.dp)
+        ) {
+            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Text(
+                    text = "3D PERSPECTIVE · EN / JA",
+                    fontFamily = JetBrainsMonoFamily,
+                    fontSize = 10.sp,
+                    color = ElectricCyan
+                )
+                Text(
+                    text = "Terminal 3 → Departure Gate B2",
+                    fontFamily = SpaceGroteskFamily,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 15.5.sp,
+                    color = Color.White
+                )
+                Text(
+                    text = "第3ターミナル · 国際線 乗り継ぎ案内",
+                    fontFamily = FontFamily.SansSerif,
+                    fontSize = 13.sp,
+                    color = Color(0xFFBAE6FD)
+                )
             }
         }
     }

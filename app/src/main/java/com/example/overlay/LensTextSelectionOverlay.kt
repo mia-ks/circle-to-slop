@@ -414,8 +414,9 @@ fun InlineTranslatedBlocksLayer(
                 val boxH = (rawB - top).coerceIn(18f, canvasH - top)
 
                 val isSelected = selectedBlockId == block.id
-                val bgColor = Color(block.backgroundColorArgb)
+                val bgColor = Color(block.backgroundColorArgb).copy(alpha = 1f)
                 val fgColor = Color(block.foregroundColorArgb)
+                val accentColor = androidx.compose.material3.MaterialTheme.colorScheme.primary
 
                 when (status) {
                     is InlineBlockStatus.Translated -> {
@@ -455,14 +456,20 @@ fun InlineTranslatedBlocksLayer(
                                     height = with(density) { boxH.toDp() }
                                 )
                                 .clip(RoundedCornerShape(6.dp))
-                                .background(bgColor.copy(alpha = 0.98f))
-                                .border(
-                                    width = if (isSelected) 1.5.dp else 0.6.dp,
-                                    color = if (isSelected) ElectricCyan else fgColor.copy(alpha = 0.16f),
-                                    shape = RoundedCornerShape(6.dp)
+                                .background(bgColor)
+                                .then(
+                                    if (isSelected) {
+                                        Modifier.border(
+                                            width = 1.5.dp,
+                                            color = accentColor,
+                                            shape = RoundedCornerShape(6.dp)
+                                        )
+                                    } else {
+                                        Modifier
+                                    }
                                 )
                                 .clickable { onBlockTapped(block, status) }
-                                .padding(horizontal = 3.dp, vertical = 1.dp)
+                                .padding(horizontal = 4.dp, vertical = 2.dp)
                                 .testTag("inline_translated_block_${block.id}"),
                             contentAlignment = Alignment.CenterStart
                         ) {
@@ -487,10 +494,10 @@ fun InlineTranslatedBlocksLayer(
                                     height = with(density) { boxH.toDp() }
                                 )
                                 .clip(RoundedCornerShape(6.dp))
-                                .background(ElectricCyan.copy(alpha = 0.20f))
+                                .background(accentColor.copy(alpha = 0.20f))
                                 .border(
                                     width = 1.dp,
-                                    color = ElectricCyan.copy(alpha = 0.55f),
+                                    color = accentColor.copy(alpha = 0.55f),
                                     shape = RoundedCornerShape(6.dp)
                                 )
                         )

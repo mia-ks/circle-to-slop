@@ -46,27 +46,31 @@ class OverlayUxTest {
             }
         }
 
-        // Top-left status/instruction pill must not exist
+        // Top-left status/instruction pill and X close button must not exist (system back dismisses)
         composeRule.onNodeWithTag("overlay_status_pill").assertDoesNotExist()
+        composeRule.onNodeWithTag("overlay_close_button").assertDoesNotExist()
 
-        // Bottom-right controls must be displayed in the lower-right quadrant
+        // Bottom-right controls must be displayed in the lower-right quadrant, stacked vertically
         val rootBounds = composeRule.onRoot().getBoundsInRoot()
         val moeBounds = composeRule.onNodeWithTag("overlay_moe_button").assertIsDisplayed().getBoundsInRoot()
         val translateBounds = composeRule.onNodeWithTag("overlay_inline_translate_button").assertIsDisplayed().getBoundsInRoot()
-        val closeBounds = composeRule.onNodeWithTag("overlay_close_button").assertIsDisplayed().getBoundsInRoot()
 
         val midY = (rootBounds.top + rootBounds.bottom) / 2f
         val midX = (rootBounds.left + rootBounds.right) / 2f
 
         assertTrue("MoE button should be in lower half", moeBounds.top >= midY)
         assertTrue("Translate button should be in lower half", translateBounds.top >= midY)
-        assertTrue("Close button should be in lower half", closeBounds.top >= midY)
-        assertTrue("Close button should be on right side", closeBounds.right >= midX)
+        assertTrue("MoE button should be on right side", moeBounds.right >= midX)
+        assertTrue("Translate button should be on right side", translateBounds.right >= midX)
+        assertTrue(
+            "Translate pill should be stacked vertically below MoE pill",
+            translateBounds.top >= moeBounds.bottom
+        )
 
-        // Tapping Translate enters inline translation bar while keeping bottom-right dismiss available
+        // Tapping Translate enters inline translation bar while keeping close button removed
         composeRule.onNodeWithTag("overlay_inline_translate_button").performClick()
         composeRule.onNodeWithTag("inline_translate_bar").assertIsDisplayed()
-        composeRule.onNodeWithTag("overlay_close_button").assertIsDisplayed()
+        composeRule.onNodeWithTag("overlay_close_button").assertDoesNotExist()
         composeRule.onNodeWithTag("overlay_status_pill").assertDoesNotExist()
     }
 }

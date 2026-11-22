@@ -56,6 +56,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -81,13 +82,93 @@ import com.example.data.GestureZoneConfig
 import com.example.data.TriggerMode
 import com.example.overlay.MinimalCircleOverlay
 import com.example.ui.theme.AmberWarn
-import com.example.ui.theme.ElectricCyan
 import com.example.ui.theme.EmeraldActive
 import com.example.ui.theme.InterFamily
 import com.example.ui.theme.JetBrainsMonoFamily
 import com.example.ui.theme.SpaceGroteskFamily
 import kotlin.math.hypot
 import kotlin.math.roundToInt
+
+data class PinnedResizeResult(
+    val offsetXFraction: Float?,
+    val offsetYFraction: Float?,
+    val widthDp: Float,
+    val heightDp: Float
+)
+
+fun computeEdgePinnedResize(
+    anchor: EdgeAnchor,
+    pinnedLeftPx: Float,
+    pinnedTopPx: Float,
+    pinnedRightPx: Float,
+    pinnedBottomPx: Float,
+    startWidthDp: Float,
+    startHeightDp: Float,
+    totalDragPxX: Float,
+    totalDragPxY: Float,
+    frameW: Float,
+    frameH: Float,
+    scaleX: Float,
+    scaleY: Float
+): PinnedResizeResult {
+    val safeScaleX = scaleX.coerceAtLeast(0.01f)
+    val safeScaleY = scaleY.coerceAtLeast(0.01f)
+    val maxWidthDp = (frameW * 0.90f / safeScaleX).coerceIn(18f, 320f)
+    val maxHeightDp = (frameH * 0.85f / safeScaleY).coerceIn(18f, 320f)
+
+    return when (anchor) {
+        EdgeAnchor.LEFT_EDGE -> {
+            // Grip is bottom-right: keep left edge & top edge pinned
+            val maxAllowedH = ((frameH - pinnedTopPx) / safeScaleY).coerceIn(18f, maxHeightDp)
+            val newW = (startWidthDp + totalDragPxX / safeScaleX).coerceIn(18f, maxWidthDp)
+            val newH = (startHeightDp + totalDragPxY / safeScaleY).coerceIn(18f, maxAllowedH)
+            val newZoneH = newH * safeScaleY
+            val denomY = (frameH - newZoneH).coerceAtLeast(1f)
+            val nextOffY = (pinnedTopPx / denomY).coerceIn(0f, 1f)
+            PinnedResizeResult(null, nextOffY, newW, newH)
+        }
+
+        EdgeAnchor.RIGHT_EDGE -> {
+            // Grip is bottom-left: keep right edge & top edge pinned
+            val maxAllowedW = (pinnedRightPx / safeScaleX).coerceIn(18f, maxWidthDp)
+            val maxAllowedH = ((frameH - pinnedTopPx) / safeScaleY).coerceIn(18f, maxHeightDp)
+            val newW = (startWidthDp - totalDragPxX / safeScaleX).coerceIn(18f, maxAllowedW)
+            val newH = (startHeightDp + totalDragPxY / safeScaleY).coerceIn(18f, maxAllowedH)
+            val newZoneH = newH * safeScaleY
+            val denomY = (frameH - newZoneH).coerceAtLeast(1f)
+            val nextOffY = (pinnedTopPx / denomY).coerceIn(0f, 1f)
+            PinnedResizeResult(null, nextOffY, newW, newH)
+        }
+
+        EdgeAnchor.BOTTOM_BAR -> {
+            // Grip is top-right: keep left edge & bottom edge pinned
+            val maxAllowedW = ((frameW - pinnedLeftPx) / safeScaleX).coerceIn(18f, maxWidthDp)
+            val maxAllowedH = (pinnedBottomPx / safeScaleY).coerceIn(18f, maxHeightDp)
+            val newW = (startWidthDp + totalDragPxX / safeScaleX).coerceIn(18f, maxAllowedW)
+            val newH = (startHeightDp - totalDragPxY / safeScaleY).coerceIn(18f, maxAllowedH)
+            val newZoneW = newW * safeScaleX
+            val denomX = (frameW - newZoneW).coerceAtLeast(1f)
+            // BOTTOM_BAR uses offsetYFraction as its horizontal position fraction
+            val nextOffX = (pinnedLeftPx / denomX).coerceIn(0f, 1f)
+            PinnedResizeResult(nextOffX, nextOffX, newW, newH)
+        }
+
+        EdgeAnchor.FREE -> {
+            // Grip is bottom-right: keep left edge & top edge pinned
+            val maxAllowedW = ((frameW - pinnedLeftPx) / safeScaleX).coerceIn(18f, maxWidthDp)
+            val maxAllowedH = ((frameH - pinnedTopPx) / safeScaleY).coerceIn(18f, maxHeightDp)
+            val newW = (startWidthDp + totalDragPxX / safeScaleX).coerceIn(18f, maxAllowedW)
+            val newH = (startHeightDp + totalDragPxY / safeScaleY).coerceIn(18f, maxAllowedH)
+            val newZoneW = newW * safeScaleX
+            val newZoneH = newH * safeScaleY
+            val denomX = (frameW - newZoneW).coerceAtLeast(1f)
+            val denomY = (frameH - newZoneH).coerceAtLeast(1f)
+            val nextOffX = (pinnedLeftPx / denomX).coerceIn(0f, 1f)
+            val nextOffY = (pinnedTopPx / denomY).coerceIn(0f, 1f)
+            PinnedResizeResult(nextOffX, nextOffY, newW, newH)
+        }
+    }
+}
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -194,7 +275,7 @@ fun ZoneEditorScreen(
                                 text = "${config.anchor.label} · ${config.widthDp.roundToInt()}×${config.heightDp.roundToInt()} dp",
                                 fontFamily = JetBrainsMonoFamily,
                                 fontSize = 11.5.sp,
-                                color = ElectricCyan,
+                                color = MaterialTheme.colorScheme.primary,
                                 modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
                             )
                         }
@@ -261,7 +342,7 @@ fun ZoneEditorScreen(
                                 modifier = Modifier
                                     .size(8.dp)
                                     .clip(CircleShape)
-                                    .background(ElectricCyan)
+                                    .background(MaterialTheme.colorScheme.primary)
                             )
                             Text(
                                 text = "Trigger zone",
@@ -533,8 +614,8 @@ fun ZoneEditorScreen(
                                     checked = config.excludeSystemBack,
                                     onCheckedChange = onSetExcludeSystemBack,
                                     colors = SwitchDefaults.colors(
-                                        checkedThumbColor = Color.Black,
-                                        checkedTrackColor = ElectricCyan
+                                        checkedThumbColor = MaterialTheme.colorScheme.onPrimary,
+                                        checkedTrackColor = MaterialTheme.colorScheme.primary
                                     ),
                                     modifier = Modifier.testTag("exclude_system_back_switch")
                                 )
@@ -654,6 +735,7 @@ private fun InteractivePhoneViewport(
             }
         }
 
+        val accentPrimary = MaterialTheme.colorScheme.primary
         // OS System Gesture conflict guides (Back side edges & bottom-corner Assistant / nav strip)
         Canvas(modifier = Modifier.fillMaxSize()) {
             val edgeBandW = 20f * scaleX
@@ -662,7 +744,7 @@ private fun InteractivePhoneViewport(
             val backBandColor = if (!config.excludeSystemBack || config.heightDp > 200f) {
                 AmberWarn.copy(alpha = 0.22f)
             } else {
-                ElectricCyan.copy(alpha = 0.08f)
+                accentPrimary.copy(alpha = 0.10f)
             }
 
             // Left & right OS Back gesture edge bands above bottom corners
@@ -734,12 +816,12 @@ private fun InteractivePhoneViewport(
                     if (isLiveTestMode) {
                         EmeraldActive.copy(alpha = 0.25f)
                     } else {
-                        ElectricCyan.copy(alpha = 0.22f)
+                        accentPrimary.copy(alpha = 0.22f)
                     }
                 )
                 .border(
                     1.5.dp,
-                    if (isLiveTestMode) EmeraldActive else ElectricCyan,
+                    if (isLiveTestMode) EmeraldActive else accentPrimary,
                     RoundedCornerShape(8.dp)
                 )
                 .then(
@@ -876,54 +958,87 @@ private fun InteractivePhoneViewport(
             )
         }
 
-        // Direct Drag-to-Resize Corner Grip Handle (when in Edit mode)
+        // Direct Drag-to-Resize Corner Grip Handle (pins opposite edge so only the dragged corner moves)
         if (!isLiveTestMode) {
-            val gripSize = 22.dp
-            val gripHalfPx = with(density) { (gripSize / 2).toPx() }
+            val touchSize = 48.dp
+            val touchHalfPx = with(density) { (touchSize / 2).toPx() }
             val gripX = when (config.anchor) {
-                EdgeAnchor.RIGHT_EDGE -> (zoneLeft - gripHalfPx).coerceIn(0f, frameW - gripHalfPx * 2)
-                else -> (zoneLeft + zoneW - gripHalfPx).coerceIn(0f, frameW - gripHalfPx * 2)
+                EdgeAnchor.RIGHT_EDGE -> (zoneLeft - touchHalfPx).coerceIn(0f, (frameW - touchHalfPx * 2).coerceAtLeast(0f))
+                else -> (zoneLeft + zoneW - touchHalfPx).coerceIn(0f, (frameW - touchHalfPx * 2).coerceAtLeast(0f))
             }
             val gripY = when (config.anchor) {
-                EdgeAnchor.BOTTOM_BAR -> (zoneTop - gripHalfPx).coerceIn(0f, frameH - gripHalfPx * 2)
-                else -> (zoneTop + zoneH - gripHalfPx).coerceIn(0f, frameH - gripHalfPx * 2)
+                EdgeAnchor.BOTTOM_BAR -> (zoneTop - touchHalfPx).coerceIn(0f, (frameH - touchHalfPx * 2).coerceAtLeast(0f))
+                else -> (zoneTop + zoneH - touchHalfPx).coerceIn(0f, (frameH - touchHalfPx * 2).coerceAtLeast(0f))
             }
 
+            val latestConfig by rememberUpdatedState(config)
+            val latestZoneRect by rememberUpdatedState(floatArrayOf(zoneLeft, zoneTop, zoneLeft + zoneW, zoneTop + zoneH))
+
             Box(
+                contentAlignment = Alignment.Center,
                 modifier = Modifier
                     .offset { IntOffset(gripX.roundToInt(), gripY.roundToInt()) }
-                    .size(gripSize)
-                    .clip(CircleShape)
-                    .background(Color.White)
-                    .border(2.5.dp, ElectricCyan, CircleShape)
-                    .pointerInput(config.anchor, scaleX, scaleY) {
-                        var currentWidthDp = config.widthDp
-                        var currentHeightDp = config.heightDp
+                    .size(touchSize)
+                    .pointerInput(config.anchor, frameW, frameH, scaleX, scaleY) {
+                        var pinnedLeft = 0f
+                        var pinnedTop = 0f
+                        var pinnedRight = 0f
+                        var pinnedBottom = 0f
+                        var startW = 28f
+                        var startH = 120f
+                        var accumDx = 0f
+                        var accumDy = 0f
                         detectDragGestures(
                             onDragStart = {
-                                currentWidthDp = config.widthDp
-                                currentHeightDp = config.heightDp
+                                val r = latestZoneRect
+                                pinnedLeft = r[0]
+                                pinnedTop = r[1]
+                                pinnedRight = r[2]
+                                pinnedBottom = r[3]
+                                startW = latestConfig.widthDp
+                                startH = latestConfig.heightDp
+                                accumDx = 0f
+                                accumDy = 0f
                             },
                             onDrag = { change, dragAmount ->
                                 change.consume()
-                                val deltaW = dragAmount.x / scaleX
-                                val deltaH = dragAmount.y / scaleY
-                                currentWidthDp = if (config.anchor == EdgeAnchor.RIGHT_EDGE) {
-                                    (currentWidthDp - deltaW).coerceIn(18f, 320f)
-                                } else {
-                                    (currentWidthDp + deltaW).coerceIn(18f, 320f)
-                                }
-                                currentHeightDp = if (config.anchor == EdgeAnchor.BOTTOM_BAR) {
-                                    (currentHeightDp - deltaH).coerceIn(18f, 320f)
-                                } else {
-                                    (currentHeightDp + deltaH).coerceIn(18f, 320f)
-                                }
-                                onUpdateGeometry(null, null, null, currentWidthDp, currentHeightDp)
+                                accumDx += dragAmount.x
+                                accumDy += dragAmount.y
+                                val resized = computeEdgePinnedResize(
+                                    anchor = latestConfig.anchor,
+                                    pinnedLeftPx = pinnedLeft,
+                                    pinnedTopPx = pinnedTop,
+                                    pinnedRightPx = pinnedRight,
+                                    pinnedBottomPx = pinnedBottom,
+                                    startWidthDp = startW,
+                                    startHeightDp = startH,
+                                    totalDragPxX = accumDx,
+                                    totalDragPxY = accumDy,
+                                    frameW = frameW,
+                                    frameH = frameH,
+                                    scaleX = scaleX,
+                                    scaleY = scaleY
+                                )
+                                onUpdateGeometry(
+                                    null,
+                                    resized.offsetXFraction,
+                                    resized.offsetYFraction,
+                                    resized.widthDp,
+                                    resized.heightDp
+                                )
                             }
                         )
                     }
                     .testTag("zone_editor_resize_grip")
-            )
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(20.dp)
+                        .clip(CircleShape)
+                        .background(Color.White)
+                        .border(2.5.dp, accentPrimary, CircleShape)
+                )
+            }
         }
     }
 }
@@ -952,7 +1067,7 @@ private fun DimensionSlider(
                 text = valueText,
                 fontFamily = JetBrainsMonoFamily,
                 fontSize = 12.sp,
-                color = ElectricCyan
+                color = MaterialTheme.colorScheme.primary
             )
         }
         Slider(
@@ -960,8 +1075,8 @@ private fun DimensionSlider(
             onValueChange = onValueChange,
             valueRange = valueRange,
             colors = SliderDefaults.colors(
-                thumbColor = ElectricCyan,
-                activeTrackColor = ElectricCyan,
+                thumbColor = MaterialTheme.colorScheme.primary,
+                activeTrackColor = MaterialTheme.colorScheme.primary,
                 inactiveTrackColor = MaterialTheme.colorScheme.surfaceVariant
             )
         )

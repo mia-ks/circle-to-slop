@@ -169,10 +169,10 @@ object MoEOcrRouter {
 
     /**
      * Triggered only on Circle invoke gesture: warms downloaded Play Services script models
-     * and native Tesseract LSTM weights in the background after yielding to Latin Fast,
-     * without running OCR on the captured screen until MoE or Translate is requested.
+     * in parallel and initializes native Tesseract LSTM weights in the background after yielding
+     * to Latin Fast, without running OCR on the captured screen until MoE or Translate is requested.
      */
-    fun prewarmMoEOnInvoke(context: Context, delayMs: Long = 160L) {
+    fun prewarmMoEOnInvoke(context: Context, delayMs: Long = 120L) {
         val appCtx = context.applicationContext
         if (isMoEWarmedUp || isMoEPrewarming) return
         isMoEPrewarming = true
@@ -181,44 +181,64 @@ object MoEOcrRouter {
                 if (delayMs > 0L) {
                     delay(delayMs)
                 }
-                val warmupBmp = Bitmap.createBitmap(64, 64, Bitmap.Config.ARGB_8888).apply {
-                    eraseColor(android.graphics.Color.WHITE)
+                val cachedStatuses = _mlKitOcrStatusFlow.value
+                val client = try {
+                    ModuleInstall.getClient(appCtx)
+                } catch (_: Throwable) {
+                    null
                 }
-                try {
-                    val img = InputImage.fromBitmap(warmupBmp, 0)
-                    if (!isLatinWarmedUp) {
+                coroutineScope {
+                    val mlWarmupJob = async(Dispatchers.Default) {
+                        val warmupBmp = Bitmap.createBitmap(64, 64, Bitmap.Config.ARGB_8888).apply {
+                            eraseColor(android.graphics.Color.WHITE)
+                        }
                         try {
-                            latinRecognizer.process(img).awaitGmsTask()
-                            isLatinWarmedUp = true
-                        } catch (_: Throwable) {
-                        }
-                    }
-                    val client = try {
-                        ModuleInstall.getClient(appCtx)
-                    } catch (_: Throwable) {
-                        null
-                    }
-                    for (key in listOf("japanese", "chinese", "korean", "devanagari")) {
-                        val rec = recognizerForKey(key) ?: continue
-                        val ready = try {
-                            client?.areModulesAvailable(rec)?.awaitGmsTask()?.areModulesAvailable() == true
-                        } catch (_: Throwable) {
-                            false
-                        }
-                        if (ready) {
-                            try {
-                                rec.process(img).awaitGmsTask()
-                            } catch (_: Throwable) {
+                            val img = InputImage.fromBitmap(warmupBmp, 0)
+                            val latinJob = if (!isLatinWarmedUp) {
+                                async {
+                                    try {
+                                        latinRecognizer.process(img).awaitGmsTask()
+                                        isLatinWarmedUp = true
+                                    } catch (_: Throwable) {
+                                    }
+                                }
+                            } else {
+                                null
                             }
+
+                            val extraJobs = listOf("japanese", "chinese", "korean", "devanagari").map { key ->
+                                async {
+                                    val rec = recognizerForKey(key) ?: return@async
+                                    val ready = cachedStatuses[key] == ModelPackStatus.DOWNLOADED || try {
+                                        client?.areModulesAvailable(rec)?.awaitGmsTask()?.areModulesAvailable() == true
+                                    } catch (_: Throwable) {
+                                        false
+                                    }
+                                    if (ready) {
+                                        try {
+                                            rec.process(img).awaitGmsTask()
+                                            _mlKitOcrStatusFlow.update { it + (key to ModelPackStatus.DOWNLOADED) }
+                                        } catch (_: Throwable) {
+                                        }
+                                    }
+                                }
+                            }
+                            latinJob?.await()
+                            extraJobs.awaitAll()
+                        } finally {
+                            warmupBmp.recycle()
                         }
                     }
-                } finally {
-                    warmupBmp.recycle()
-                }
 
-                val downloadedTess = getDownloadedTesseractLangs(appCtx)
-                if (downloadedTess.isNotEmpty()) {
-                    prewarmTesseract(appCtx, downloadedTess)
+                    val tessWarmupJob = async(Dispatchers.IO) {
+                        val downloadedTess = getDownloadedTesseractLangs(appCtx)
+                        if (downloadedTess.isNotEmpty()) {
+                            prewarmTesseract(appCtx, downloadedTess)
+                        }
+                    }
+
+                    mlWarmupJob.await()
+                    tessWarmupJob.await()
                 }
                 isMoEWarmedUp = true
             } catch (e: Throwable) {
@@ -361,6 +381,7 @@ object MoEOcrRouter {
                             }
                             STATE_COMPLETED -> {
                                 client.unregisterListener(this)
+                                isMoEWarmedUp = false
                                 _mlKitOcrStatusFlow.update { it + (scriptKey to ModelPackStatus.DOWNLOADED) }
                                 _mlKitOcrErrorFlow.update { it - scriptKey }
                                 if (cont.isActive) cont.resume(true)
@@ -471,6 +492,7 @@ object MoEOcrRouter {
                 cachedTessApi?.recycle()
                 cachedTessApi = null
                 cachedTessLangCombo = null
+                isMoEWarmedUp = false
             }
             _tessOcrStatusFlow.update { it + (cleanCode to ModelPackStatus.DOWNLOADED) }
             _tessOcrErrorFlow.update { it - cleanCode }
@@ -551,8 +573,8 @@ object MoEOcrRouter {
     /**
      * Progressive two-stage MoE OCR:
      * - Stage 1 emits fast ML Kit detections immediately (typically 80–220ms) so tapping words works right away.
-     * - Stage 2 (only if Tesseract extra script packs like Arabic/Cyrillic are downloaded) runs asynchronously
-     *   on a downscaled bitmap and merges non-Latin lines cleanly without blocking the UI.
+     * - Stage 2 (only if Tesseract extra script packs like Arabic/Cyrillic are downloaded) masks out
+     *   already-clean ML Kit Latin/CJK detections and runs Tesseract only on residual regions for 3-6x speedup.
      */
     suspend fun recognizeWithMoEProgressive(
         context: Context,
@@ -564,31 +586,15 @@ object MoEOcrRouter {
         val downloadedTessLangs = getDownloadedTesseractLangs(appCtx)
         val mlKitKeys = resolveMlKitKeys(appCtx, scriptMode)
 
-        // Downscale full-screen captures so ML Kit & Tesseract process ~3-4x fewer pixels without losing legibility
-        val (mlBitmap, mlScaleBack) = scaleDownForOcr(bitmap, maxLongSide = 1280)
-        val inputImage = InputImage.fromBitmap(mlBitmap, 0)
-
-        val stage1Raw = try {
-            coroutineScope {
-                mlKitKeys.map { key ->
-                    async(Dispatchers.Default) {
-                        runMlKitExpert(key, inputImage, mlScaleBack)
-                    }
-                }.awaitAll().flatten()
-            }
-        } finally {
-            if (mlBitmap !== bitmap) {
-                mlBitmap.recycle()
-            }
-        }
-
+        val stage1Raw = runMlKitKeysOnScaledBitmaps(bitmap, mlKitKeys)
         val stage1Fused = fuseMoECandidates(stage1Raw)
         val hasTesseractStage = downloadedTessLangs.isNotEmpty()
         onStageResult(stage1Fused, !hasTesseractStage)
 
         if (!hasTesseractStage) return@withContext
 
-        val (tessBitmap, tessScaleBack) = scaleDownForOcr(bitmap, maxLongSide = 1024)
+        val maskRects = collectCleanStage1MaskRects(stage1Raw)
+        val (tessBitmap, tessScaleBack) = buildMaskedTesseractBitmap(bitmap, maskRects, maxLongSide = 900)
         val tessCandidates = try {
             withContext(Dispatchers.IO) {
                 runTesseractExpert(appCtx, tessBitmap, downloadedTessLangs, tessScaleBack)
@@ -617,38 +623,103 @@ object MoEOcrRouter {
         val downloadedTessLangs = getDownloadedTesseractLangs(appCtx)
         val mlKitKeys = resolveMlKitKeys(appCtx, scriptMode)
 
-        val (mlBitmap, mlScaleBack) = scaleDownForOcr(bitmap, maxLongSide = 1280)
-        val inputImage = InputImage.fromBitmap(mlBitmap, 0)
-
-        val allCandidates = coroutineScope {
-            val mlKitJobs = mlKitKeys.map { key ->
-                async(Dispatchers.Default) {
-                    runMlKitExpert(key, inputImage, mlScaleBack)
-                }
-            }
-            val tessJob = if (downloadedTessLangs.isNotEmpty()) {
-                val (tessBitmap, tessScaleBack) = scaleDownForOcr(bitmap, maxLongSide = 1024)
-                async(Dispatchers.IO) {
-                    try {
-                        runTesseractExpert(appCtx, tessBitmap, downloadedTessLangs, tessScaleBack)
-                    } finally {
-                        if (tessBitmap !== bitmap) tessBitmap.recycle()
-                    }
-                }
-            } else {
-                null
-            }
-
-            val mlRes = try {
-                mlKitJobs.awaitAll().flatten()
-            } finally {
-                if (mlBitmap !== bitmap) mlBitmap.recycle()
-            }
-            val tessRes = tessJob?.await().orEmpty()
-            mlRes + tessRes
+        val stage1Raw = runMlKitKeysOnScaledBitmaps(bitmap, mlKitKeys)
+        if (downloadedTessLangs.isEmpty()) {
+            return@withContext fuseMoECandidates(stage1Raw)
         }
 
-        fuseMoECandidates(allCandidates)
+        val maskRects = collectCleanStage1MaskRects(stage1Raw)
+        val (tessBitmap, tessScaleBack) = buildMaskedTesseractBitmap(bitmap, maskRects, maxLongSide = 900)
+        val tessRes = try {
+            withContext(Dispatchers.IO) {
+                runTesseractExpert(appCtx, tessBitmap, downloadedTessLangs, tessScaleBack)
+            }
+        } finally {
+            if (tessBitmap !== bitmap) tessBitmap.recycle()
+        }
+
+        fuseMoECandidates(stage1Raw + tessRes)
+    }
+
+    private suspend fun runMlKitKeysOnScaledBitmaps(
+        bitmap: Bitmap,
+        mlKitKeys: List<String>
+    ): List<CandidateOcrLine> = coroutineScope {
+        val hasLatin = "latin" in mlKitKeys
+        val nonLatinKeys = mlKitKeys.filter { it != "latin" }
+        val (latinBmp, latinScale) = if (hasLatin) scaleDownForOcr(bitmap, maxLongSide = 1280) else (bitmap to 1f)
+        val (cjkBmp, cjkScale) = if (nonLatinKeys.isNotEmpty()) scaleDownForOcr(bitmap, maxLongSide = 960) else (bitmap to 1f)
+
+        try {
+            val jobs = buildList {
+                if (hasLatin) {
+                    val latinImg = InputImage.fromBitmap(latinBmp, 0)
+                    add(async(Dispatchers.Default) { runMlKitExpert("latin", latinImg, latinScale) })
+                }
+                if (nonLatinKeys.isNotEmpty()) {
+                    val cjkImg = InputImage.fromBitmap(cjkBmp, 0)
+                    for (key in nonLatinKeys) {
+                        add(async(Dispatchers.Default) { runMlKitExpert(key, cjkImg, cjkScale) })
+                    }
+                }
+            }
+            jobs.awaitAll().flatten()
+        } finally {
+            if (hasLatin && latinBmp !== bitmap) latinBmp.recycle()
+            if (nonLatinKeys.isNotEmpty() && cjkBmp !== bitmap) cjkBmp.recycle()
+        }
+    }
+
+    /**
+     * Collects bounding rects of lines that Stage 1 ML Kit already read with high confidence
+     * (clean Latin or CJK/Devanagari) so Tesseract can skip layout/LSTM decoding on those regions.
+     */
+    fun collectCleanStage1MaskRects(candidates: List<CandidateOcrLine>): List<Rect> {
+        return candidates.mapNotNull { cand ->
+            val stats = analyzeScriptStats(cand.text)
+            val isCleanLatin = cand.expert == OcrExpertKind.MLKIT_LATIN &&
+                cand.confidence >= 84f &&
+                isStrongCleanLatinLine(cand) &&
+                cand.text.length >= 4
+            val isCleanCjk = cand.expert != OcrExpertKind.MLKIT_LATIN &&
+                cand.expert != OcrExpertKind.TESSERACT &&
+                cand.confidence >= 80f &&
+                (stats.kanaCount + stats.hanCount + stats.hangulCount + stats.devanagariCount) >= 2
+            if (isCleanLatin || isCleanCjk) cand.boundingBox else null
+        }
+    }
+
+    private fun buildMaskedTesseractBitmap(
+        source: Bitmap,
+        maskRectsInSourceCoords: List<Rect>,
+        maxLongSide: Int
+    ): Pair<Bitmap, Float> {
+        val (scaled, scaleBack) = scaleDownForOcr(source, maxLongSide = maxLongSide)
+        if (maskRectsInSourceCoords.isEmpty() || scaled.width <= 4 || scaled.height <= 4) {
+            return scaled to scaleBack
+        }
+        val mutable = if (scaled.isMutable) {
+            scaled
+        } else {
+            val copy = scaled.copy(Bitmap.Config.ARGB_8888, true)
+            if (scaled !== source) scaled.recycle()
+            copy
+        }
+        val canvas = android.graphics.Canvas(mutable)
+        val paint = android.graphics.Paint().apply { style = android.graphics.Paint.Style.FILL }
+        val invScale = 1f / scaleBack.coerceAtLeast(0.01f)
+        for (srcRect in maskRectsInSourceCoords) {
+            val l = (srcRect.left * invScale).toInt().coerceIn(0, mutable.width - 1)
+            val t = (srcRect.top * invScale).toInt().coerceIn(0, mutable.height - 1)
+            val r = (srcRect.right * invScale).toInt().coerceIn(l + 1, mutable.width)
+            val b = (srcRect.bottom * invScale).toInt().coerceIn(t + 1, mutable.height)
+            if (r - l < 4 || b - t < 4) continue
+            val sampleX = (l - 2).coerceIn(0, mutable.width - 1)
+            val sampleY = (t - 2).coerceIn(0, mutable.height - 1)
+            paint.color = mutable.getPixel(sampleX, sampleY)
+            canvas.drawRect(l.toFloat(), t.toFloat(), r.toFloat(), b.toFloat(), paint)
+        }
+        return mutable to scaleBack
     }
 
     private fun scaleDownForOcr(bitmap: Bitmap, maxLongSide: Int): Pair<Bitmap, Float> {
@@ -916,7 +987,7 @@ object MoEOcrRouter {
                 c in 0x4E00..0x9FFF || c in 0x3400..0x4DBF -> hanCount++
                 ch.isLetter() -> latinLetterCount++
                 ch.isDigit() -> digitCount++
-                !ch.isWhitespace() && ch !in ".,:;!?-_/()€¥$£%·&+'\"" -> symbolGarbageCount++
+                !ch.isWhitespace() && ch !in ".,:;!?-_/()€¥$£%·&+'\"<>@#•–—«»°→←↑↓" -> symbolGarbageCount++
             }
         }
 

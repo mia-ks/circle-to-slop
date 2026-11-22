@@ -149,6 +149,7 @@ fun DashboardScreen(
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(10.dp)
                     ) {
+                        val brandAccent = MaterialTheme.colorScheme.primary
                         Box(
                             modifier = Modifier
                                 .size(34.dp)
@@ -165,7 +166,7 @@ fun DashboardScreen(
                                     style = Stroke(width = 2.6.dp.toPx(), cap = StrokeCap.Round)
                                 )
                                 drawCircle(
-                                    color = ElectricCyan,
+                                    color = brandAccent,
                                     radius = 2.6.dp.toPx(),
                                     center = center
                                 )
@@ -268,8 +269,8 @@ fun DashboardScreen(
                                         checked = config.triggerEnabled,
                                         onCheckedChange = onToggleTriggerEnabled,
                                         colors = SwitchDefaults.colors(
-                                            checkedThumbColor = Color.White,
-                                            checkedTrackColor = ElectricCyan
+                                            checkedThumbColor = MaterialTheme.colorScheme.onPrimary,
+                                            checkedTrackColor = MaterialTheme.colorScheme.primary
                                         ),
                                         modifier = Modifier.testTag("system_trigger_switch")
                                     )
@@ -308,29 +309,20 @@ fun DashboardScreen(
                                 verticalAlignment = Alignment.CenterVertically,
                                 horizontalArrangement = Arrangement.spacedBy(12.dp)
                             ) {
-                                MiniPhoneZonePreview(
-                                    config = config,
-                                    modifier = Modifier.size(width = 28.dp, height = 44.dp)
+                                Icon(
+                                    imageVector = Icons.Rounded.Tune,
+                                    contentDescription = null,
+                                    tint = MaterialTheme.colorScheme.primary,
+                                    modifier = Modifier.size(20.dp)
                                 )
                                 Column(modifier = Modifier.weight(1f)) {
-                                    Row(
-                                        verticalAlignment = Alignment.CenterVertically,
-                                        horizontalArrangement = Arrangement.spacedBy(5.dp)
-                                    ) {
-                                        Icon(
-                                            imageVector = Icons.Rounded.Tune,
-                                            contentDescription = null,
-                                            tint = ElectricCyan,
-                                            modifier = Modifier.size(14.dp)
-                                        )
-                                        Text(
-                                            text = "Trigger Zone",
-                                            fontFamily = SpaceGroteskFamily,
-                                            fontWeight = FontWeight.SemiBold,
-                                            fontSize = 14.sp,
-                                            color = MaterialTheme.colorScheme.onSurface
-                                        )
-                                    }
+                                    Text(
+                                        text = "Trigger Zone",
+                                        fontFamily = SpaceGroteskFamily,
+                                        fontWeight = FontWeight.SemiBold,
+                                        fontSize = 14.sp,
+                                        color = MaterialTheme.colorScheme.onSurface
+                                    )
                                     Text(
                                         text = config.summaryLine(),
                                         fontFamily = InterFamily,
@@ -403,7 +395,7 @@ fun DashboardScreen(
                                 Icon(
                                     imageVector = Icons.Rounded.Translate,
                                     contentDescription = null,
-                                    tint = ElectricCyan,
+                                    tint = MaterialTheme.colorScheme.primary,
                                     modifier = Modifier.size(17.dp)
                                 )
                                 Text(
@@ -420,7 +412,7 @@ fun DashboardScreen(
                             ) {
                                 if (downloadingCount > 0) {
                                     CircularProgressIndicator(
-                                        color = ElectricCyan,
+                                        color = MaterialTheme.colorScheme.primary,
                                         strokeWidth = 1.8.dp,
                                         modifier = Modifier.size(12.dp)
                                     )
@@ -433,7 +425,7 @@ fun DashboardScreen(
                                     },
                                     fontFamily = JetBrainsMonoFamily,
                                     fontSize = 11.5.sp,
-                                    color = if (downloadingCount > 0) ElectricCyan else MaterialTheme.colorScheme.onSurfaceVariant
+                                    color = if (downloadingCount > 0) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
                                 )
                             }
                         }
@@ -467,7 +459,7 @@ fun DashboardScreen(
                                     ) {
                                         PackDot(
                                             status = packStatus,
-                                            spinnerColor = if (selected) MaterialTheme.colorScheme.onPrimary else ElectricCyan
+                                            spinnerColor = if (selected) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.primary
                                         )
                                         Text(
                                             text = "${lang.shortCode} · ${lang.label}",
@@ -522,7 +514,7 @@ fun DashboardScreen(
                                     fontSize = 12.sp,
                                     color = when (selectedStatus) {
                                         ModelPackStatus.DOWNLOADED -> EmeraldActive
-                                        ModelPackStatus.DOWNLOADING -> ElectricCyan
+                                        ModelPackStatus.DOWNLOADING -> MaterialTheme.colorScheme.primary
                                         ModelPackStatus.ERROR -> CoralError
                                         ModelPackStatus.NOT_DOWNLOADED -> MaterialTheme.colorScheme.onSurfaceVariant
                                     },
@@ -550,7 +542,7 @@ fun DashboardScreen(
                                 }
                                 ModelPackStatus.DOWNLOADING -> {
                                     CircularProgressIndicator(
-                                        color = ElectricCyan,
+                                        color = MaterialTheme.colorScheme.primary,
                                         strokeWidth = 2.dp,
                                         modifier = Modifier
                                             .padding(horizontal = 12.dp)
@@ -584,7 +576,7 @@ fun DashboardScreen(
 
                         if (selectedStatus == ModelPackStatus.DOWNLOADING) {
                             LinearProgressIndicator(
-                                color = ElectricCyan,
+                                color = MaterialTheme.colorScheme.primary,
                                 trackColor = MaterialTheme.colorScheme.background,
                                 modifier = Modifier.fillMaxWidth()
                             )
@@ -605,12 +597,12 @@ fun DashboardScreen(
                                 fontFamily = SpaceGroteskFamily,
                                 fontWeight = FontWeight.Medium,
                                 fontSize = 12.5.sp,
-                                color = ElectricCyan
+                                color = MaterialTheme.colorScheme.primary
                             )
                             Icon(
                                 imageVector = if (showPackManager) Icons.Rounded.ExpandLess else Icons.Rounded.ExpandMore,
                                 contentDescription = null,
-                                tint = ElectricCyan
+                                tint = MaterialTheme.colorScheme.primary
                             )
                         }
 
@@ -647,7 +639,7 @@ fun DashboardScreen(
                                                 fontSize = 11.5.sp,
                                                 color = when (st) {
                                                     ModelPackStatus.DOWNLOADED -> EmeraldActive
-                                                    ModelPackStatus.DOWNLOADING -> ElectricCyan
+                                                    ModelPackStatus.DOWNLOADING -> MaterialTheme.colorScheme.primary
                                                     ModelPackStatus.ERROR -> CoralError
                                                     ModelPackStatus.NOT_DOWNLOADED -> MaterialTheme.colorScheme.onSurfaceVariant
                                                 },
@@ -668,7 +660,7 @@ fun DashboardScreen(
                                             }
                                             ModelPackStatus.DOWNLOADING -> {
                                                 CircularProgressIndicator(
-                                                    color = ElectricCyan,
+                                                    color = MaterialTheme.colorScheme.primary,
                                                     strokeWidth = 2.dp,
                                                     modifier = Modifier
                                                         .padding(end = 10.dp)
@@ -790,12 +782,12 @@ fun DashboardScreen(
                                     text = "$readyMlKitCount/${SupportedMlKitDynamicScripts.size} · +$readyTessCount",
                                     fontFamily = JetBrainsMonoFamily,
                                     fontSize = 11.5.sp,
-                                    color = ElectricCyan
+                                    color = MaterialTheme.colorScheme.primary
                                 )
                                 Icon(
                                     imageVector = if (showOcrPackManager) Icons.Rounded.ExpandLess else Icons.Rounded.ExpandMore,
                                     contentDescription = null,
-                                    tint = ElectricCyan
+                                    tint = MaterialTheme.colorScheme.primary
                                 )
                             }
                         }
@@ -856,7 +848,7 @@ fun DashboardScreen(
                                                 fontSize = 11.5.sp,
                                                 color = when (st) {
                                                     ModelPackStatus.DOWNLOADED -> EmeraldActive
-                                                    ModelPackStatus.DOWNLOADING -> ElectricCyan
+                                                    ModelPackStatus.DOWNLOADING -> MaterialTheme.colorScheme.primary
                                                     ModelPackStatus.ERROR -> CoralError
                                                     ModelPackStatus.NOT_DOWNLOADED -> MaterialTheme.colorScheme.onSurfaceVariant
                                                 },
@@ -875,7 +867,7 @@ fun DashboardScreen(
                                             }
                                             ModelPackStatus.DOWNLOADING -> {
                                                 CircularProgressIndicator(
-                                                    color = ElectricCyan,
+                                                    color = MaterialTheme.colorScheme.primary,
                                                     strokeWidth = 2.dp,
                                                     modifier = Modifier.size(18.dp)
                                                 )
@@ -938,7 +930,7 @@ fun DashboardScreen(
                                                 fontSize = 11.5.sp,
                                                 color = when (st) {
                                                     ModelPackStatus.DOWNLOADED -> EmeraldActive
-                                                    ModelPackStatus.DOWNLOADING -> ElectricCyan
+                                                    ModelPackStatus.DOWNLOADING -> MaterialTheme.colorScheme.primary
                                                     ModelPackStatus.ERROR -> CoralError
                                                     ModelPackStatus.NOT_DOWNLOADED -> MaterialTheme.colorScheme.onSurfaceVariant
                                                 },
@@ -959,7 +951,7 @@ fun DashboardScreen(
                                             }
                                             ModelPackStatus.DOWNLOADING -> {
                                                 CircularProgressIndicator(
-                                                    color = ElectricCyan,
+                                                    color = MaterialTheme.colorScheme.primary,
                                                     strokeWidth = 2.dp,
                                                     modifier = Modifier.size(18.dp)
                                                 )
@@ -1003,8 +995,8 @@ fun DashboardScreen(
                                 checked = config.hapticFeedback,
                                 onCheckedChange = onToggleHaptic,
                                 colors = SwitchDefaults.colors(
-                                    checkedThumbColor = Color.White,
-                                    checkedTrackColor = ElectricCyan
+                                    checkedThumbColor = MaterialTheme.colorScheme.onPrimary,
+                                    checkedTrackColor = MaterialTheme.colorScheme.primary
                                 ),
                                 modifier = Modifier.testTag("haptic_switch")
                             )
@@ -1056,34 +1048,23 @@ private fun StatusChip(
     isActive: Boolean,
     onClick: () -> Unit
 ) {
-    val dotColor = if (isActive) EmeraldActive else AmberWarn
     val label = if (isActive) "Active" else "Setup"
-    Surface(
-        shape = RoundedCornerShape(999.dp),
-        color = MaterialTheme.colorScheme.surfaceVariant,
+    Box(
+        contentAlignment = Alignment.CenterEnd,
         modifier = Modifier
-            .clip(RoundedCornerShape(999.dp))
+            .heightIn(min = 48.dp)
+            .clip(RoundedCornerShape(8.dp))
             .clickable { onClick() }
+            .padding(horizontal = 8.dp)
+            .testTag("header_status_text")
     ) {
-        Row(
-            modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(6.dp)
-        ) {
-            Box(
-                modifier = Modifier
-                    .size(7.dp)
-                    .clip(CircleShape)
-                    .background(dotColor)
-            )
-            Text(
-                text = label,
-                fontFamily = SpaceGroteskFamily,
-                fontWeight = FontWeight.Medium,
-                fontSize = 12.sp,
-                color = MaterialTheme.colorScheme.onSurface
-            )
-        }
+        Text(
+            text = label,
+            fontFamily = SpaceGroteskFamily,
+            fontWeight = FontWeight.SemiBold,
+            fontSize = 13.5.sp,
+            color = if (isActive) EmeraldActive else AmberWarn
+        )
     }
 }
 

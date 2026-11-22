@@ -63,7 +63,8 @@ data class InlineTextBlock(
     val averageLineHeightPx: Float,
     val detectedLanguageCode: String?,
     val backgroundColorArgb: Int,
-    val foregroundColorArgb: Int
+    val foregroundColorArgb: Int,
+    val sourceLines: List<String> = emptyList()
 )
 
 data class ScreenOcrAnalysis(
@@ -352,17 +353,18 @@ object OcrAndLensEngine {
         val langResults = kotlinx.coroutines.coroutineScope {
             analysis.blocks.map { block ->
                 async(Dispatchers.Default) {
+                    val cleanedForLang = cleanTextForLanguageId(block.text)
                     val existing = block.detectedLanguageCode
                     val lang = existing
-                        ?: fastScriptLangHint(block.text)
-                        ?: if (block.text.length >= 3) detectLanguageCode(block.text) else null
+                        ?: fastScriptLangHint(cleanedForLang)
+                        ?: if (cleanedForLang.length >= 3) detectLanguageCode(cleanedForLang) else null
                     val colors = sampleBlockColors(bitmap, block.boundingBox)
                     Triple(block.id, lang, colors)
                 }
             }.map { it.await() }
         }.associateBy { it.first }
 
-        val fullScreenSample = analysis.blocks.take(8).joinToString(" ") { it.text }
+        val fullScreenSample = analysis.blocks.take(8).joinToString(" ") { cleanTextForLanguageId(it.text) }.trim()
         val dominantLang = analysis.dominantLanguageCode
             ?: fastScriptLangHint(fullScreenSample)
             ?: if (fullScreenSample.isNotBlank()) detectLanguageCode(fullScreenSample) else null
@@ -405,16 +407,17 @@ object OcrAndLensEngine {
         val sourcePerBlock = mutableMapOf<Int, String>()
         val uniqueMissingSources = linkedSetOf<String>()
 
-        // Resolve source language per block in parallel (using 0ms script heuristics first)
+        // Resolve source language per block in parallel (using 0ms script heuristics on quote-cleaned text first)
         val detectedTags = kotlinx.coroutines.coroutineScope {
             blocks.map { block ->
                 async(Dispatchers.Default) {
-                    val tag = if (!block.text.any { it.isLetter() }) {
+                    val cleaned = cleanTextForLanguageId(block.text)
+                    val tag = if (!cleaned.any { it.isLetter() }) {
                         null
                     } else {
                         block.detectedLanguageCode
-                            ?: fastScriptLangHint(block.text)
-                            ?: detectLanguageCode(block.text)
+                            ?: fastScriptLangHint(cleaned)
+                            ?: detectLanguageCode(cleaned)
                             ?: dominantLangHint
                     }
                     block.id to tag
@@ -534,7 +537,11 @@ object OcrAndLensEngine {
                     )
                 }
                 try {
-                    val translated = translator.translate(block.text).awaitTask().trim()
+                    val translated = translatePreservingQuoteLines(
+                        translator = translator,
+                        rawText = block.text,
+                        sourceLines = block.sourceLines
+                    )
                     currentStates[blockId] = InlineBlockStatus.Translated(
                         text = translated.ifBlank { block.text },
                         sourceLangName = formatLanguageName(mlSource)
@@ -640,9 +647,10 @@ object OcrAndLensEngine {
     }
 
     suspend fun detectLanguageCode(text: String): String? = withContext(Dispatchers.Default) {
-        if (text.isBlank()) return@withContext null
+        val cleaned = cleanTextForLanguageId(text)
+        if (cleaned.isBlank()) return@withContext null
         try {
-            val tag = languageIdentifier.identifyLanguage(text).awaitTask()
+            val tag = languageIdentifier.identifyLanguage(cleaned).awaitTask()
             if (tag == "und") null else tag
         } catch (e: Exception) {
             Log.e(TAG, "Language ID failed", e)
@@ -745,7 +753,11 @@ object OcrAndLensEngine {
             }
 
             onState(TranslationState.Translating)
-            val translated = translator.translate(text).awaitTask()
+            val translated = translatePreservingQuoteLines(
+                translator = translator,
+                rawText = text,
+                sourceLines = text.split('\n')
+            )
             onState(
                 TranslationState.Success(
                     translatedText = translated,
@@ -811,14 +823,67 @@ object OcrAndLensEngine {
         }
     }
 
-    fun launchWebSearch(context: Context, query: String): Boolean {
-        if (query.isBlank()) return false
-        return try {
-            val url = "https://www.google.com/search?q=${Uri.encode(query.trim())}"
-            val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url)).apply {
+    fun buildWebSearchIntents(context: Context, query: String): List<Intent> {
+        val trimmed = query.trim()
+        if (trimmed.isBlank()) return emptyList()
+        val intents = mutableListOf<Intent>()
+
+        // 1. Prefer Google App in-place / pop-up search sheet via ACTION_WEB_SEARCH
+        intents.add(
+            Intent(Intent.ACTION_WEB_SEARCH).apply {
+                putExtra(android.app.SearchManager.QUERY, trimmed)
+                setPackage(GOOGLE_QUICK_SEARCH_PACKAGE)
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             }
-            context.startActivity(intent)
+        )
+        // 2. Generic system ACTION_WEB_SEARCH (in-app / pop-up search handler)
+        intents.add(
+            Intent(Intent.ACTION_WEB_SEARCH).apply {
+                putExtra(android.app.SearchManager.QUERY, trimmed)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+        )
+        // 3. Fallback to browser Google Search URL
+        val url = "https://www.google.com/search?q=${Uri.encode(trimmed)}"
+        val browserPkg = try {
+            resolvePreferredBrowserPackage(context)
+        } catch (_: Exception) {
+            null
+        }
+        if (browserPkg != null) {
+            intents.add(
+                Intent(Intent.ACTION_VIEW, Uri.parse(url)).apply {
+                    addCategory(Intent.CATEGORY_BROWSABLE)
+                    setPackage(browserPkg)
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+            )
+        }
+        intents.add(
+            Intent(Intent.ACTION_VIEW, Uri.parse(url)).apply {
+                addCategory(Intent.CATEGORY_BROWSABLE)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+        )
+        return intents
+    }
+
+    fun launchWebSearch(context: Context, query: String): Boolean {
+        val candidates = buildWebSearchIntents(context, query)
+        if (candidates.isEmpty()) return false
+        val pm = context.packageManager
+        for (intent in candidates) {
+            try {
+                if (intent.resolveActivity(pm) != null) {
+                    context.startActivity(intent)
+                    return true
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Web search candidate failed (${intent.action}/${intent.`package`}): ${e.message}")
+            }
+        }
+        return try {
+            context.startActivity(candidates.last())
             true
         } catch (e: Exception) {
             Log.e(TAG, "Failed to open web search", e)
@@ -870,30 +935,45 @@ object OcrAndLensEngine {
         }
     }
 
+    @Suppress("DEPRECATION")
     private fun resolvePreferredBrowserPackage(context: Context): String? {
         val pm = context.packageManager
         val probe = Intent(Intent.ACTION_VIEW, Uri.parse("https://example.org/"))
             .addCategory(Intent.CATEGORY_BROWSABLE)
 
+        fun isBrowserPkg(pkg: String?): Boolean {
+            return !pkg.isNullOrBlank() &&
+                pkg != "android" &&
+                pkg != GOOGLE_TRANSLATE_PACKAGE &&
+                pkg != GOOGLE_QUICK_SEARCH_PACKAGE &&
+                !pkg.contains("resolver", ignoreCase = true)
+        }
+
         val defaultMatch = pm.resolveActivity(probe, android.content.pm.PackageManager.MATCH_DEFAULT_ONLY)
             ?.activityInfo?.packageName
-        if (!defaultMatch.isNullOrBlank() &&
-            defaultMatch != "android" &&
-            defaultMatch != GOOGLE_TRANSLATE_PACKAGE &&
-            !defaultMatch.contains("resolver", ignoreCase = true)
-        ) {
+        if (isBrowserPkg(defaultMatch)) {
             return defaultMatch
         }
 
-        val candidates = pm.queryIntentActivities(probe, android.content.pm.PackageManager.MATCH_DEFAULT_ONLY)
-        return candidates
+        val flags = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M) {
+            android.content.pm.PackageManager.MATCH_ALL
+        } else {
+            android.content.pm.PackageManager.MATCH_DEFAULT_ONLY
+        }
+        val candidates = pm.queryIntentActivities(probe, flags)
             .mapNotNull { it.activityInfo?.packageName }
-            .firstOrNull { pkg ->
-                pkg.isNotBlank() &&
-                    pkg != "android" &&
-                    pkg != GOOGLE_TRANSLATE_PACKAGE &&
-                    !pkg.contains("resolver", ignoreCase = true)
+            .filter { isBrowserPkg(it) }
+        if (candidates.isNotEmpty()) {
+            return KNOWN_BROWSER_PACKAGES.firstOrNull { it in candidates } ?: candidates.first()
+        }
+
+        for (pkg in KNOWN_BROWSER_PACKAGES) {
+            val targetedProbe = Intent(probe).setPackage(pkg)
+            if (targetedProbe.resolveActivity(pm) != null) {
+                return pkg
             }
+        }
+        return null
     }
 
     fun launchGoogleTranslateFallback(
@@ -905,14 +985,17 @@ object OcrAndLensEngine {
         val trimmed = text.trim()
         if (trimmed.isBlank()) return false
 
+        val cleanSourceHint = sourceLangCodeHint
+            ?: fastScriptLangHint(cleanTextForLanguageId(trimmed))
+
         val translateUri = buildGoogleTranslateWebUri(
             text = trimmed,
             targetLangCode = targetLangCode,
-            sourceLangCodeHint = sourceLangCodeHint
+            sourceLangCodeHint = cleanSourceHint
         )
 
-        // 1. Target the user's browser explicitly so Android App Links do NOT open the native
-        // Google Translate app (whose ACTION_VIEW drops sl/tl/text URL parameters).
+        // 1. Target an explicit browser package + Custom Tab overlay bundle so Android Verified
+        // App Links NEVER intercept translate.google.com into the native Translate app (which drops sl/tl/text).
         val browserPkg = try {
             resolvePreferredBrowserPackage(context)
         } catch (_: Exception) {
@@ -920,9 +1003,13 @@ object OcrAndLensEngine {
         }
         if (browserPkg != null) {
             try {
+                val customTabsExtras = android.os.Bundle().apply {
+                    putBinder("android.support.customtabs.extra.SESSION", null)
+                }
                 val browserIntent = Intent(Intent.ACTION_VIEW, translateUri).apply {
                     addCategory(Intent.CATEGORY_BROWSABLE)
                     setPackage(browserPkg)
+                    putExtras(customTabsExtras)
                     addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                 }
                 context.startActivity(browserIntent)
@@ -932,21 +1019,8 @@ object OcrAndLensEngine {
             }
         }
 
-        // 2. Fallback to system VIEW (no Translate app package pinning)
-        try {
-            val webIntent = Intent(Intent.ACTION_VIEW, translateUri).apply {
-                addCategory(Intent.CATEGORY_BROWSABLE)
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            }
-            if (webIntent.resolveActivity(context.packageManager) != null) {
-                context.startActivity(webIntent)
-                return true
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "Generic ACTION_VIEW Translate failed: ${e.message}")
-        }
-
-        // 3. Final fallback: Google Translate native PROCESS_TEXT / SEND (preserves text)
+        // 2. If Chrome/browsers aren't found cleanly, prefer native Translate PROCESS_TEXT / SEND
+        // rather than un-packaged ACTION_VIEW when Google Translate app is installed (so text isn't wiped).
         val pm = context.packageManager
         try {
             val processTextIntent = Intent(Intent.ACTION_PROCESS_TEXT).apply {
@@ -972,9 +1046,25 @@ object OcrAndLensEngine {
                 return true
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to open Google Translate", e)
+            Log.w(TAG, "Google Translate PROCESS_TEXT/SEND failed: ${e.message}")
         }
-        return false
+
+        // 3. Final generic VIEW fallback
+        return try {
+            val webIntent = Intent(Intent.ACTION_VIEW, translateUri).apply {
+                addCategory(Intent.CATEGORY_BROWSABLE)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            if (webIntent.resolveActivity(pm) != null) {
+                context.startActivity(webIntent)
+                true
+            } else {
+                false
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to open Google Translate", e)
+            false
+        }
     }
 
     fun launchWebTranslate(
@@ -987,6 +1077,19 @@ object OcrAndLensEngine {
         text = text,
         targetLangCode = targetLangCode,
         sourceLangCodeHint = sourceLangCodeHint
+    )
+
+    private const val GOOGLE_QUICK_SEARCH_PACKAGE = "com.google.android.googlequicksearchbox"
+    private val KNOWN_BROWSER_PACKAGES = listOf(
+        "com.android.chrome",
+        "com.chrome.beta",
+        "com.chrome.dev",
+        "com.brave.browser",
+        "org.mozilla.firefox",
+        "com.sec.android.app.sbrowser",
+        "com.microsoft.emmx",
+        "com.opera.browser",
+        "com.duckduckgo.mobile.android"
     )
 
     private const val GOOGLE_TRANSLATE_PACKAGE = "com.google.android.apps.translate"
@@ -1115,10 +1218,11 @@ object OcrAndLensEngine {
             }
 
             val blockText = joinLinesIntelligently(joinedPieces)
-            val langTag = if (enrichLanguagesAndColors && blockText.length >= 3) {
-                fastScriptLangHint(blockText) ?: detectLanguageCode(blockText)
+            val cleanedForLang = cleanTextForLanguageId(blockText)
+            val langTag = if (enrichLanguagesAndColors && cleanedForLang.length >= 3) {
+                fastScriptLangHint(cleanedForLang) ?: detectLanguageCode(cleanedForLang)
             } else {
-                fastScriptLangHint(blockText)
+                fastScriptLangHint(cleanedForLang)
             }
             val (bgArgb, fgArgb) = if (enrichLanguagesAndColors) {
                 sampleBlockColors(bitmap, blockBounds)
@@ -1134,13 +1238,14 @@ object OcrAndLensEngine {
                     averageLineHeightPx = (heightSum / groupLines.size.coerceAtLeast(1)).coerceAtLeast(12f),
                     detectedLanguageCode = langTag,
                     backgroundColorArgb = bgArgb,
-                    foregroundColorArgb = fgArgb
+                    foregroundColorArgb = fgArgb,
+                    sourceLines = joinedPieces.toList()
                 )
             )
         }
 
         val dominantLang = if (enrichLanguagesAndColors) {
-            val fullScreenSample = blocksOut.take(8).joinToString(" ") { it.text }
+            val fullScreenSample = blocksOut.take(8).joinToString(" ") { cleanTextForLanguageId(it.text) }.trim()
             if (fullScreenSample.isNotBlank()) {
                 fastScriptLangHint(fullScreenSample) ?: detectLanguageCode(fullScreenSample)
             } else {
@@ -1166,8 +1271,86 @@ object OcrAndLensEngine {
         )
     }
 
+    fun cleanTextForLanguageId(raw: String): String {
+        if (raw.isBlank()) return ""
+        return raw.lineSequence()
+            .map { line ->
+                line.trim()
+                    .replace(Regex("^[>›•\\-*]+\\s*"), "")
+                    .replace(Regex("@[\\w.]+"), "")
+                    .trim()
+            }
+            .filter { it.any { ch -> ch.isLetter() } }
+            .joinToString(" ")
+            .trim()
+    }
+
+    fun splitPrefixForTranslation(line: String): Pair<String, String> {
+        val trimmed = line.trim()
+        val match = Regex("^([>›]+|[•\\-*]|\\d+[.)])\\s*(.*)$").find(trimmed)
+        if (match != null) {
+            val marker = match.groupValues[1]
+            val body = match.groupValues[2].trim()
+            if (body.isNotEmpty()) {
+                return "$marker " to body
+            }
+        }
+        return "" to trimmed
+    }
+
+    fun shouldTranslateLineByLine(lines: List<String>): Boolean {
+        if (lines.size <= 1) return false
+        val quoteOrBulletCount = lines.count { line ->
+            val t = line.trimStart()
+            t.startsWith(">") || t.startsWith("›") || t.startsWith("•") ||
+                t.startsWith("- ") || t.startsWith("* ")
+        }
+        if (quoteOrBulletCount >= 2) return true
+        // Also keep separate lines when none end cleanly with connectors and every line is a short clause
+        return lines.all { it.trim().length <= 44 } && lines.count { it.trim().isNotEmpty() } >= 2
+    }
+
+    private suspend fun translatePreservingQuoteLines(
+        translator: com.google.mlkit.nl.translate.Translator,
+        rawText: String,
+        sourceLines: List<String>
+    ): String {
+        val effectiveLines = (if (sourceLines.isNotEmpty()) sourceLines else rawText.split('\n'))
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+
+        if (effectiveLines.size <= 1) {
+            val (prefix, body) = splitPrefixForTranslation(rawText)
+            if (body.isBlank()) return rawText.trim()
+            val out = translator.translate(body).awaitTask().trim()
+            return if (prefix.isNotEmpty()) "$prefix${out.ifBlank { body }}" else out
+        }
+
+        if (shouldTranslateLineByLine(effectiveLines)) {
+            val outLines = effectiveLines.map { line ->
+                val (prefix, body) = splitPrefixForTranslation(line)
+                if (body.isBlank()) {
+                    line
+                } else {
+                    val out = translator.translate(body).awaitTask().trim()
+                    if (prefix.isNotEmpty()) "$prefix${out.ifBlank { body }}" else out
+                }
+            }
+            return outLines.joinToString("\n")
+        }
+
+        val joined = joinLinesIntelligently(effectiveLines)
+        val (prefix, body) = splitPrefixForTranslation(joined)
+        if (body.isBlank()) return joined
+        val out = translator.translate(body).awaitTask().trim()
+        return if (prefix.isNotEmpty()) "$prefix${out.ifBlank { body }}" else out
+    }
+
     private fun joinLinesIntelligently(lines: List<String>): String {
         if (lines.isEmpty()) return ""
+        if (shouldTranslateLineByLine(lines)) {
+            return lines.joinToString("\n") { it.trim() }
+        }
         val sb = StringBuilder()
         for (i in lines.indices) {
             val part = lines[i]
