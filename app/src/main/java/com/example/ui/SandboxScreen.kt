@@ -66,13 +66,11 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.platform.testTag
-import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.view.drawToBitmap
-import com.example.R
 import com.example.data.EdgeAnchor
 import com.example.data.GestureZoneConfig
 import com.example.data.TriggerMode
@@ -199,46 +197,7 @@ fun SandboxScreen(
                         modifier = Modifier.fillMaxSize()
                     )
                 } else {
-                    Column(
-                        modifier = Modifier.fillMaxSize(),
-                        verticalArrangement = Arrangement.SpaceBetween
-                    ) {
-                        Image(
-                            painter = painterResource(id = R.drawable.img_sandbox_cafe),
-                            contentDescription = "Tokyo street cafe menu board and camera scene",
-                            contentScale = ContentScale.Crop,
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .weight(1f)
-                        )
-                        Column(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .background(Color(0xFF14141A))
-                                .padding(14.dp),
-                            verticalArrangement = Arrangement.spacedBy(6.dp)
-                        ) {
-                            Text(
-                                text = "KYOTO ROASTERY · 東京喫茶店",
-                                fontFamily = SpaceGroteskFamily,
-                                fontWeight = FontWeight.Bold,
-                                fontSize = 16.sp,
-                                color = Color.White
-                            )
-                            Text(
-                                text = "本日のハンドドリップ珈琲 ¥680 · Café au lait glacé 5,50 €",
-                                fontFamily = InterFamily,
-                                fontSize = 13.5.sp,
-                                color = Color(0xFFD1D5DB)
-                            )
-                            Text(
-                                text = "Circle the Japanese board, the camera, or any text above to test OCR, translation, and Google Lens lookup.",
-                                fontFamily = InterFamily,
-                                fontSize = 12.sp,
-                                color = Color(0xFF9CA3AF)
-                            )
-                        }
-                    }
+                    MultiScriptTestBoard(modifier = Modifier.fillMaxSize())
                 }
             }
 

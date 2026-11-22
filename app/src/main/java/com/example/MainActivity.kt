@@ -46,6 +46,10 @@ fun QuickCircleApp(
     val isAccessibilityEnabled by viewModel.isAccessibilityEnabled.collectAsStateWithLifecycle()
     val packStatuses by viewModel.packStatuses.collectAsStateWithLifecycle()
     val packErrors by viewModel.packErrors.collectAsStateWithLifecycle()
+    val mlKitOcrStatuses by viewModel.mlKitOcrStatuses.collectAsStateWithLifecycle()
+    val mlKitOcrErrors by viewModel.mlKitOcrErrors.collectAsStateWithLifecycle()
+    val tessOcrStatuses by viewModel.tessOcrStatuses.collectAsStateWithLifecycle()
+    val tessOcrErrors by viewModel.tessOcrErrors.collectAsStateWithLifecycle()
     val lifecycleOwner = LocalLifecycleOwner.current
 
     DisposableEffect(lifecycleOwner) {
@@ -70,6 +74,10 @@ fun QuickCircleApp(
                 isAccessibilityEnabled = isAccessibilityEnabled,
                 packStatuses = packStatuses,
                 packErrors = packErrors,
+                mlKitOcrStatuses = mlKitOcrStatuses,
+                mlKitOcrErrors = mlKitOcrErrors,
+                tessOcrStatuses = tessOcrStatuses,
+                tessOcrErrors = tessOcrErrors,
                 onOpenZoneEditor = { navController.navigate(ROUTE_ZONE_EDITOR) },
                 onOpenSandbox = { navController.navigate(ROUTE_SANDBOX) },
                 onToggleTriggerEnabled = viewModel::setTriggerEnabled,
@@ -77,7 +85,11 @@ fun QuickCircleApp(
                 onSelectTargetLanguage = viewModel::setTargetLanguage,
                 onSelectScriptMode = viewModel::setScriptMode,
                 onDownloadLanguagePack = viewModel::downloadLanguagePack,
-                onDeleteLanguagePack = viewModel::deleteLanguagePack
+                onDeleteLanguagePack = viewModel::deleteLanguagePack,
+                onDownloadMlKitOcrScript = viewModel::downloadMlKitOcrScript,
+                onPreloadAllMlKitOcrScripts = viewModel::preloadAllMlKitOcrScripts,
+                onDownloadTesseractOcrPack = viewModel::downloadTesseractOcrPack,
+                onDeleteTesseractOcrPack = viewModel::deleteTesseractOcrPack
             )
         }
 

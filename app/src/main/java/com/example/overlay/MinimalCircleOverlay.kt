@@ -103,6 +103,7 @@ import com.example.data.SupportedTargetLanguages
 import com.example.engine.InlineBlockStatus
 import com.example.engine.InlineScreenTranslationState
 import com.example.engine.InlineTextBlock
+import com.example.engine.MoEOcrRouter
 import com.example.engine.ModelPackStatus
 import com.example.engine.OcrAndLensEngine
 import com.example.engine.OcrRegionResult
@@ -183,7 +184,8 @@ fun MinimalCircleOverlay(
     // Pre-scan full screen text (words + visual blocks + color sampling) & refresh pack cache
     LaunchedEffect(screenshotBitmap, scriptMode) {
         OcrAndLensEngine.refreshDownloadedPacksAsync()
-        screenAnalysis = OcrAndLensEngine.analyzeFullScreen(screenshotBitmap, scriptMode)
+        MoEOcrRouter.refreshAllOcrPacksAsync(context)
+        screenAnalysis = OcrAndLensEngine.analyzeFullScreen(context, screenshotBitmap, scriptMode)
     }
 
     // Clear copied indicator quickly
@@ -323,6 +325,7 @@ fun MinimalCircleOverlay(
 
         scope.launch {
             val result = OcrAndLensEngine.extractRegionOcr(
+                context = context,
                 cropBitmap = crop,
                 cropRectInScreen = cropRect,
                 fullScreenLines = fullScreenLines,

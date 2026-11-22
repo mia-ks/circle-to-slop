@@ -19,11 +19,7 @@ import com.google.mlkit.nl.translate.TranslateLanguage
 import com.google.mlkit.nl.translate.TranslateRemoteModel
 import com.google.mlkit.nl.translate.Translation
 import com.google.mlkit.nl.translate.TranslatorOptions
-import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.Text
-import com.google.mlkit.vision.text.TextRecognition
-import com.google.mlkit.vision.text.japanese.JapaneseTextRecognizerOptions
-import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
@@ -126,14 +122,6 @@ sealed interface TranslationState {
 object OcrAndLensEngine {
     private const val TAG = "OcrAndLensEngine"
 
-    private val latinRecognizer by lazy {
-        TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
-    }
-
-    private val japaneseRecognizer by lazy {
-        TextRecognition.getClient(JapaneseTextRecognizerOptions.Builder().build())
-    }
-
     private val languageIdentifier by lazy {
         LanguageIdentification.getClient()
     }
@@ -152,11 +140,9 @@ object OcrAndLensEngine {
     fun prewarm(context: Context) {
         try {
             com.google.mlkit.common.sdkinternal.MlKitContext.initializeIfNeeded(context.applicationContext)
-            // Touch lazy instances to start native ML Kit initialization off the critical draw path
-            latinRecognizer
-            japaneseRecognizer
             languageIdentifier
             refreshDownloadedPacksAsync()
+            MoEOcrRouter.prewarm(context.applicationContext)
         } catch (e: Exception) {
             Log.w(TAG, "ML Kit prewarm skipped: ${e.message}")
         }
@@ -272,22 +258,19 @@ object OcrAndLensEngine {
     }
 
     suspend fun recognizeFullScreenLines(
+        context: Context,
         bitmap: Bitmap,
         scriptMode: OcrScriptMode
-    ): List<RecognizedTextLine> = analyzeFullScreen(bitmap, scriptMode).lines
+    ): List<RecognizedTextLine> = analyzeFullScreen(context, bitmap, scriptMode).lines
 
     suspend fun analyzeFullScreen(
+        context: Context,
         bitmap: Bitmap,
         scriptMode: OcrScriptMode
     ): ScreenOcrAnalysis = withContext(Dispatchers.Default) {
         try {
-            val image = InputImage.fromBitmap(bitmap, 0)
-            val recognizer = when (scriptMode) {
-                OcrScriptMode.LATIN -> latinRecognizer
-                OcrScriptMode.JAPANESE_AND_LATIN -> japaneseRecognizer
-            }
-            val result = recognizer.process(image).awaitTask()
-            buildScreenAnalysis(bitmap, result)
+            val candidates = MoEOcrRouter.recognizeWithMoE(context, bitmap, scriptMode)
+            buildScreenAnalysisFromCandidates(bitmap, candidates)
         } catch (e: Exception) {
             Log.e(TAG, "Full-screen OCR analysis failed", e)
             ScreenOcrAnalysis()
@@ -470,12 +453,13 @@ object OcrAndLensEngine {
     }
 
     suspend fun extractRegionOcr(
+        context: Context,
         cropBitmap: Bitmap,
         cropRectInScreen: Rect,
         fullScreenLines: List<RecognizedTextLine>,
         scriptMode: OcrScriptMode
     ): OcrRegionResult = withContext(Dispatchers.Default) {
-        // 1. Run high-precision OCR directly on the cropped bitmap (upscale small crops for crispness)
+        // 1. Run high-precision MoE OCR directly on the cropped bitmap (upscale small crops for crispness)
         val workingBitmap = if (cropBitmap.width < 540 || cropBitmap.height < 220) {
             val scale = 2.0f
             Bitmap.createScaledBitmap(
@@ -489,12 +473,7 @@ object OcrAndLensEngine {
         }
 
         val directTextLines = try {
-            val recognizer = when (scriptMode) {
-                OcrScriptMode.LATIN -> latinRecognizer
-                OcrScriptMode.JAPANESE_AND_LATIN -> japaneseRecognizer
-            }
-            val visionText = recognizer.process(InputImage.fromBitmap(workingBitmap, 0)).awaitTask()
-            extractLinesFromMlKitResult(visionText).map { it.text }
+            MoEOcrRouter.recognizeWithMoE(context, workingBitmap, scriptMode).map { it.text }
         } catch (e: Exception) {
             Log.e(TAG, "Cropped OCR failed", e)
             emptyList()
@@ -830,41 +809,44 @@ object OcrAndLensEngine {
                 .ifBlank { clean.uppercase(Locale.ROOT) }
     }
 
-    private suspend fun buildScreenAnalysis(
+    private suspend fun buildScreenAnalysisFromCandidates(
         bitmap: Bitmap,
-        visionText: Text
+        candidates: List<CandidateOcrLine>
     ): ScreenOcrAnalysis {
-        val rawLineEntries = mutableListOf<Pair<Text.Line, Rect>>()
-        // First split ML Kit textBlocks into cohesive visual sub-blocks so paragraphs stay unified
-        // while separate buttons/labels stay isolated
-        val visualGroups = mutableListOf<List<Text.Line>>()
-        for (block in visionText.textBlocks) {
-            val blockLines = block.lines.filter { it.boundingBox != null && it.text.isNotBlank() }
-            if (blockLines.isEmpty()) continue
-            var currentGroup = mutableListOf<Text.Line>()
-            for (line in blockLines) {
-                val rect = line.boundingBox ?: continue
-                if (currentGroup.isEmpty()) {
+        if (candidates.isEmpty()) return ScreenOcrAnalysis()
+
+        // Split fused reading-order lines into cohesive visual groups so paragraphs translate
+        // as full sentences while separate buttons/cards stay isolated.
+        val visualGroups = mutableListOf<List<CandidateOcrLine>>()
+        var currentGroup = mutableListOf<CandidateOcrLine>()
+        for (line in candidates) {
+            val rect = line.boundingBox
+            if (currentGroup.isEmpty()) {
+                currentGroup.add(line)
+            } else {
+                val prevRect = currentGroup.last().boundingBox
+                val avgH = currentGroup.map { it.boundingBox.height() }.average().toFloat().coerceAtLeast(8f)
+                val curH = rect.height().toFloat().coerceAtLeast(8f)
+                val vGap = (rect.top - prevRect.bottom).toFloat()
+                val hOverlap = minOf(rect.right, prevRect.right) - maxOf(rect.left, prevRect.left)
+                val minWidth = minOf(rect.width(), prevRect.width()).coerceAtLeast(1)
+                val horizontallyAligned = hOverlap > -avgH * 1.5f && hOverlap.toFloat() / minWidth >= -0.25f
+                val sameExpert = currentGroup.last().expert == line.expert
+                val sizeRatio = curH / avgH
+                val sameParagraph = vGap in (-avgH * 0.35f)..(avgH * 0.95f) &&
+                    sizeRatio in 0.62f..1.6f &&
+                    horizontallyAligned &&
+                    sameExpert
+                if (sameParagraph) {
                     currentGroup.add(line)
                 } else {
-                    val prevRect = currentGroup.last().boundingBox ?: rect
-                    val avgH = currentGroup.mapNotNull { it.boundingBox?.height() }.average().toFloat().coerceAtLeast(8f)
-                    val curH = rect.height().toFloat().coerceAtLeast(8f)
-                    val vGap = rect.top - prevRect.bottom
-                    val sizeRatio = curH / avgH
-                    val sameRowOrCloseParagraph = vGap <= avgH * 0.95f && sizeRatio in 0.62f..1.6f
-                    if (sameRowOrCloseParagraph) {
-                        currentGroup.add(line)
-                    } else {
-                        visualGroups.add(currentGroup)
-                        currentGroup = mutableListOf(line)
-                    }
+                    visualGroups.add(currentGroup)
+                    currentGroup = mutableListOf(line)
                 }
-                rawLineEntries.add(line to rect)
             }
-            if (currentGroup.isNotEmpty()) {
-                visualGroups.add(currentGroup)
-            }
+        }
+        if (currentGroup.isNotEmpty()) {
+            visualGroups.add(currentGroup)
         }
 
         val linesOut = mutableListOf<RecognizedTextLine>()
@@ -879,34 +861,20 @@ object OcrAndLensEngine {
             var heightSum = 0f
             val joinedPieces = mutableListOf<String>()
 
-            for (mlLine in groupLines) {
-                val lineBox = mlLine.boundingBox ?: continue
+            for (candLine in groupLines) {
+                val lineBox = candLine.boundingBox
                 blockBounds.union(lineBox)
                 heightSum += lineBox.height().toFloat()
-                joinedPieces.add(mlLine.text.trim())
+                joinedPieces.add(candLine.text.trim())
 
                 val lineWords = mutableListOf<RecognizedTextWord>()
-                val elements = mlLine.elements.filter { it.boundingBox != null && it.text.isNotBlank() }
-                if (elements.isNotEmpty()) {
-                    for (el in elements) {
-                        val elBox = el.boundingBox ?: continue
-                        val word = RecognizedTextWord(
-                            globalIndex = nextWordIdx++,
-                            lineIndex = nextLineIdx,
-                            blockId = blockId,
-                            text = el.text,
-                            boundingBox = elBox
-                        )
-                        lineWords.add(word)
-                        wordsOut.add(word)
-                    }
-                } else {
+                for (w in candLine.words) {
                     val word = RecognizedTextWord(
                         globalIndex = nextWordIdx++,
                         lineIndex = nextLineIdx,
                         blockId = blockId,
-                        text = mlLine.text,
-                        boundingBox = lineBox
+                        text = w.text,
+                        boundingBox = w.boundingBox
                     )
                     lineWords.add(word)
                     wordsOut.add(word)
@@ -914,7 +882,7 @@ object OcrAndLensEngine {
 
                 linesOut.add(
                     RecognizedTextLine(
-                        text = mlLine.text,
+                        text = candLine.text,
                         boundingBox = lineBox,
                         lineIndex = nextLineIdx,
                         blockId = blockId,
@@ -925,7 +893,7 @@ object OcrAndLensEngine {
             }
 
             val blockText = joinLinesIntelligently(joinedPieces)
-            val langTag = if (blockText.length >= 4) detectLanguageCode(blockText) else null
+            val langTag = if (blockText.length >= 3) detectLanguageCode(blockText) else null
             val (bgArgb, fgArgb) = sampleBlockColors(bitmap, blockBounds)
             blocksOut.add(
                 InlineTextBlock(

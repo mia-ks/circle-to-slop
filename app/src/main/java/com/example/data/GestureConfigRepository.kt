@@ -74,7 +74,7 @@ class GestureConfigRepository(private val context: Context) {
 
         val scriptMode = prefs[Keys.SCRIPT_MODE]?.let { name ->
             OcrScriptMode.entries.firstOrNull { it.name == name }
-        } ?: OcrScriptMode.JAPANESE_AND_LATIN
+        } ?: OcrScriptMode.AUTO_MOE
 
         return GestureZoneConfig(
             anchor = anchor,

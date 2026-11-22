@@ -67,19 +67,18 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
-import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
-import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.example.R
 import com.example.data.EdgeAnchor
 import com.example.data.GestureZoneConfig
 import com.example.data.OcrScriptMode
+import com.example.data.SupportedMlKitDynamicScripts
 import com.example.data.SupportedTargetLanguages
+import com.example.data.SupportedTesseractOcrPacks
 import com.example.engine.ModelPackStatus
 import com.example.ui.theme.AmberWarn
 import com.example.ui.theme.CoralError
@@ -95,6 +94,10 @@ fun DashboardScreen(
     isAccessibilityEnabled: Boolean,
     packStatuses: Map<String, ModelPackStatus>,
     packErrors: Map<String, String>,
+    mlKitOcrStatuses: Map<String, ModelPackStatus>,
+    mlKitOcrErrors: Map<String, String>,
+    tessOcrStatuses: Map<String, ModelPackStatus>,
+    tessOcrErrors: Map<String, String>,
     onOpenZoneEditor: () -> Unit,
     onOpenSandbox: () -> Unit,
     onToggleTriggerEnabled: (Boolean) -> Unit,
@@ -102,10 +105,15 @@ fun DashboardScreen(
     onSelectTargetLanguage: (String) -> Unit,
     onSelectScriptMode: (OcrScriptMode) -> Unit,
     onDownloadLanguagePack: (String) -> Unit,
-    onDeleteLanguagePack: (String) -> Unit
+    onDeleteLanguagePack: (String) -> Unit,
+    onDownloadMlKitOcrScript: (String) -> Unit,
+    onPreloadAllMlKitOcrScripts: () -> Unit,
+    onDownloadTesseractOcrPack: (String) -> Unit,
+    onDeleteTesseractOcrPack: (String) -> Unit
 ) {
     val context = LocalContext.current
     var showPackManager by remember { mutableStateOf(false) }
+    var showOcrPackManager by remember { mutableStateOf(false) }
 
     Scaffold(
         containerColor = MaterialTheme.colorScheme.background
@@ -186,19 +194,14 @@ fun DashboardScreen(
                                 .fillMaxWidth()
                                 .height(152.dp)
                         ) {
-                            Image(
-                                painter = painterResource(id = R.drawable.img_sandbox_cafe),
-                                contentDescription = "Sample Tokyo cafe sign for instant OCR and translation test",
-                                contentScale = ContentScale.Crop,
-                                modifier = Modifier.fillMaxSize()
-                            )
+                            CompactMultiScriptPreview(modifier = Modifier.fillMaxSize())
                             Box(
                                 modifier = Modifier
                                     .fillMaxSize()
                                     .background(
                                         Brush.verticalGradient(
                                             colors = listOf(
-                                                Color(0x44000000),
+                                                Color(0x22000000),
                                                 Color(0xDD0B0B0E)
                                             )
                                         )
@@ -852,14 +855,16 @@ fun DashboardScreen(
                             }
                         }
 
-                        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                             Text(
-                                text = "ON-DEVICE OCR ENGINE",
+                                text = "ON-DEVICE OCR ENGINE (MOE)",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
                             Row(
-                                modifier = Modifier.fillMaxWidth(),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .horizontalScroll(rememberScrollState()),
                                 horizontalArrangement = Arrangement.spacedBy(8.dp)
                             ) {
                                 OcrScriptMode.entries.forEach { mode ->
@@ -872,26 +877,262 @@ fun DashboardScreen(
                                             MaterialTheme.colorScheme.surfaceVariant
                                         },
                                         modifier = Modifier
-                                            .weight(1f)
-                                            .heightIn(min = 44.dp)
+                                            .heightIn(min = 48.dp)
                                             .clickable { onSelectScriptMode(mode) }
                                             .testTag("script_mode_${mode.name}")
                                     ) {
                                         Box(
                                             contentAlignment = Alignment.Center,
-                                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 10.dp)
+                                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp)
                                         ) {
                                             Text(
                                                 text = mode.label,
                                                 fontFamily = SpaceGroteskFamily,
                                                 fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
-                                                fontSize = 13.sp,
+                                                fontSize = 12.5.sp,
                                                 color = if (selected) {
                                                     MaterialTheme.colorScheme.onPrimary
                                                 } else {
                                                     MaterialTheme.colorScheme.onSurfaceVariant
-                                                }
+                                                },
+                                                maxLines = 1
                                             )
+                                        }
+                                    }
+                                }
+                            }
+
+                            val readyMlKitCount = SupportedMlKitDynamicScripts.count {
+                                mlKitOcrStatuses[it.code] == ModelPackStatus.DOWNLOADED
+                            }
+                            val readyTessCount = SupportedTesseractOcrPacks.count {
+                                tessOcrStatuses[it.code] == ModelPackStatus.DOWNLOADED
+                            }
+
+                            Surface(
+                                shape = RoundedCornerShape(12.dp),
+                                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f),
+                                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Column(
+                                    modifier = Modifier.padding(12.dp),
+                                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .heightIn(min = 48.dp)
+                                            .clip(RoundedCornerShape(10.dp))
+                                            .clickable { showOcrPackManager = !showOcrPackManager }
+                                            .padding(horizontal = 4.dp, vertical = 4.dp)
+                                            .testTag("toggle_ocr_pack_manager_button"),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Column(modifier = Modifier.weight(1f)) {
+                                            Text(
+                                                text = "Dynamic OCR Script Experts",
+                                                fontFamily = SpaceGroteskFamily,
+                                                fontWeight = FontWeight.Medium,
+                                                fontSize = 13.sp,
+                                                color = MaterialTheme.colorScheme.onSurface
+                                            )
+                                            Text(
+                                                text = "$readyMlKitCount/${SupportedMlKitDynamicScripts.size} ML Kit · $readyTessCount Arabic/Cyrillic/Extra active",
+                                                fontFamily = JetBrainsMonoFamily,
+                                                fontSize = 10.5.sp,
+                                                color = ElectricCyan
+                                            )
+                                        }
+                                        Icon(
+                                            imageVector = if (showOcrPackManager) Icons.Rounded.ExpandLess else Icons.Rounded.ExpandMore,
+                                            contentDescription = null,
+                                            tint = ElectricCyan
+                                        )
+                                    }
+
+                                    AnimatedVisibility(visible = showOcrPackManager) {
+                                        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                            Row(
+                                                modifier = Modifier.fillMaxWidth(),
+                                                horizontalArrangement = Arrangement.SpaceBetween,
+                                                verticalAlignment = Alignment.CenterVertically
+                                            ) {
+                                                Text(
+                                                    text = "ML KIT PLAY SERVICES EXPERTS (0 MB IN APK)",
+                                                    fontFamily = JetBrainsMonoFamily,
+                                                    fontSize = 10.sp,
+                                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                    modifier = Modifier.weight(1f)
+                                                )
+                                                OutlinedButton(
+                                                    onClick = onPreloadAllMlKitOcrScripts,
+                                                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                                                    modifier = Modifier
+                                                        .heightIn(min = 48.dp)
+                                                        .testTag("preload_mlkit_ocr_button")
+                                                ) {
+                                                    Text("Preload All", fontSize = 11.5.sp)
+                                                }
+                                            }
+
+                                            SupportedMlKitDynamicScripts.forEach { script ->
+                                                val st = mlKitOcrStatuses[script.code] ?: ModelPackStatus.NOT_DOWNLOADED
+                                                Row(
+                                                    modifier = Modifier
+                                                        .fillMaxWidth()
+                                                        .heightIn(min = 48.dp)
+                                                        .clip(RoundedCornerShape(10.dp))
+                                                        .background(MaterialTheme.colorScheme.surface)
+                                                        .padding(horizontal = 10.dp, vertical = 6.dp),
+                                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                                    verticalAlignment = Alignment.CenterVertically
+                                                ) {
+                                                    Column(modifier = Modifier.weight(1f)) {
+                                                        Text(
+                                                            text = script.label,
+                                                            fontFamily = InterFamily,
+                                                            fontWeight = FontWeight.Medium,
+                                                            fontSize = 12.5.sp,
+                                                            color = MaterialTheme.colorScheme.onSurface
+                                                        )
+                                                        Text(
+                                                            text = when (st) {
+                                                                ModelPackStatus.DOWNLOADED -> "Ready via Play Services"
+                                                                ModelPackStatus.DOWNLOADING -> "Installing module…"
+                                                                ModelPackStatus.ERROR -> mlKitOcrErrors[script.code] ?: "Play Services install error"
+                                                                ModelPackStatus.NOT_DOWNLOADED -> "On-demand (${script.sizeHint})"
+                                                            },
+                                                            fontFamily = JetBrainsMonoFamily,
+                                                            fontSize = 10.sp,
+                                                            color = when (st) {
+                                                                ModelPackStatus.DOWNLOADED -> EmeraldActive
+                                                                ModelPackStatus.DOWNLOADING -> ElectricCyan
+                                                                ModelPackStatus.ERROR -> CoralError
+                                                                ModelPackStatus.NOT_DOWNLOADED -> MaterialTheme.colorScheme.onSurfaceVariant
+                                                            },
+                                                            maxLines = 1,
+                                                            overflow = TextOverflow.Ellipsis
+                                                        )
+                                                    }
+                                                    when (st) {
+                                                        ModelPackStatus.DOWNLOADED -> {
+                                                            Icon(
+                                                                imageVector = Icons.Rounded.CheckCircle,
+                                                                contentDescription = "Ready",
+                                                                tint = EmeraldActive,
+                                                                modifier = Modifier.size(20.dp)
+                                                            )
+                                                        }
+                                                        ModelPackStatus.DOWNLOADING -> {
+                                                            CircularProgressIndicator(
+                                                                color = ElectricCyan,
+                                                                strokeWidth = 2.dp,
+                                                                modifier = Modifier.size(18.dp)
+                                                            )
+                                                        }
+                                                        ModelPackStatus.NOT_DOWNLOADED, ModelPackStatus.ERROR -> {
+                                                            OutlinedButton(
+                                                                onClick = { onDownloadMlKitOcrScript(script.code) },
+                                                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                                                                modifier = Modifier
+                                                                    .heightIn(min = 48.dp)
+                                                                    .testTag("mlkit_ocr_get_${script.code}")
+                                                            ) {
+                                                                Text(
+                                                                    text = if (st == ModelPackStatus.ERROR) "Retry" else "Get",
+                                                                    fontSize = 11.5.sp
+                                                                )
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+
+                                            Text(
+                                                text = "ARABIC · CYRILLIC · EXTRA SCRIPTS (TESSERACT)",
+                                                fontFamily = JetBrainsMonoFamily,
+                                                fontSize = 10.sp,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                modifier = Modifier.padding(top = 4.dp)
+                                            )
+
+                                            SupportedTesseractOcrPacks.forEach { pack ->
+                                                val st = tessOcrStatuses[pack.code] ?: ModelPackStatus.NOT_DOWNLOADED
+                                                Row(
+                                                    modifier = Modifier
+                                                        .fillMaxWidth()
+                                                        .heightIn(min = 48.dp)
+                                                        .clip(RoundedCornerShape(10.dp))
+                                                        .background(MaterialTheme.colorScheme.surface)
+                                                        .padding(horizontal = 10.dp, vertical = 6.dp),
+                                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                                    verticalAlignment = Alignment.CenterVertically
+                                                ) {
+                                                    Column(modifier = Modifier.weight(1f)) {
+                                                        Text(
+                                                            text = "${pack.label} (${pack.shortCode})",
+                                                            fontFamily = InterFamily,
+                                                            fontWeight = FontWeight.Medium,
+                                                            fontSize = 12.5.sp,
+                                                            color = MaterialTheme.colorScheme.onSurface
+                                                        )
+                                                        Text(
+                                                            text = when (st) {
+                                                                ModelPackStatus.DOWNLOADED -> "Active in Auto MoE (${pack.sizeHint})"
+                                                                ModelPackStatus.DOWNLOADING -> "Downloading ${pack.sizeHint}…"
+                                                                ModelPackStatus.ERROR -> tessOcrErrors[pack.code] ?: "Download failed"
+                                                                ModelPackStatus.NOT_DOWNLOADED -> "Download (${pack.sizeHint})"
+                                                            },
+                                                            fontFamily = JetBrainsMonoFamily,
+                                                            fontSize = 10.sp,
+                                                            color = when (st) {
+                                                                ModelPackStatus.DOWNLOADED -> EmeraldActive
+                                                                ModelPackStatus.DOWNLOADING -> ElectricCyan
+                                                                ModelPackStatus.ERROR -> CoralError
+                                                                ModelPackStatus.NOT_DOWNLOADED -> MaterialTheme.colorScheme.onSurfaceVariant
+                                                            },
+                                                            maxLines = 1,
+                                                            overflow = TextOverflow.Ellipsis
+                                                        )
+                                                    }
+                                                    when (st) {
+                                                        ModelPackStatus.DOWNLOADED -> {
+                                                            OutlinedButton(
+                                                                onClick = { onDeleteTesseractOcrPack(pack.code) },
+                                                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                                                                modifier = Modifier
+                                                                    .heightIn(min = 48.dp)
+                                                                    .testTag("tess_ocr_delete_${pack.code}")
+                                                            ) {
+                                                                Text("Remove", fontSize = 11.5.sp)
+                                                            }
+                                                        }
+                                                        ModelPackStatus.DOWNLOADING -> {
+                                                            CircularProgressIndicator(
+                                                                color = ElectricCyan,
+                                                                strokeWidth = 2.dp,
+                                                                modifier = Modifier.size(18.dp)
+                                                            )
+                                                        }
+                                                        ModelPackStatus.NOT_DOWNLOADED, ModelPackStatus.ERROR -> {
+                                                            OutlinedButton(
+                                                                onClick = { onDownloadTesseractOcrPack(pack.code) },
+                                                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                                                                modifier = Modifier
+                                                                    .heightIn(min = 48.dp)
+                                                                    .testTag("tess_ocr_get_${pack.code}")
+                                                            ) {
+                                                                Text(
+                                                                    text = if (st == ModelPackStatus.ERROR) "Retry" else "Get",
+                                                                    fontSize = 11.5.sp
+                                                                )
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                 }

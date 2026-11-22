@@ -11,7 +11,11 @@ import androidx.test.core.app.ApplicationProvider
 import com.example.data.EdgeAnchor
 import com.example.data.GestureZoneConfig
 import com.example.data.TriggerMode
+import com.example.engine.CandidateOcrLine
+import com.example.engine.CandidateOcrWord
+import com.example.engine.MoEOcrRouter
 import com.example.engine.OcrAndLensEngine
+import com.example.engine.OcrExpertKind
 import com.example.engine.RecognizedTextWord
 import com.example.overlay.TextSelectionRange
 import com.example.overlay.buildSelectedText
@@ -75,12 +79,72 @@ class ExampleRobolectricTest {
     }
 
     @Test
+    fun `moe ocr router fuses arabic cyrillic japanese and latin experts cleanly`() {
+        val arabicBox = Rect(20, 20, 300, 60)
+        val japaneseBox = Rect(20, 80, 300, 120)
+        val latinBox = Rect(20, 140, 300, 180)
+
+        val candidates = listOf(
+            // Latin ML Kit misreads Arabic glyphs with junk symbols
+            CandidateOcrLine(
+                expert = OcrExpertKind.MLKIT_LATIN,
+                text = "l|o *#",
+                boundingBox = arabicBox,
+                words = listOf(CandidateOcrWord("l|o", arabicBox)),
+                confidence = 70f
+            ),
+            // Tesseract Arabic nails the exact same region
+            CandidateOcrLine(
+                expert = OcrExpertKind.TESSERACT,
+                text = "مطار دبي الدولي",
+                boundingBox = arabicBox,
+                words = listOf(CandidateOcrWord("مطار", arabicBox)),
+                confidence = 88f
+            ),
+            // ML Kit Japanese wins over Latin on Japanese box
+            CandidateOcrLine(
+                expert = OcrExpertKind.MLKIT_JAPANESE,
+                text = "東京駅",
+                boundingBox = japaneseBox,
+                words = listOf(CandidateOcrWord("東京駅", japaneseBox)),
+                confidence = 92f
+            ),
+            // ML Kit Latin wins over Tesseract on clean English text
+            CandidateOcrLine(
+                expert = OcrExpertKind.TESSERACT,
+                text = "Boarding Gate B14",
+                boundingBox = latinBox,
+                words = listOf(CandidateOcrWord("Boarding", latinBox)),
+                confidence = 82f
+            ),
+            CandidateOcrLine(
+                expert = OcrExpertKind.MLKIT_LATIN,
+                text = "Boarding Gate B14",
+                boundingBox = latinBox,
+                words = listOf(CandidateOcrWord("Boarding", latinBox)),
+                confidence = 95f
+            )
+        )
+
+        val fused = MoEOcrRouter.fuseMoECandidates(candidates)
+        assertEquals(3, fused.size)
+        assertEquals(OcrExpertKind.TESSERACT, fused[0].expert)
+        assertEquals("مطار دبي الدولي", fused[0].text)
+        assertEquals(OcrExpertKind.MLKIT_JAPANESE, fused[1].expert)
+        assertEquals(OcrExpertKind.MLKIT_LATIN, fused[2].expert)
+    }
+
+    @Test
     fun `dashboard shows offline pack status and navigates to zone editor and sandbox`() {
         composeRule.onNodeWithTag("launch_sandbox_button").performScrollTo().assertIsDisplayed()
         composeRule.onNodeWithTag("open_zone_editor_button").performScrollTo().assertIsDisplayed()
         composeRule.onNodeWithTag("offline_pack_status_card").performScrollTo().assertIsDisplayed()
         composeRule.onNodeWithTag("toggle_pack_manager_button").performScrollTo().performClick()
         composeRule.onNodeWithTag("pack_download_ja").performScrollTo().assertIsDisplayed()
+
+        composeRule.onNodeWithTag("toggle_ocr_pack_manager_button").performScrollTo().performClick()
+        composeRule.onNodeWithTag("tess_ocr_get_ara").performScrollTo().assertIsDisplayed()
+        composeRule.onNodeWithTag("tess_ocr_get_rus").performScrollTo().assertIsDisplayed()
 
         composeRule.onNodeWithTag("open_zone_editor_button").performScrollTo().performClick()
         composeRule.onNodeWithTag("zone_editor_viewport").assertIsDisplayed()

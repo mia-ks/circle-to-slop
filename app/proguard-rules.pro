@@ -12,10 +12,9 @@
 #   public *;
 #}
 
-# Uncomment this to preserve the line number information for
-# debugging stack traces.
-#-keepattributes SourceFile,LineNumberTable
-
-# If you keep the line number information, uncomment this to
-# hide the original source file name.
-#-renamesourcefileattribute SourceFile
+# Keep JNI / reflection signatures for Tesseract4Android and ML Kit under R8 full mode
+-keep class com.googlecode.tesseract.android.** { *; }
+-keep class com.googlecode.leptonica.android.** { *; }
+-keep class com.google.mlkit.** { *; }
+-keepclassmembers class com.google.android.gms.** { *; }
+-dontwarn org.slf4j.**

@@ -8,6 +8,7 @@ import com.example.data.GestureConfigRepository
 import com.example.data.GestureZoneConfig
 import com.example.data.OcrScriptMode
 import com.example.data.TriggerMode
+import com.example.engine.MoEOcrRouter
 import com.example.engine.ModelPackStatus
 import com.example.engine.OcrAndLensEngine
 import com.example.service.QuickCircleAccessibilityService
@@ -47,6 +48,10 @@ class QuickCircleViewModel(application: Application) : AndroidViewModel(applicat
 
     val packStatuses: StateFlow<Map<String, ModelPackStatus>> = OcrAndLensEngine.packStatusFlow
     val packErrors: StateFlow<Map<String, String>> = OcrAndLensEngine.packErrorFlow
+    val mlKitOcrStatuses: StateFlow<Map<String, ModelPackStatus>> = MoEOcrRouter.mlKitOcrStatusFlow
+    val mlKitOcrErrors: StateFlow<Map<String, String>> = MoEOcrRouter.mlKitOcrErrorFlow
+    val tessOcrStatuses: StateFlow<Map<String, ModelPackStatus>> = MoEOcrRouter.tessOcrStatusFlow
+    val tessOcrErrors: StateFlow<Map<String, String>> = MoEOcrRouter.tessOcrErrorFlow
 
     init {
         viewModelScope.launch(Dispatchers.Default) {
@@ -58,6 +63,7 @@ class QuickCircleViewModel(application: Application) : AndroidViewModel(applicat
         _systemCheckFlag.value =
             QuickCircleAccessibilityService.isAccessibilityEnabled(getApplication())
         OcrAndLensEngine.refreshDownloadedPacksAsync()
+        MoEOcrRouter.refreshAllOcrPacksAsync(getApplication())
     }
 
     fun downloadLanguagePack(code: String) {
@@ -66,6 +72,22 @@ class QuickCircleViewModel(application: Application) : AndroidViewModel(applicat
 
     fun deleteLanguagePack(code: String) {
         OcrAndLensEngine.deleteLanguagePack(code)
+    }
+
+    fun downloadMlKitOcrScript(code: String) {
+        MoEOcrRouter.startMlKitScriptDownload(getApplication(), code)
+    }
+
+    fun preloadAllMlKitOcrScripts() {
+        MoEOcrRouter.preloadAllMlKitScripts(getApplication())
+    }
+
+    fun downloadTesseractOcrPack(code: String) {
+        MoEOcrRouter.startTesseractPackDownload(getApplication(), code)
+    }
+
+    fun deleteTesseractOcrPack(code: String) {
+        MoEOcrRouter.deleteTesseractPack(getApplication(), code)
     }
 
     fun setAnchor(anchor: EdgeAnchor) {

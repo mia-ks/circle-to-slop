@@ -39,8 +39,12 @@ android {
 
   buildTypes {
     release {
-      isCrunchPngs = false
-      isMinifyEnabled = false
+      isCrunchPngs = true
+      isMinifyEnabled = true
+      isShrinkResources = true
+      ndk {
+        abiFilters += "arm64-v8a"
+      }
       proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
       // Do not remove or modify this signingConfig assignment. It is necessary for Android apps in
       // AI Studio.
@@ -121,8 +125,12 @@ dependencies {
   // implementation(libs.okhttp)
   // implementation(libs.play.services.location)
   // implementation(libs.retrofit)
-  implementation(libs.mlkit.text.recognition)
-  implementation(libs.mlkit.text.recognition.japanese)
+  implementation(libs.play.services.mlkit.text.recognition)
+  implementation(libs.play.services.mlkit.text.recognition.chinese)
+  implementation(libs.play.services.mlkit.text.recognition.japanese)
+  implementation(libs.play.services.mlkit.text.recognition.korean)
+  implementation(libs.play.services.mlkit.text.recognition.devanagari)
+  implementation(libs.tesseract4android)
   implementation(libs.mlkit.language.id)
   implementation(libs.mlkit.translate)
   testImplementation(libs.androidx.compose.ui.test.junit4)
