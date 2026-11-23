@@ -4,6 +4,9 @@ on:
   push:
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build-release-apk:
     runs-on: ubuntu-latest
@@ -24,6 +27,12 @@ jobs:
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: 9.3.1
+
+      - name: Compute Monotonic Version Code
+        run: |
+          CI_VERSION_CODE=$(( ($(date -u +%s) - 1767225600) + 100000 ))
+          echo "CI_VERSION_CODE=$CI_VERSION_CODE" >> "$GITHUB_ENV"
+          echo "Computed monotonic versionCode: $CI_VERSION_CODE"
 
       - name: Prepare Release Signing Keystore
         env:
@@ -61,10 +70,48 @@ jobs:
           echo "KEYSTORE_PATH=$KS_PATH" >> "$GITHUB_ENV"
 
       - name: Build Signed Release APK
-        run: gradle :app:assembleRelease
+        run: gradle :app:assembleRelease --no-configuration-cache
 
-      - name: Upload QuickCircle Release APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: QuickCircle-release-apk
-          path: app/build/outputs/apk/release/app-release.apk
+      - name: Verify Signed Release APK
+        run: |
+          APK_PATH="app/build/outputs/apk/release/app-release.apk"
+          BUILD_TOOLS_DIR=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n 1)
+          "$BUILD_TOOLS_DIR/apksigner" verify --print-certs -v "$APK_PATH"
+          "$BUILD_TOOLS_DIR/aapt2" dump badging "$APK_PATH" | grep -E "package:|sdkVersion:|targetSdkVersion:"
+
+      - name: Publish Pure APK to GitHub Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: latest
+        run: |
+          APK_PATH="app/build/outputs/apk/release/app-release.apk"
+          VERSIONED_APK="QuickCircle-v1.1.${{ github.run_number }}.apk"
+          mkdir -p dist
+          cp "$APK_PATH" "dist/QuickCircle.apk"
+          cp "$APK_PATH" "dist/$VERSIONED_APK"
+
+          if gh release view "$TAG_NAME" >/dev/null 2>&1; then
+            OLD_VERSIONED=$(gh release view "$TAG_NAME" --json assets --jq '.assets[].name' | grep -E '^QuickCircle-v.*\.apk$' || true)
+            for OLD_ASSET in $OLD_VERSIONED; do
+              if [ "$OLD_ASSET" != "$VERSIONED_APK" ]; then
+                gh release delete-asset "$TAG_NAME" "$OLD_ASSET" --yes || true
+              fi
+            done
+            gh release upload "$TAG_NAME" "dist/QuickCircle.apk" "dist/$VERSIONED_APK" --clobber
+            gh release edit "$TAG_NAME" \
+              --title "QuickCircle v1.1.${{ github.run_number }}" \
+              --notes "Latest signed release APK (versionCode ${CI_VERSION_CODE}, signed consistently for in-place updates). Download QuickCircle.apk directly — no zip extraction needed." \
+              --latest
+          else
+            gh release create "$TAG_NAME" "dist/QuickCircle.apk" "dist/$VERSIONED_APK" \
+              --title "QuickCircle v1.1.${{ github.run_number }}" \
+              --notes "Latest signed release APK (versionCode ${CI_VERSION_CODE}, signed consistently for in-place updates). Download QuickCircle.apk directly — no zip extraction needed." \
+              --target "${{ github.sha }}" \
+              --latest
+          fi
+
+          {
+            echo "## QuickCircle v1.1.${{ github.run_number }} (versionCode ${CI_VERSION_CODE})"
+            echo "- Direct pure APK download: https://github.com/${{ github.repository }}/releases/download/${TAG_NAME}/QuickCircle.apk"
+            echo "- Versioned APK: https://github.com/${{ github.repository }}/releases/download/${TAG_NAME}/${VERSIONED_APK}"
+          } >> "$GITHUB_STEP_SUMMARY"

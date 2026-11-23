@@ -46,6 +46,8 @@ class QuickCircleViewModel(application: Application) : AndroidViewModel(applicat
         initialValue = QuickCircleAccessibilityService.isAccessibilityEnabled(application.applicationContext)
     )
 
+    val isLiveTranslateActive: StateFlow<Boolean> = QuickCircleAccessibilityService.isLiveTranslateActive
+
     val packStatuses: StateFlow<Map<String, ModelPackStatus>> = OcrAndLensEngine.packStatusFlow
     val packErrors: StateFlow<Map<String, String>> = OcrAndLensEngine.packErrorFlow
     val packProgress: StateFlow<Map<String, Float>> = OcrAndLensEngine.packProgressFlow
@@ -60,6 +62,10 @@ class QuickCircleViewModel(application: Application) : AndroidViewModel(applicat
         viewModelScope.launch(Dispatchers.Default) {
             OcrAndLensEngine.prewarmLatin(getApplication())
         }
+    }
+
+    fun toggleLiveTranslate(): Boolean {
+        return QuickCircleAccessibilityService.toggleLiveTranslate()
     }
 
     fun refreshAccessibilityStatus() {

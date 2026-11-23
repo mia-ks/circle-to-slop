@@ -44,6 +44,7 @@ fun QuickCircleApp(
     val navController = rememberNavController()
     val config by viewModel.config.collectAsStateWithLifecycle()
     val isAccessibilityEnabled by viewModel.isAccessibilityEnabled.collectAsStateWithLifecycle()
+    val isLiveTranslateActive by viewModel.isLiveTranslateActive.collectAsStateWithLifecycle()
     val packStatuses by viewModel.packStatuses.collectAsStateWithLifecycle()
     val packErrors by viewModel.packErrors.collectAsStateWithLifecycle()
     val packProgress by viewModel.packProgress.collectAsStateWithLifecycle()
@@ -75,6 +76,7 @@ fun QuickCircleApp(
             DashboardScreen(
                 config = config,
                 isAccessibilityEnabled = isAccessibilityEnabled,
+                isLiveTranslateActive = isLiveTranslateActive,
                 packStatuses = packStatuses,
                 packErrors = packErrors,
                 packProgress = packProgress,
@@ -86,6 +88,7 @@ fun QuickCircleApp(
                 tessOcrProgress = tessOcrProgress,
                 onOpenZoneEditor = { navController.navigate(ROUTE_ZONE_EDITOR) },
                 onOpenSandbox = { navController.navigate(ROUTE_SANDBOX) },
+                onToggleLiveTranslate = { viewModel.toggleLiveTranslate() },
                 onToggleTriggerEnabled = viewModel::setTriggerEnabled,
                 onToggleHaptic = viewModel::setHapticFeedback,
                 onSelectTargetLanguage = viewModel::setTargetLanguage,

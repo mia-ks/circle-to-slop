@@ -18,6 +18,7 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -347,6 +348,7 @@ fun MinimalCircleOverlay(
     onTargetLanguageChanged: (String) -> Unit,
     onDismiss: () -> Unit,
     onExternalActionLaunched: () -> Unit = {},
+    onStartLiveTranslate: (() -> Unit)? = null,
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
@@ -1310,7 +1312,8 @@ fun MinimalCircleOverlay(
                     ) {
                         onExternalActionLaunched()
                     }
-                }
+                },
+                onStartLiveTranslate = onStartLiveTranslate
             )
         }
 
@@ -1447,19 +1450,29 @@ private fun CompactLookupSheet(
                 .padding(horizontal = 16.dp, vertical = 12.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
-            // Drag/sheet indicator
-            Box(
-                modifier = Modifier
-                    .align(Alignment.CenterHorizontally)
-                    .width(36.dp)
-                    .height(4.dp)
-                    .clip(CircleShape)
-                    .background(Color(0xFF3A3A46))
-            )
-
-            // Bottom-right reachable utility controls (Reset / MoE / Translate)
+            // Bottom-right reachable utility controls (Reset / MoE / Translate) — swipe down on header to close selection
+            var headerDragDelta by remember { mutableStateOf(0f) }
+            val dismissThresholdPx = with(LocalDensity.current) { 44.dp.toPx() }
             Row(
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .pointerInput(Unit) {
+                        detectVerticalDragGestures(
+                            onDragStart = { headerDragDelta = 0f },
+                            onDragEnd = { headerDragDelta = 0f },
+                            onDragCancel = { headerDragDelta = 0f },
+                            onVerticalDrag = { change, dragAmount ->
+                                if (scrollState.value == 0 && dragAmount > 0f) {
+                                    headerDragDelta += dragAmount
+                                    if (headerDragDelta >= dismissThresholdPx) {
+                                        change.consume()
+                                        headerDragDelta = 0f
+                                        onResetSelection()
+                                    }
+                                }
+                            }
+                        )
+                    },
                 horizontalArrangement = Arrangement.End,
                 verticalAlignment = Alignment.CenterVertically
             ) {
@@ -2191,7 +2204,8 @@ private fun InlineTranslateBottomBar(
     onRetryInline: () -> Unit,
     onCopy: (label: String, value: String) -> Unit,
     onWebSearch: (String) -> Unit,
-    onOpenGoogleTranslate: (text: String, sourceHint: String?) -> Unit
+    onOpenGoogleTranslate: (text: String, sourceHint: String?) -> Unit,
+    onStartLiveTranslate: (() -> Unit)? = null
 ) {
     val translateLabel = if (hasGoogleTranslateApp) "Google Translate" else "Translate Web"
     val translatedCount = inlineTranslationState.blockStates.values.count {
@@ -2199,6 +2213,8 @@ private fun InlineTranslateBottomBar(
     }
     val accentColor = MaterialTheme.colorScheme.primary
     val onAccentColor = MaterialTheme.colorScheme.onPrimary
+    var barDragDelta by remember { mutableStateOf(0f) }
+    val barDismissThresholdPx = with(LocalDensity.current) { 44.dp.toPx() }
 
     Surface(
         color = Color(0xF2101014),
@@ -2217,7 +2233,25 @@ private fun InlineTranslateBottomBar(
             verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
             Row(
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .pointerInput(Unit) {
+                        detectVerticalDragGestures(
+                            onDragStart = { barDragDelta = 0f },
+                            onDragEnd = { barDragDelta = 0f },
+                            onDragCancel = { barDragDelta = 0f },
+                            onVerticalDrag = { change, dragAmount ->
+                                if (dragAmount > 0f) {
+                                    barDragDelta += dragAmount
+                                    if (barDragDelta >= barDismissThresholdPx) {
+                                        change.consume()
+                                        barDragDelta = 0f
+                                        onExitInlineMode()
+                                    }
+                                }
+                            }
+                        )
+                    },
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
@@ -2326,6 +2360,39 @@ private fun InlineTranslateBottomBar(
                                 fontWeight = FontWeight.Medium,
                                 fontSize = 12.sp
                             )
+                        }
+                    }
+
+                    if (onStartLiveTranslate != null) {
+                        Surface(
+                            color = EmeraldActive.copy(alpha = 0.16f),
+                            shape = RoundedCornerShape(999.dp),
+                            border = BorderStroke(1.dp, EmeraldActive.copy(alpha = 0.55f)),
+                            modifier = Modifier
+                                .heightIn(min = 48.dp)
+                                .clip(RoundedCornerShape(999.dp))
+                                .clickable { onStartLiveTranslate() }
+                                .testTag("inline_start_live_button")
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 11.dp, vertical = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(5.dp)
+                            ) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(6.dp)
+                                        .clip(CircleShape)
+                                        .background(EmeraldActive)
+                                )
+                                Text(
+                                    text = "Live",
+                                    color = EmeraldActive,
+                                    fontFamily = SpaceGroteskFamily,
+                                    fontWeight = FontWeight.SemiBold,
+                                    fontSize = 12.sp
+                                )
+                            }
                         }
                     }
 

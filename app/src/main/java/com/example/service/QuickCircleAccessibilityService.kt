@@ -12,12 +12,14 @@ import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.Rect
+import android.graphics.RectF
 import android.graphics.drawable.GradientDrawable
 import android.hardware.display.DisplayManager
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.PowerManager
+import android.os.SystemClock
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
@@ -35,21 +37,37 @@ import android.widget.FrameLayout
 import android.widget.Toast
 import android.window.OnBackInvokedCallback
 import android.window.OnBackInvokedDispatcher
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
 import androidx.compose.ui.platform.ComposeView
 import com.example.data.EdgeAnchor
 import com.example.data.GestureConfigRepository
 import com.example.data.GestureZoneConfig
+import com.example.data.OcrScriptMode
 import com.example.data.TriggerMode
+import com.example.engine.InlineScreenTranslationState
+import com.example.engine.InlineTextBlock
 import com.example.engine.OcrAndLensEngine
+import com.example.overlay.LIVE_FINGERPRINT_H
+import com.example.overlay.LIVE_FINGERPRINT_W
+import com.example.overlay.LiveTranslateHud
+import com.example.overlay.LiveTranslatedScreenLayer
 import com.example.overlay.MinimalCircleOverlay
+import com.example.overlay.computeFingerprintDiffFraction
+import com.example.overlay.createScreenFingerprint
+import com.example.overlay.filterBlocksExcludingRects
 import com.example.ui.theme.QuickCircleTheme
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlin.math.hypot
 import kotlin.math.roundToInt
@@ -99,11 +117,37 @@ class QuickCircleAccessibilityService : AccessibilityService() {
     private var isCapturing = false
     private var isScreenReceiverRegistered = false
 
+    // Experimental Live Translate windows and state
+    private var liveTranslationContainer: FrameLayout? = null
+    private var liveTranslationLifecycleOwner: OverlayLifecycleOwner? = null
+    private var liveHudContainer: FrameLayout? = null
+    private var liveHudLifecycleOwner: OverlayLifecycleOwner? = null
+    private var liveHudParams: WindowManager.LayoutParams? = null
+    private var liveHudX = 0f
+    private var liveHudY = 0f
+
+    private val liveBlocksFlow = MutableStateFlow<List<InlineTextBlock>>(emptyList())
+    private val liveInlineStateFlow = MutableStateFlow(InlineScreenTranslationState())
+    private val liveBitmapSizeFlow = MutableStateFlow(0 to 0)
+    private val livePausedFlow = MutableStateFlow(false)
+    private val liveScanningFlow = MutableStateFlow(false)
+    private val liveScrollSettlingFlow = MutableStateFlow(false)
+
+    private var liveHeartbeatJob: Job? = null
+    private var liveProcessJob: Job? = null
+    private var liveCaptureInFlight = false
+    private var lastLiveFingerprint: IntArray? = null
+    private var lastLiveTargetLang: String? = null
+    private var lastLiveScreenSize: Pair<Int, Int>? = null
+    private var suppressLiveEventsUntilMs = 0L
+    private var liveDebouncedCaptureRunnable: Runnable? = null
+
     private val screenStateReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             when (intent?.action) {
                 Intent.ACTION_SCREEN_OFF -> {
                     dismissOverlay()
+                    stopLiveTranslateInternal()
                     updateTriggerWindowVisibility()
                 }
                 Intent.ACTION_SCREEN_ON, Intent.ACTION_USER_PRESENT -> {
@@ -143,15 +187,41 @@ class QuickCircleAccessibilityService : AccessibilityService() {
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         val type = event?.eventType ?: return
-        if (type == AccessibilityEvent.TYPE_WINDOWS_CHANGED ||
-            type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
-        ) {
-            updateTriggerWindowVisibility()
+        when (type) {
+            AccessibilityEvent.TYPE_WINDOWS_CHANGED,
+            AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED -> {
+                updateTriggerWindowVisibility()
+                if (_isLiveTranslateActive.value) {
+                    onLiveContentEvent(
+                        isScroll = false,
+                        eventPkg = event.packageName?.toString()
+                    )
+                }
+            }
+
+            AccessibilityEvent.TYPE_VIEW_SCROLLED -> {
+                if (_isLiveTranslateActive.value) {
+                    onLiveContentEvent(
+                        isScroll = true,
+                        eventPkg = event.packageName?.toString()
+                    )
+                }
+            }
+
+            AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED -> {
+                if (_isLiveTranslateActive.value) {
+                    onLiveContentEvent(
+                        isScroll = false,
+                        eventPkg = event.packageName?.toString()
+                    )
+                }
+            }
         }
     }
 
     override fun onInterrupt() {
         dismissOverlay()
+        stopLiveTranslateInternal()
     }
 
     override fun onUnbind(intent: Intent?): Boolean {
@@ -194,6 +264,7 @@ class QuickCircleAccessibilityService : AccessibilityService() {
             }
             isScreenReceiverRegistered = false
         }
+        stopLiveTranslateInternal()
         dismissOverlay()
         removeTriggerView()
         serviceScope.cancel()
@@ -581,6 +652,9 @@ class QuickCircleAccessibilityService : AccessibilityService() {
             ).show()
             return
         }
+        if (_isLiveTranslateActive.value) {
+            stopLiveTranslateInternal()
+        }
 
         isCapturing = true
         updateTriggerWindowVisibility()
@@ -680,7 +754,15 @@ class QuickCircleAccessibilityService : AccessibilityService() {
                             }
                         },
                         onDismiss = { dismissOverlay() },
-                        onExternalActionLaunched = { dismissOverlay() }
+                        onExternalActionLaunched = { dismissOverlay() },
+                        onStartLiveTranslate = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                            {
+                                dismissOverlay()
+                                mainHandler.postDelayed({ startLiveTranslateInternal() }, 90L)
+                            }
+                        } else {
+                            null
+                        }
                     )
                 }
             }
@@ -745,14 +827,517 @@ class QuickCircleAccessibilityService : AccessibilityService() {
         restoreTriggerVisibility()
     }
 
+    private fun startLiveTranslateInternal(): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+            Toast.makeText(
+                this,
+                "Live Translate requires Android 11+.",
+                Toast.LENGTH_SHORT
+            ).show()
+            return false
+        }
+        if (isDeviceLockedOrAod()) return false
+        if (_isLiveTranslateActive.value) return true
+
+        dismissOverlay()
+        OcrAndLensEngine.prewarmMoEOnInvoke(applicationContext, delayMs = 0L)
+
+        liveBlocksFlow.value = emptyList()
+        liveInlineStateFlow.value = InlineScreenTranslationState(targetLangCode = currentConfig.targetLanguageCode)
+        livePausedFlow.value = false
+        liveScanningFlow.value = false
+        liveScrollSettlingFlow.value = false
+        lastLiveFingerprint = null
+        lastLiveTargetLang = null
+        lastLiveScreenSize = null
+
+        attachLiveTranslationLayer()
+        attachLiveHudWindow()
+        _isLiveTranslateActive.value = true
+
+        liveHeartbeatJob?.cancel()
+        liveHeartbeatJob = serviceScope.launch {
+            delay(180L)
+            while (isActive && _isLiveTranslateActive.value) {
+                if (!livePausedFlow.value && !liveScrollSettlingFlow.value && !isDeviceLockedOrAod()) {
+                    scheduleLiveCapture(delayMs = 0L, forceRefresh = false)
+                }
+                delay(2200L)
+            }
+        }
+        scheduleLiveCapture(delayMs = 140L, forceRefresh = true)
+        return true
+    }
+
+    private fun stopLiveTranslateInternal() {
+        _isLiveTranslateActive.value = false
+        liveHeartbeatJob?.cancel()
+        liveHeartbeatJob = null
+        liveProcessJob?.cancel()
+        liveProcessJob = null
+        liveDebouncedCaptureRunnable?.let { mainHandler.removeCallbacks(it) }
+        liveDebouncedCaptureRunnable = null
+        liveCaptureInFlight = false
+        liveScanningFlow.value = false
+        liveScrollSettlingFlow.value = false
+        liveBlocksFlow.value = emptyList()
+        lastLiveFingerprint = null
+        detachLiveHudWindow()
+        detachLiveTranslationLayer()
+    }
+
+    private fun attachLiveTranslationLayer() {
+        if (liveTranslationContainer != null) return
+        val lifecycleOwner = OverlayLifecycleOwner()
+        liveTranslationLifecycleOwner = lifecycleOwner
+
+        val container = FrameLayout(this)
+        val composeView = ComposeView(this).apply {
+            setContent {
+                QuickCircleTheme(darkTheme = true) {
+                    val blocks by liveBlocksFlow.collectAsState()
+                    val trState by liveInlineStateFlow.collectAsState()
+                    val bmpSize by liveBitmapSizeFlow.collectAsState()
+                    val isPaused by livePausedFlow.collectAsState()
+                    val isSettling by liveScrollSettlingFlow.collectAsState()
+
+                    LiveTranslatedScreenLayer(
+                        blocks = blocks,
+                        translationState = trState,
+                        bitmapWidth = bmpSize.first,
+                        bitmapHeight = bmpSize.second,
+                        isPaused = isPaused,
+                        isScrollSettling = isSettling
+                    )
+                }
+            }
+        }
+
+        lifecycleOwner.attachToView(container)
+        container.addView(
+            composeView,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+            )
+        )
+
+        val layerParams = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                layoutInDisplayCutoutMode =
+                    WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+            }
+        }
+
+        liveTranslationContainer = container
+        try {
+            suppressLiveEventsUntilMs = SystemClock.uptimeMillis() + 260L
+            windowManager.addView(container, layerParams)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed adding Live Translate layer", e)
+            detachLiveTranslationLayer()
+        }
+    }
+
+    private fun detachLiveTranslationLayer() {
+        liveTranslationContainer?.let { container ->
+            if (container.parent != null) {
+                try {
+                    windowManager.removeViewImmediate(container)
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error removing Live Translate layer", e)
+                }
+            }
+        }
+        liveTranslationContainer = null
+        liveTranslationLifecycleOwner?.detach()
+        liveTranslationLifecycleOwner = null
+    }
+
+    private fun attachLiveHudWindow() {
+        if (liveHudContainer != null) return
+        val lifecycleOwner = OverlayLifecycleOwner()
+        liveHudLifecycleOwner = lifecycleOwner
+
+        val density = resources.displayMetrics.density
+        val screenW = resources.displayMetrics.widthPixels
+        val screenH = resources.displayMetrics.heightPixels
+
+        val hudWidthEstimate = (250f * density).roundToInt()
+        liveHudX = ((screenW - hudWidthEstimate) / 2f).coerceAtLeast(12f * density)
+        liveHudY = (44f * density).coerceAtMost((screenH - 96f * density).coerceAtLeast(0f))
+
+        val hudParams = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            x = liveHudX.roundToInt()
+            y = liveHudY.roundToInt()
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                layoutInDisplayCutoutMode =
+                    WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+            }
+        }
+        liveHudParams = hudParams
+
+        val container = FrameLayout(this)
+        val composeView = ComposeView(this).apply {
+            setContent {
+                QuickCircleTheme(darkTheme = true) {
+                    val isPaused by livePausedFlow.collectAsState()
+                    val isScanning by liveScanningFlow.collectAsState()
+                    val trState by liveInlineStateFlow.collectAsState()
+                    val packStatuses by OcrAndLensEngine.packStatusFlow.collectAsState()
+                    val cfg by repository.configFlow.collectAsState(initial = currentConfig)
+
+                    LiveTranslateHud(
+                        targetLangCode = cfg.targetLanguageCode,
+                        isPaused = isPaused,
+                        isScanning = isScanning,
+                        translationState = trState,
+                        packStatuses = packStatuses,
+                        onTogglePause = {
+                            val nextPaused = !livePausedFlow.value
+                            livePausedFlow.value = nextPaused
+                            suppressLiveEventsUntilMs = SystemClock.uptimeMillis() + 260L
+                            liveTranslationContainer?.visibility =
+                                if (nextPaused) View.GONE else View.VISIBLE
+                            if (!nextPaused) {
+                                scheduleLiveCapture(delayMs = 90L, forceRefresh = true)
+                            }
+                        },
+                        onSelectTargetLanguage = { code ->
+                            suppressLiveEventsUntilMs = SystemClock.uptimeMillis() + 260L
+                            serviceScope.launch {
+                                repository.updateConfig { it.copy(targetLanguageCode = code) }
+                            }
+                            lastLiveTargetLang = null
+                            scheduleLiveCapture(delayMs = 80L, forceRefresh = true)
+                        },
+                        onDragDelta = { dx, dy ->
+                            val curW = liveHudContainer?.width?.takeIf { it > 0 } ?: hudWidthEstimate
+                            val curH = liveHudContainer?.height?.takeIf { it > 0 } ?: (56f * density).roundToInt()
+                            val maxX = (resources.displayMetrics.widthPixels - curW).toFloat().coerceAtLeast(0f)
+                            val maxY = (resources.displayMetrics.heightPixels - curH).toFloat().coerceAtLeast(0f)
+                            liveHudX = (liveHudX + dx).coerceIn(0f, maxX)
+                            liveHudY = (liveHudY + dy).coerceIn(0f, maxY)
+                            hudParams.x = liveHudX.roundToInt()
+                            hudParams.y = liveHudY.roundToInt()
+                            suppressLiveEventsUntilMs = SystemClock.uptimeMillis() + 250L
+                            liveHudContainer?.let { view ->
+                                if (view.parent != null) {
+                                    try {
+                                        windowManager.updateViewLayout(view, hudParams)
+                                    } catch (_: Exception) {
+                                    }
+                                }
+                            }
+                        },
+                        onStop = { stopLiveTranslateInternal() }
+                    )
+                }
+            }
+        }
+
+        lifecycleOwner.attachToView(container)
+        container.addView(
+            composeView,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT
+            )
+        )
+
+        liveHudContainer = container
+        try {
+            suppressLiveEventsUntilMs = SystemClock.uptimeMillis() + 260L
+            windowManager.addView(container, hudParams)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed adding Live Translate HUD", e)
+            detachLiveHudWindow()
+        }
+    }
+
+    private fun detachLiveHudWindow() {
+        liveHudContainer?.let { container ->
+            if (container.parent != null) {
+                try {
+                    windowManager.removeViewImmediate(container)
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error removing Live Translate HUD", e)
+                }
+            }
+        }
+        liveHudContainer = null
+        liveHudParams = null
+        liveHudLifecycleOwner?.detach()
+        liveHudLifecycleOwner = null
+    }
+
+    private fun onLiveContentEvent(isScroll: Boolean, eventPkg: String?) {
+        if (!_isLiveTranslateActive.value || livePausedFlow.value || isDeviceLockedOrAod()) return
+        val now = SystemClock.uptimeMillis()
+        if (eventPkg == packageName && now < suppressLiveEventsUntilMs) return
+        if (isScroll) {
+            // Clear floating blocks briefly during active scrolls so old boxes don't lag behind text
+            liveScrollSettlingFlow.value = true
+            scheduleLiveCapture(delayMs = 340L, forceRefresh = false)
+        } else {
+            scheduleLiveCapture(delayMs = 420L, forceRefresh = false)
+        }
+    }
+
+    private fun scheduleLiveCapture(delayMs: Long, forceRefresh: Boolean) {
+        if (!_isLiveTranslateActive.value || livePausedFlow.value) return
+        liveDebouncedCaptureRunnable?.let { mainHandler.removeCallbacks(it) }
+        val runnable = Runnable {
+            captureAndProcessLiveFrame(forceRefresh = forceRefresh)
+        }
+        liveDebouncedCaptureRunnable = runnable
+        if (delayMs <= 0L) {
+            mainHandler.post(runnable)
+        } else {
+            mainHandler.postDelayed(runnable, delayMs)
+        }
+    }
+
+    private fun getLiveHudScreenRect(): Rect? {
+        val params = liveHudParams ?: return null
+        val view = liveHudContainer ?: return null
+        val w = view.width
+        val h = view.height
+        if (w <= 0 || h <= 0) return null
+        return Rect(params.x, params.y, params.x + w, params.y + h)
+    }
+
+    private fun getImeWindowRects(): List<Rect> {
+        return try {
+            windows.orEmpty().mapNotNull { win ->
+                if (win.type == AccessibilityWindowInfo.TYPE_INPUT_METHOD) {
+                    Rect().also { win.getBoundsInScreen(it) }
+                } else {
+                    null
+                }
+            }
+        } catch (_: Exception) {
+            emptyList()
+        }
+    }
+
+    private fun captureAndProcessLiveFrame(forceRefresh: Boolean) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return
+        if (!_isLiveTranslateActive.value || livePausedFlow.value || liveCaptureInFlight) return
+        if (isDeviceLockedOrAod() || overlayContainer != null || isCapturing) return
+
+        liveCaptureInFlight = true
+        val layer = liveTranslationContainer
+        suppressLiveEventsUntilMs = SystemClock.uptimeMillis() + 220L
+        layer?.visibility = View.INVISIBLE
+
+        // 24ms (1-2 frames) ensures WindowManager composites without our translation blocks
+        mainHandler.postDelayed({
+            if (!_isLiveTranslateActive.value || livePausedFlow.value || isDeviceLockedOrAod()) {
+                liveCaptureInFlight = false
+                if (_isLiveTranslateActive.value && !livePausedFlow.value) {
+                    layer?.visibility = View.VISIBLE
+                }
+                return@postDelayed
+            }
+
+            takeScreenshot(
+                Display.DEFAULT_DISPLAY,
+                mainExecutor,
+                object : TakeScreenshotCallback {
+                    override fun onSuccess(screenshot: ScreenshotResult) {
+                        liveCaptureInFlight = false
+                        suppressLiveEventsUntilMs = SystemClock.uptimeMillis() + 220L
+                        if (_isLiveTranslateActive.value && !livePausedFlow.value) {
+                            layer?.visibility = View.VISIBLE
+                        }
+
+                        val buffer = screenshot.hardwareBuffer
+                        val softwareBitmap = try {
+                            val hwBitmap = Bitmap.wrapHardwareBuffer(buffer, screenshot.colorSpace)
+                            val copy = hwBitmap?.copy(Bitmap.Config.ARGB_8888, false)
+                            hwBitmap?.recycle()
+                            copy
+                        } catch (e: Exception) {
+                            Log.e(TAG, "Live screenshot bitmap conversion failed", e)
+                            null
+                        } finally {
+                            buffer.close()
+                        }
+
+                        if (softwareBitmap != null && _isLiveTranslateActive.value && !livePausedFlow.value) {
+                            processCapturedLiveBitmap(softwareBitmap, forceRefresh)
+                        } else {
+                            softwareBitmap?.recycle()
+                            liveScrollSettlingFlow.value = false
+                        }
+                    }
+
+                    override fun onFailure(errorCode: Int) {
+                        liveCaptureInFlight = false
+                        liveScrollSettlingFlow.value = false
+                        if (_isLiveTranslateActive.value && !livePausedFlow.value) {
+                            layer?.visibility = View.VISIBLE
+                        }
+                        Log.w(TAG, "Live takeScreenshot failed errorCode=$errorCode")
+                    }
+                }
+            )
+        }, 24L)
+    }
+
+    private fun processCapturedLiveBitmap(bitmap: Bitmap, forceRefresh: Boolean) {
+        val targetLang = currentConfig.targetLanguageCode
+        val hudRect = getLiveHudScreenRect()
+        val excludeNorm = hudRect?.let { r ->
+            val w = bitmap.width.toFloat().coerceAtLeast(1f)
+            val h = bitmap.height.toFloat().coerceAtLeast(1f)
+            RectF(
+                (r.left / w).coerceIn(0f, 1f),
+                (r.top / h).coerceIn(0f, 1f),
+                (r.right / w).coerceIn(0f, 1f),
+                (r.bottom / h).coerceIn(0f, 1f)
+            )
+        }
+
+        val fingerprint = createScreenFingerprint(bitmap)
+        val screenSize = bitmap.width to bitmap.height
+        val diff = computeFingerprintDiffFraction(
+            previous = lastLiveFingerprint,
+            current = fingerprint,
+            width = LIVE_FINGERPRINT_W,
+            height = LIVE_FINGERPRINT_H,
+            excludeNormalized = excludeNorm
+        )
+
+        val unchanged = !forceRefresh &&
+            lastLiveTargetLang == targetLang &&
+            lastLiveScreenSize == screenSize &&
+            diff < 0.014f
+
+        if (unchanged) {
+            liveScrollSettlingFlow.value = false
+            bitmap.recycle()
+            return
+        }
+
+        lastLiveFingerprint = fingerprint
+        lastLiveTargetLang = targetLang
+        lastLiveScreenSize = screenSize
+
+        val excludedRects = buildList {
+            hudRect?.let { add(it) }
+            addAll(getImeWindowRects())
+        }
+
+        liveProcessJob?.cancel()
+        liveProcessJob = serviceScope.launch(Dispatchers.Default) {
+            liveScanningFlow.value = true
+            try {
+                val effectiveMode = if (currentConfig.scriptMode == OcrScriptMode.LATIN) {
+                    OcrScriptMode.AUTO_MOE
+                } else {
+                    currentConfig.scriptMode
+                }
+
+                OcrAndLensEngine.analyzeFullScreenProgressive(
+                    applicationContext,
+                    bitmap,
+                    effectiveMode
+                ) { analysis, isFinal ->
+                    val filteredBlocks = filterBlocksExcludingRects(analysis.blocks, excludedRects)
+                    val filteredAnalysis = analysis.copy(blocks = filteredBlocks)
+
+                    if (filteredBlocks.isEmpty()) {
+                        if (isFinal) {
+                            liveBitmapSizeFlow.value = bitmap.width to bitmap.height
+                            liveBlocksFlow.value = emptyList()
+                            liveInlineStateFlow.value = InlineScreenTranslationState(targetLangCode = targetLang)
+                            liveScrollSettlingFlow.value = false
+                            liveScanningFlow.value = false
+                        }
+                        return@analyzeFullScreenProgressive
+                    }
+
+                    val enriched = OcrAndLensEngine.enrichAnalysisForInlineTranslate(bitmap, filteredAnalysis)
+                    OcrAndLensEngine.translateBlocksInline(
+                        blocks = enriched.blocks,
+                        targetLangCode = targetLang,
+                        dominantLangHint = enriched.dominantLanguageCode,
+                        useCache = true
+                    ) { state ->
+                        suppressLiveEventsUntilMs = SystemClock.uptimeMillis() + 160L
+                        liveBitmapSizeFlow.value = bitmap.width to bitmap.height
+                        liveBlocksFlow.value = enriched.blocks
+                        liveInlineStateFlow.value = state
+                        liveScrollSettlingFlow.value = false
+                    }
+
+                    if (isFinal) {
+                        liveScanningFlow.value = false
+                    }
+                }
+            } catch (e: Exception) {
+                if (e !is CancellationException) {
+                    Log.w(TAG, "Live Translate processing error: ${e.message}")
+                }
+            } finally {
+                liveScanningFlow.value = false
+                liveScrollSettlingFlow.value = false
+                if (!bitmap.isRecycled) {
+                    bitmap.recycle()
+                }
+            }
+        }
+    }
+
     companion object {
         private const val TAG = "QuickCircleA11y"
 
         private val _isServiceConnected = MutableStateFlow(false)
         val isServiceConnected: StateFlow<Boolean> = _isServiceConnected.asStateFlow()
 
+        private val _isLiveTranslateActive = MutableStateFlow(false)
+        val isLiveTranslateActive: StateFlow<Boolean> = _isLiveTranslateActive.asStateFlow()
+
         @Volatile
         private var activeInstance: QuickCircleAccessibilityService? = null
+
+        fun startLiveTranslate(): Boolean {
+            return activeInstance?.startLiveTranslateInternal() ?: false
+        }
+
+        fun stopLiveTranslate() {
+            activeInstance?.stopLiveTranslateInternal()
+            if (activeInstance == null) {
+                _isLiveTranslateActive.value = false
+            }
+        }
+
+        fun toggleLiveTranslate(): Boolean {
+            val instance = activeInstance ?: return false
+            if (_isLiveTranslateActive.value) {
+                instance.stopLiveTranslateInternal()
+                return false
+            }
+            return instance.startLiveTranslateInternal()
+        }
 
         fun triggerFromTile(): Boolean {
             val instance = activeInstance ?: return false

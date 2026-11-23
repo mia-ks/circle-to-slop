@@ -82,6 +82,7 @@ import com.example.data.SupportedTesseractOcrPacks
 import com.example.engine.ModelPackStatus
 import com.example.ui.theme.AmberWarn
 import com.example.ui.theme.CoralError
+import com.example.ui.theme.EmeraldActive
 import com.example.ui.theme.InterFamily
 import com.example.ui.theme.JetBrainsMonoFamily
 import com.example.ui.theme.SpaceGroteskFamily
@@ -91,6 +92,7 @@ import kotlin.math.roundToInt
 fun DashboardScreen(
     config: GestureZoneConfig,
     isAccessibilityEnabled: Boolean,
+    isLiveTranslateActive: Boolean = false,
     packStatuses: Map<String, ModelPackStatus>,
     packErrors: Map<String, String>,
     packProgress: Map<String, Float> = emptyMap(),
@@ -102,6 +104,7 @@ fun DashboardScreen(
     tessOcrProgress: Map<String, Float> = emptyMap(),
     onOpenZoneEditor: () -> Unit,
     onOpenSandbox: () -> Unit,
+    onToggleLiveTranslate: () -> Unit = {},
     onToggleTriggerEnabled: (Boolean) -> Unit,
     onToggleHaptic: (Boolean) -> Unit,
     onSelectTargetLanguage: (String) -> Unit,
@@ -364,6 +367,105 @@ fun DashboardScreen(
                                 fontWeight = FontWeight.SemiBold,
                                 fontSize = 14.5.sp
                             )
+                        }
+
+                        Surface(
+                            shape = RoundedCornerShape(14.dp),
+                            color = if (isLiveTranslateActive) {
+                                EmeraldActive.copy(alpha = 0.14f)
+                            } else {
+                                MaterialTheme.colorScheme.surfaceVariant
+                            },
+                            border = if (isLiveTranslateActive) {
+                                BorderStroke(1.dp, EmeraldActive.copy(alpha = 0.6f))
+                            } else {
+                                null
+                            },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .heightIn(min = 56.dp)
+                                .clip(RoundedCornerShape(14.dp))
+                                .clickable {
+                                    if (!isAccessibilityEnabled) {
+                                        openAccessibilitySettings()
+                                    } else {
+                                        onToggleLiveTranslate()
+                                    }
+                                }
+                                .testTag("toggle_live_translate_button")
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(12.dp)
+                            ) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(30.dp)
+                                        .clip(CircleShape)
+                                        .background(
+                                            (if (isLiveTranslateActive) EmeraldActive else MaterialTheme.colorScheme.primary).copy(alpha = 0.16f)
+                                        ),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Rounded.Translate,
+                                        contentDescription = null,
+                                        tint = if (isLiveTranslateActive) EmeraldActive else MaterialTheme.colorScheme.primary,
+                                        modifier = Modifier.size(17.dp)
+                                    )
+                                }
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                    ) {
+                                        Text(
+                                            text = "Live Translate",
+                                            fontFamily = SpaceGroteskFamily,
+                                            fontWeight = FontWeight.SemiBold,
+                                            fontSize = 14.sp,
+                                            color = MaterialTheme.colorScheme.onSurface
+                                        )
+                                        Surface(
+                                            shape = RoundedCornerShape(6.dp),
+                                            color = (if (isLiveTranslateActive) EmeraldActive else MaterialTheme.colorScheme.primary).copy(alpha = 0.18f)
+                                        ) {
+                                            Text(
+                                                text = if (isLiveTranslateActive) "RUNNING" else "EXP",
+                                                fontFamily = JetBrainsMonoFamily,
+                                                fontWeight = FontWeight.Bold,
+                                                fontSize = 9.5.sp,
+                                                color = if (isLiveTranslateActive) EmeraldActive else MaterialTheme.colorScheme.primary,
+                                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                            )
+                                        }
+                                    }
+                                    Text(
+                                        text = when {
+                                            !isAccessibilityEnabled -> "Enable accessibility trigger to stream screen captions"
+                                            isLiveTranslateActive -> "Click-through overlay active · Tap to stop"
+                                            else -> "Continuous scroll & screen translation HUD"
+                                        },
+                                        fontFamily = InterFamily,
+                                        fontSize = 12.sp,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                }
+                                Text(
+                                    text = when {
+                                        !isAccessibilityEnabled -> "Setup"
+                                        isLiveTranslateActive -> "Stop"
+                                        else -> "Start"
+                                    },
+                                    fontFamily = SpaceGroteskFamily,
+                                    fontWeight = FontWeight.SemiBold,
+                                    fontSize = 12.5.sp,
+                                    color = if (isLiveTranslateActive) EmeraldActive else MaterialTheme.colorScheme.primary
+                                )
+                            }
                         }
                     }
                 }

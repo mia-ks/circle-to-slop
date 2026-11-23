@@ -13,8 +13,9 @@ android {
     applicationId = "com.aistudio.quickcircle.xkmpqz"
     minSdk = 24
     targetSdk = 36
-    val ciRunNumber = System.getenv("GITHUB_RUN_NUMBER")?.toIntOrNull()
-    versionCode = 1000 + (ciRunNumber ?: 0)
+    val ciVersionCode = providers.environmentVariable("CI_VERSION_CODE").orNull?.toIntOrNull()
+    val ciRunNumber = providers.environmentVariable("GITHUB_RUN_NUMBER").orNull?.toIntOrNull()
+    versionCode = ciVersionCode ?: (1000 + (ciRunNumber ?: 0))
     versionName = if (ciRunNumber != null) "1.1.$ciRunNumber" else "1.1.0"
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"

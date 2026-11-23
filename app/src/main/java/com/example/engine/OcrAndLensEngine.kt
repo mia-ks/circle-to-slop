@@ -20,6 +20,7 @@ import com.google.mlkit.nl.translate.TranslateRemoteModel
 import com.google.mlkit.nl.translate.Translation
 import com.google.mlkit.nl.translate.TranslatorOptions
 import com.google.mlkit.vision.text.Text
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
@@ -143,6 +144,30 @@ object OcrAndLensEngine {
 
     private val engineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val activeDownloads = ConcurrentHashMap<String, Deferred<Result<Unit>>>()
+    private val liveTranslationCache = object : LinkedHashMap<String, String>(256, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, String>?): Boolean = size > 400
+    }
+
+    internal fun buildTranslationCacheKey(sourceLang: String, targetLang: String, text: String): String =
+        "$sourceLang|$targetLang|${text.trim()}"
+
+    internal fun getCachedTranslation(sourceLang: String, targetLang: String, text: String): String? =
+        synchronized(liveTranslationCache) {
+            liveTranslationCache[buildTranslationCacheKey(sourceLang, targetLang, text)]
+        }
+
+    internal fun putCachedTranslation(sourceLang: String, targetLang: String, text: String, translated: String) {
+        if (translated.isBlank()) return
+        synchronized(liveTranslationCache) {
+            liveTranslationCache[buildTranslationCacheKey(sourceLang, targetLang, text)] = translated
+        }
+    }
+
+    fun clearLiveTranslationCache() {
+        synchronized(liveTranslationCache) {
+            liveTranslationCache.clear()
+        }
+    }
 
     private val _packStatusFlow = MutableStateFlow<Map<String, ModelPackStatus>>(
         SupportedTargetLanguages.associate { it.code to ModelPackStatus.NOT_DOWNLOADED }
@@ -336,6 +361,7 @@ object OcrAndLensEngine {
                 enrichLanguagesAndColors = false
             )
         } catch (e: Exception) {
+            if (e is CancellationException) throw e
             Log.e(TAG, "Fast Latin full-screen OCR failed", e)
             ScreenOcrAnalysis()
         }
@@ -362,6 +388,7 @@ object OcrAndLensEngine {
                 onUpdate(fastAnalysis, isFinal)
             }
         } catch (e: Exception) {
+            if (e is CancellationException) throw e
             Log.e(TAG, "Progressive full-screen OCR failed", e)
             onUpdate(ScreenOcrAnalysis(), true)
         }
@@ -380,6 +407,7 @@ object OcrAndLensEngine {
                 enrichLanguagesAndColors = false
             )
         } catch (e: Exception) {
+            if (e is CancellationException) throw e
             Log.e(TAG, "Full-screen OCR analysis failed", e)
             ScreenOcrAnalysis()
         }
@@ -430,6 +458,7 @@ object OcrAndLensEngine {
         blocks: List<InlineTextBlock>,
         targetLangCode: String,
         dominantLangHint: String?,
+        useCache: Boolean = false,
         onState: (InlineScreenTranslationState) -> Unit
     ) {
         val mlTarget = resolveMlKitTag(targetLangCode)
@@ -484,9 +513,17 @@ object OcrAndLensEngine {
                     currentStates[block.id] = InlineBlockStatus.SameLanguage
                 }
                 else -> {
-                    sourcePerBlock[block.id] = mlSource
-                    currentStates[block.id] = InlineBlockStatus.Translating
-                    uniqueMissingSources.add(mlSource)
+                    val cached = if (useCache) getCachedTranslation(mlSource, mlTarget, block.text) else null
+                    if (cached != null) {
+                        currentStates[block.id] = InlineBlockStatus.Translated(
+                            text = cached,
+                            sourceLangName = formatLanguageName(mlSource)
+                        )
+                    } else {
+                        sourcePerBlock[block.id] = mlSource
+                        currentStates[block.id] = InlineBlockStatus.Translating
+                        uniqueMissingSources.add(mlSource)
+                    }
                 }
             }
         }
@@ -619,12 +656,16 @@ object OcrAndLensEngine {
                         translator = translator,
                         rawText = block.text,
                         sourceLines = block.sourceLines
-                    )
+                    ).ifBlank { block.text }
+                    if (useCache) {
+                        putCachedTranslation(mlSource, mlTarget, block.text, translated)
+                    }
                     currentStates[blockId] = InlineBlockStatus.Translated(
-                        text = translated.ifBlank { block.text },
+                        text = translated,
                         sourceLangName = formatLanguageName(mlSource)
                     )
                 } catch (e: Exception) {
+                    if (e is CancellationException) throw e
                     currentStates[blockId] = InlineBlockStatus.Error(
                         e.localizedMessage ?: "Translation failed"
                     )

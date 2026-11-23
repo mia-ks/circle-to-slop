@@ -3,8 +3,13 @@ package com.example
 import android.app.SearchManager
 import android.content.Context
 import android.content.Intent
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.Paint
 import android.graphics.Point
 import android.graphics.Rect
+import android.graphics.RectF
 import android.view.Display
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.test.assertIsDisplayed
@@ -20,15 +25,21 @@ import com.example.data.TriggerMode
 import com.example.engine.CandidateOcrLine
 import com.example.engine.CandidateOcrWord
 import com.example.engine.InlineScreenTranslationState
+import com.example.engine.InlineTextBlock
 import com.example.engine.MoEOcrRouter
 import com.example.engine.OcrAndLensEngine
 import com.example.engine.OcrExpertKind
 import com.example.engine.RecognizedTextWord
 import com.example.engine.TranslationState
+import com.example.overlay.LIVE_FINGERPRINT_H
+import com.example.overlay.LIVE_FINGERPRINT_W
 import com.example.overlay.TextSelectionRange
 import com.example.overlay.buildSelectedText
 import com.example.overlay.buildSmoothedFreehandPath
+import com.example.overlay.computeFingerprintDiffFraction
 import com.example.overlay.correctFreehandShape
+import com.example.overlay.createScreenFingerprint
+import com.example.overlay.filterBlocksExcludingRects
 import com.example.overlay.hitTestWord
 import com.example.service.doesTriggerOverlapIme
 import com.example.service.isDeviceLockedOrAodState
@@ -255,8 +266,10 @@ class ExampleRobolectricTest {
 
     @Test
     fun `dashboard shows offline pack status and navigates to zone editor and sandbox`() {
+        composeRule.waitForIdle()
         composeRule.onNodeWithTag("header_status_text").assertIsDisplayed()
         composeRule.onNodeWithTag("launch_sandbox_button").performScrollTo().assertIsDisplayed()
+        composeRule.onNodeWithTag("toggle_live_translate_button").performScrollTo().assertIsDisplayed()
         composeRule.onNodeWithTag("open_zone_editor_button").performScrollTo().assertIsDisplayed()
         composeRule.onNodeWithTag("offline_pack_status_card").performScrollTo().assertIsDisplayed()
         composeRule.onNodeWithTag("toggle_pack_manager_button").performScrollTo().performClick()
@@ -448,5 +461,77 @@ class ExampleRobolectricTest {
         )
         assertEquals("Japanese, English", sheet.missingPacksLabel)
         assertEquals(0.45f, sheet.progress, 0.001f)
+    }
+
+    @Test
+    fun `screen fingerprint diff ignores excluded hud region and detects content changes`() {
+        fun paintRect(bitmap: Bitmap, left: Int, top: Int, right: Int, bottom: Int, color: Int) {
+            for (y in top until bottom.coerceAtMost(bitmap.height)) {
+                for (x in left until right.coerceAtMost(bitmap.width)) {
+                    bitmap.setPixel(x, y, color)
+                }
+            }
+        }
+
+        val bmpA = Bitmap.createBitmap(64, 96, Bitmap.Config.ARGB_8888).apply {
+            eraseColor(Color.BLACK)
+        }
+        val bmpB = Bitmap.createBitmap(64, 96, Bitmap.Config.ARGB_8888).apply {
+            eraseColor(Color.BLACK)
+        }
+        val hudNorm = RectF(0.2f, 0.08f, 0.8f, 0.18f)
+        // Paint only inside the excluded HUD region on bmpB -> diff must remain 0f
+        paintRect(bmpB, 14, 9, 50, 16, Color.WHITE)
+
+        val fpA = createScreenFingerprint(bmpA)
+        val fpB = createScreenFingerprint(bmpB)
+        val hudOnlyDiff = computeFingerprintDiffFraction(
+            previous = fpA,
+            current = fpB,
+            width = LIVE_FINGERPRINT_W,
+            height = LIVE_FINGERPRINT_H,
+            excludeNormalized = hudNorm
+        )
+        assertEquals(0f, hudOnlyDiff, 0.001f)
+
+        // Paint a large white card in main body -> diff must clearly exceed threshold
+        paintRect(bmpB, 4, 28, 60, 76, Color.WHITE)
+        val fpChanged = createScreenFingerprint(bmpB)
+        val bodyDiff = computeFingerprintDiffFraction(
+            previous = fpA,
+            current = fpChanged,
+            width = LIVE_FINGERPRINT_W,
+            height = LIVE_FINGERPRINT_H,
+            excludeNormalized = hudNorm
+        )
+        assertTrue("Expected content diff > 0.25, got $bodyDiff", bodyDiff > 0.25f)
+        bmpA.recycle()
+        bmpB.recycle()
+    }
+
+    @Test
+    fun `live filter excludes blocks inside floating hud or keyboard and caches translations`() {
+        val hudRect = Rect(200, 80, 780, 180)
+        val imeRect = Rect(0, 1500, 1080, 2200)
+        val blocks = listOf(
+            InlineTextBlock(0, "Live · 3", Rect(240, 100, 460, 150), 1, 24f, "en", Color.BLACK, Color.WHITE),
+            InlineTextBlock(1, "東京駅へようこそ", Rect(60, 420, 720, 500), 1, 32f, "ja", Color.BLACK, Color.WHITE),
+            InlineTextBlock(2, "q w e r t y", Rect(40, 1650, 900, 1740), 1, 28f, "en", Color.BLACK, Color.WHITE)
+        )
+
+        val kept = filterBlocksExcludingRects(blocks, listOf(hudRect, imeRect))
+        assertEquals(1, kept.size)
+        assertEquals(1, kept.first().id)
+
+        OcrAndLensEngine.clearLiveTranslationCache()
+        OcrAndLensEngine.putCachedTranslation("ja", "en", "東京駅へようこそ", "Welcome to Tokyo Station")
+        assertEquals(
+            "Welcome to Tokyo Station",
+            OcrAndLensEngine.getCachedTranslation("ja", "en", "東京駅へようこそ")
+        )
+        assertEquals(
+            null,
+            OcrAndLensEngine.getCachedTranslation("ja", "es", "東京駅へようこそ")
+        )
     }
 }
