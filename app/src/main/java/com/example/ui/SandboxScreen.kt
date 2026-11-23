@@ -45,6 +45,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -76,7 +77,6 @@ import com.example.data.GestureZoneConfig
 import com.example.data.TriggerMode
 import com.example.engine.OcrAndLensEngine
 import com.example.overlay.MinimalCircleOverlay
-import com.example.ui.theme.ElectricCyan
 import com.example.ui.theme.InterFamily
 import com.example.ui.theme.JetBrainsMonoFamily
 import com.example.ui.theme.SpaceGroteskFamily
@@ -131,9 +131,9 @@ fun SandboxScreen(
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .background(Color(0xFF0B0B0E))
+            .background(MaterialTheme.colorScheme.background)
     ) {
-        // Test Content Area (Sample Tokyo cafe storefront OR user's picked photo)
+        // Test Content Area (Multilingual & perspective test board OR user's picked photo)
         Column(
             modifier = Modifier
                 .fillMaxSize()
@@ -157,23 +157,23 @@ fun SandboxScreen(
                     Icon(
                         imageVector = Icons.AutoMirrored.Rounded.ArrowBack,
                         contentDescription = "Back",
-                        tint = Color.White
+                        tint = MaterialTheme.colorScheme.onBackground
                     )
                 }
 
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
                     Text(
-                        text = "Test Arena",
+                        text = "Test Canvas",
                         fontFamily = SpaceGroteskFamily,
                         fontWeight = FontWeight.SemiBold,
                         fontSize = 16.sp,
-                        color = Color.White
+                        color = MaterialTheme.colorScheme.onBackground
                     )
                     Text(
                         text = "Trigger: ${config.summaryLine()}",
                         fontFamily = JetBrainsMonoFamily,
-                        fontSize = 10.5.sp,
-                        color = ElectricCyan
+                        fontSize = 11.sp,
+                        color = MaterialTheme.colorScheme.primary
                     )
                 }
 
@@ -215,7 +215,7 @@ fun SandboxScreen(
                             PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
                         )
                     },
-                    border = BorderStroke(1.dp, Color(0xFF343644)),
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
                     shape = RoundedCornerShape(12.dp),
                     modifier = Modifier
                         .weight(1f)
@@ -225,22 +225,22 @@ fun SandboxScreen(
                     Icon(
                         imageVector = Icons.Rounded.PhotoLibrary,
                         contentDescription = null,
-                        tint = Color.White,
+                        tint = MaterialTheme.colorScheme.onBackground,
                         modifier = Modifier.size(18.dp)
                     )
                     Spacer(Modifier.width(6.dp))
                     Text(
                         text = "Pick Photo",
                         fontFamily = SpaceGroteskFamily,
-                        color = Color.White
+                        color = MaterialTheme.colorScheme.onBackground
                     )
                 }
 
                 Button(
                     onClick = { captureSandboxAndLaunch() },
                     colors = ButtonDefaults.buttonColors(
-                        containerColor = Color.White,
-                        contentColor = Color(0xFF0B0B0E)
+                        containerColor = MaterialTheme.colorScheme.primary,
+                        contentColor = MaterialTheme.colorScheme.onPrimary
                     ),
                     shape = RoundedCornerShape(12.dp),
                     modifier = Modifier

@@ -48,10 +48,13 @@ class QuickCircleViewModel(application: Application) : AndroidViewModel(applicat
 
     val packStatuses: StateFlow<Map<String, ModelPackStatus>> = OcrAndLensEngine.packStatusFlow
     val packErrors: StateFlow<Map<String, String>> = OcrAndLensEngine.packErrorFlow
+    val packProgress: StateFlow<Map<String, Float>> = OcrAndLensEngine.packProgressFlow
     val mlKitOcrStatuses: StateFlow<Map<String, ModelPackStatus>> = MoEOcrRouter.mlKitOcrStatusFlow
     val mlKitOcrErrors: StateFlow<Map<String, String>> = MoEOcrRouter.mlKitOcrErrorFlow
+    val mlKitOcrProgress: StateFlow<Map<String, Float>> = MoEOcrRouter.mlKitOcrProgressFlow
     val tessOcrStatuses: StateFlow<Map<String, ModelPackStatus>> = MoEOcrRouter.tessOcrStatusFlow
     val tessOcrErrors: StateFlow<Map<String, String>> = MoEOcrRouter.tessOcrErrorFlow
+    val tessOcrProgress: StateFlow<Map<String, Float>> = MoEOcrRouter.tessOcrProgressFlow
 
     init {
         viewModelScope.launch(Dispatchers.Default) {

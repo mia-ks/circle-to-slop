@@ -47,8 +47,17 @@ import java.io.File
 import java.io.FileOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
+import java.util.concurrent.ConcurrentHashMap
+import kotlinx.coroutines.Deferred
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
+import kotlin.math.PI
+import kotlin.math.abs
+import kotlin.math.atan
+import kotlin.math.atan2
+import kotlin.math.hypot
+import kotlin.math.max
+import kotlin.math.min
 
 enum class OcrExpertKind {
     MLKIT_LATIN,
@@ -64,12 +73,25 @@ data class CandidateOcrWord(
     val boundingBox: Rect
 )
 
+data class PerspectivePose(
+    val tiltZDeg: Float,
+    val tiltXDeg: Float,
+    val tiltYDeg: Float,
+    val quadWidthPx: Float,
+    val quadHeightPx: Float
+)
+
 data class CandidateOcrLine(
     val expert: OcrExpertKind,
     val text: String,
     val boundingBox: Rect,
     val words: List<CandidateOcrWord>,
-    val confidence: Float = 85f
+    val confidence: Float = 85f,
+    val tiltZDeg: Float = 0f,
+    val tiltXDeg: Float = 0f,
+    val tiltYDeg: Float = 0f,
+    val quadWidthPx: Float = 0f,
+    val quadHeightPx: Float = 0f
 )
 
 object MoEOcrRouter {
@@ -104,6 +126,9 @@ object MoEOcrRouter {
     private val _mlKitOcrErrorFlow = MutableStateFlow<Map<String, String>>(emptyMap())
     val mlKitOcrErrorFlow: StateFlow<Map<String, String>> = _mlKitOcrErrorFlow.asStateFlow()
 
+    private val _mlKitOcrProgressFlow = MutableStateFlow<Map<String, Float>>(emptyMap())
+    val mlKitOcrProgressFlow: StateFlow<Map<String, Float>> = _mlKitOcrProgressFlow.asStateFlow()
+
     private val _tessOcrStatusFlow = MutableStateFlow<Map<String, ModelPackStatus>>(
         SupportedTesseractOcrPacks.associate { it.code to ModelPackStatus.NOT_DOWNLOADED }
     )
@@ -111,6 +136,12 @@ object MoEOcrRouter {
 
     private val _tessOcrErrorFlow = MutableStateFlow<Map<String, String>>(emptyMap())
     val tessOcrErrorFlow: StateFlow<Map<String, String>> = _tessOcrErrorFlow.asStateFlow()
+
+    private val _tessOcrProgressFlow = MutableStateFlow<Map<String, Float>>(emptyMap())
+    val tessOcrProgressFlow: StateFlow<Map<String, Float>> = _tessOcrProgressFlow.asStateFlow()
+
+    private val activeTessDownloads = ConcurrentHashMap<String, Deferred<Boolean>>()
+    private val activeMlKitDownloads = ConcurrentHashMap<String, Deferred<Boolean>>()
 
     private fun recognizerForKey(key: String): TextRecognizer? = when (key) {
         "latin" -> latinRecognizer
@@ -340,8 +371,10 @@ object MoEOcrRouter {
     fun preloadAllMlKitScripts(context: Context) {
         val appCtx = context.applicationContext
         routerScope.launch {
-            for (script in SupportedMlKitDynamicScripts) {
-                ensureMlKitScriptInstalled(appCtx, script.code)
+            coroutineScope {
+                SupportedMlKitDynamicScripts
+                    .map { script -> async { ensureMlKitScriptInstalled(appCtx, script.code) } }
+                    .awaitAll()
             }
         }
     }
@@ -354,6 +387,7 @@ object MoEOcrRouter {
         } catch (e: Exception) {
             _mlKitOcrStatusFlow.update { it + (scriptKey to ModelPackStatus.ERROR) }
             _mlKitOcrErrorFlow.update { it + (scriptKey to (e.localizedMessage ?: "Play Services unavailable")) }
+            _mlKitOcrProgressFlow.update { it - scriptKey }
             return@withContext false
         }
 
@@ -365,76 +399,123 @@ object MoEOcrRouter {
         if (alreadyAvailable) {
             _mlKitOcrStatusFlow.update { it + (scriptKey to ModelPackStatus.DOWNLOADED) }
             _mlKitOcrErrorFlow.update { it - scriptKey }
+            _mlKitOcrProgressFlow.update { it + (scriptKey to 1f) }
             return@withContext true
         }
 
-        _mlKitOcrStatusFlow.update { it + (scriptKey to ModelPackStatus.DOWNLOADING) }
-        _mlKitOcrErrorFlow.update { it - scriptKey }
+        val existing = activeMlKitDownloads[scriptKey]
+        if (existing != null && existing.isActive) {
+            return@withContext existing.await()
+        }
 
-        return@withContext try {
-            suspendCancellableCoroutine { cont ->
-                val listener = object : InstallStatusListener {
-                    override fun onInstallStatusUpdated(update: ModuleInstallStatusUpdate) {
-                        when (update.installState) {
-                            STATE_DOWNLOADING, STATE_INSTALLING -> {
-                                _mlKitOcrStatusFlow.update { it + (scriptKey to ModelPackStatus.DOWNLOADING) }
-                            }
-                            STATE_COMPLETED -> {
-                                client.unregisterListener(this)
-                                isMoEWarmedUp = false
-                                _mlKitOcrStatusFlow.update { it + (scriptKey to ModelPackStatus.DOWNLOADED) }
-                                _mlKitOcrErrorFlow.update { it - scriptKey }
-                                if (cont.isActive) cont.resume(true)
-                            }
-                            STATE_FAILED, STATE_CANCELED -> {
-                                client.unregisterListener(this)
-                                _mlKitOcrStatusFlow.update { it + (scriptKey to ModelPackStatus.ERROR) }
-                                _mlKitOcrErrorFlow.update {
-                                    it + (scriptKey to "Play Services download failed (code ${update.errorCode})")
-                                }
-                                if (cont.isActive) cont.resume(false)
-                            }
-                            else -> Unit
+        val deferred = routerScope.async {
+            _mlKitOcrStatusFlow.update { it + (scriptKey to ModelPackStatus.DOWNLOADING) }
+            _mlKitOcrErrorFlow.update { it - scriptKey }
+            _mlKitOcrProgressFlow.update { it + (scriptKey to 0.06f) }
+
+            val hasRealProgress = java.util.concurrent.atomic.AtomicBoolean(false)
+            val ticker = launch {
+                val startMs = System.currentTimeMillis()
+                while (true) {
+                    delay(220L)
+                    if (!hasRealProgress.get()) {
+                        val elapsedSec = (System.currentTimeMillis() - startMs) / 1000.0
+                        val est = (0.06 + (1.0 - kotlin.math.exp(-elapsedSec / 3.0)) * 0.84).toFloat().coerceIn(0.06f, 0.90f)
+                        _mlKitOcrProgressFlow.update { cur ->
+                            val curVal = cur[scriptKey] ?: 0f
+                            cur + (scriptKey to max(curVal, est))
                         }
-                    }
-                }
-
-                val request = ModuleInstallRequest.newBuilder()
-                    .addApi(recognizer)
-                    .setListener(listener)
-                    .build()
-
-                client.installModules(request)
-                    .addOnSuccessListener { response ->
-                        if (response.areModulesAlreadyInstalled()) {
-                            client.unregisterListener(listener)
-                            _mlKitOcrStatusFlow.update { it + (scriptKey to ModelPackStatus.DOWNLOADED) }
-                            _mlKitOcrErrorFlow.update { it - scriptKey }
-                            if (cont.isActive) cont.resume(true)
-                        }
-                    }
-                    .addOnFailureListener { exc ->
-                        client.unregisterListener(listener)
-                        _mlKitOcrStatusFlow.update { it + (scriptKey to ModelPackStatus.ERROR) }
-                        _mlKitOcrErrorFlow.update {
-                            it + (scriptKey to (exc.localizedMessage ?: "Play Services module install failed"))
-                        }
-                        if (cont.isActive) cont.resume(false)
-                    }
-
-                cont.invokeOnCancellation {
-                    try {
-                        client.unregisterListener(listener)
-                    } catch (_: Exception) {
                     }
                 }
             }
-        } catch (e: Exception) {
-            Log.e(TAG, "ML Kit module install failed for $scriptKey", e)
-            _mlKitOcrStatusFlow.update { it + (scriptKey to ModelPackStatus.ERROR) }
-            _mlKitOcrErrorFlow.update { it + (scriptKey to (e.localizedMessage ?: "Install error")) }
-            false
+
+            try {
+                suspendCancellableCoroutine { cont ->
+                    val listener = object : InstallStatusListener {
+                        override fun onInstallStatusUpdated(update: ModuleInstallStatusUpdate) {
+                            when (update.installState) {
+                                STATE_DOWNLOADING, STATE_INSTALLING -> {
+                                    _mlKitOcrStatusFlow.update { it + (scriptKey to ModelPackStatus.DOWNLOADING) }
+                                    val info = update.progressInfo
+                                    if (info != null && info.totalBytesToDownload > 0L) {
+                                        hasRealProgress.set(true)
+                                        val frac = (info.bytesDownloaded.toFloat() / info.totalBytesToDownload.toFloat())
+                                            .coerceIn(0.05f, 0.99f)
+                                        _mlKitOcrProgressFlow.update { it + (scriptKey to frac) }
+                                    } else if (update.installState == STATE_INSTALLING) {
+                                        hasRealProgress.set(true)
+                                        _mlKitOcrProgressFlow.update { cur ->
+                                            cur + (scriptKey to max(cur[scriptKey] ?: 0.92f, 0.92f))
+                                        }
+                                    }
+                                }
+                                STATE_COMPLETED -> {
+                                    client.unregisterListener(this)
+                                    isMoEWarmedUp = false
+                                    _mlKitOcrStatusFlow.update { it + (scriptKey to ModelPackStatus.DOWNLOADED) }
+                                    _mlKitOcrErrorFlow.update { it - scriptKey }
+                                    _mlKitOcrProgressFlow.update { it + (scriptKey to 1f) }
+                                    if (cont.isActive) cont.resume(true)
+                                }
+                                STATE_FAILED, STATE_CANCELED -> {
+                                    client.unregisterListener(this)
+                                    _mlKitOcrStatusFlow.update { it + (scriptKey to ModelPackStatus.ERROR) }
+                                    _mlKitOcrErrorFlow.update {
+                                        it + (scriptKey to "Play Services download failed (code ${update.errorCode})")
+                                    }
+                                    _mlKitOcrProgressFlow.update { it - scriptKey }
+                                    if (cont.isActive) cont.resume(false)
+                                }
+                                else -> Unit
+                            }
+                        }
+                    }
+
+                    val request = ModuleInstallRequest.newBuilder()
+                        .addApi(recognizer)
+                        .setListener(listener)
+                        .build()
+
+                    client.installModules(request)
+                        .addOnSuccessListener { response ->
+                            if (response.areModulesAlreadyInstalled()) {
+                                client.unregisterListener(listener)
+                                _mlKitOcrStatusFlow.update { it + (scriptKey to ModelPackStatus.DOWNLOADED) }
+                                _mlKitOcrErrorFlow.update { it - scriptKey }
+                                _mlKitOcrProgressFlow.update { it + (scriptKey to 1f) }
+                                if (cont.isActive) cont.resume(true)
+                            }
+                        }
+                        .addOnFailureListener { exc ->
+                            client.unregisterListener(listener)
+                            _mlKitOcrStatusFlow.update { it + (scriptKey to ModelPackStatus.ERROR) }
+                            _mlKitOcrErrorFlow.update {
+                                it + (scriptKey to (exc.localizedMessage ?: "Play Services module install failed"))
+                            }
+                            _mlKitOcrProgressFlow.update { it - scriptKey }
+                            if (cont.isActive) cont.resume(false)
+                        }
+
+                    cont.invokeOnCancellation {
+                        try {
+                            client.unregisterListener(listener)
+                        } catch (_: Exception) {
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "ML Kit module install failed for $scriptKey", e)
+                _mlKitOcrStatusFlow.update { it + (scriptKey to ModelPackStatus.ERROR) }
+                _mlKitOcrErrorFlow.update { it + (scriptKey to (e.localizedMessage ?: "Install error")) }
+                _mlKitOcrProgressFlow.update { it - scriptKey }
+                false
+            } finally {
+                ticker.cancel()
+                activeMlKitDownloads.remove(scriptKey)
+            }
         }
+        activeMlKitDownloads[scriptKey] = deferred
+        return@withContext deferred.await()
     }
 
     fun startTesseractPackDownload(context: Context, langCode: String) {
@@ -452,60 +533,92 @@ object MoEOcrRouter {
         if (finalFile.exists() && finalFile.length() > 10_000L) {
             _tessOcrStatusFlow.update { it + (cleanCode to ModelPackStatus.DOWNLOADED) }
             _tessOcrErrorFlow.update { it - cleanCode }
+            _tessOcrProgressFlow.update { it + (cleanCode to 1f) }
             return@withContext true
         }
 
-        _tessOcrStatusFlow.update { it + (cleanCode to ModelPackStatus.DOWNLOADING) }
-        _tessOcrErrorFlow.update { it - cleanCode }
-
-        val tmpFile = File(tessDir, "$cleanCode.traineddata.tmp")
-        val downloadUrl = "https://github.com/tesseract-ocr/tessdata_fast/raw/main/$cleanCode.traineddata"
-        return@withContext try {
-            val conn = (URL(downloadUrl).openConnection() as HttpURLConnection).apply {
-                connectTimeout = 15_000
-                readTimeout = 30_000
-                instanceFollowRedirects = true
-            }
-            val statusCode = conn.responseCode
-            if (statusCode !in 200..299) {
-                throw IllegalStateException("HTTP $statusCode downloading $cleanCode.traineddata")
-            }
-            conn.inputStream.use { input ->
-                FileOutputStream(tmpFile).use { output ->
-                    val buf = ByteArray(16_384)
-                    while (true) {
-                        val read = input.read(buf)
-                        if (read <= 0) break
-                        output.write(buf, 0, read)
-                    }
-                    output.flush()
-                }
-            }
-            conn.disconnect()
-            if (finalFile.exists()) finalFile.delete()
-            if (!tmpFile.renameTo(finalFile)) {
-                tmpFile.copyTo(finalFile, overwrite = true)
-                tmpFile.delete()
-            }
-            // Invalidate cached Tesseract session so the new language joins immediately
-            tessMutex.withLock {
-                cachedTessApi?.recycle()
-                cachedTessApi = null
-                cachedTessLangCombo = null
-                isMoEWarmedUp = false
-            }
-            _tessOcrStatusFlow.update { it + (cleanCode to ModelPackStatus.DOWNLOADED) }
-            _tessOcrErrorFlow.update { it - cleanCode }
-            true
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed downloading tessdata_fast/$cleanCode.traineddata", e)
-            tmpFile.delete()
-            _tessOcrStatusFlow.update { it + (cleanCode to ModelPackStatus.ERROR) }
-            _tessOcrErrorFlow.update {
-                it + (cleanCode to (e.localizedMessage ?: "Download failed"))
-            }
-            false
+        val existing = activeTessDownloads[cleanCode]
+        if (existing != null && existing.isActive) {
+            return@withContext existing.await()
         }
+
+        val deferred = routerScope.async {
+            _tessOcrStatusFlow.update { it + (cleanCode to ModelPackStatus.DOWNLOADING) }
+            _tessOcrErrorFlow.update { it - cleanCode }
+            _tessOcrProgressFlow.update { it + (cleanCode to 0.03f) }
+
+            val tmpFile = File(tessDir, "$cleanCode.traineddata.tmp")
+            val downloadUrl = "https://github.com/tesseract-ocr/tessdata_fast/raw/main/$cleanCode.traineddata"
+            try {
+                val conn = (URL(downloadUrl).openConnection() as HttpURLConnection).apply {
+                    connectTimeout = 15_000
+                    readTimeout = 30_000
+                    instanceFollowRedirects = true
+                }
+                val statusCode = conn.responseCode
+                if (statusCode !in 200..299) {
+                    throw IllegalStateException("HTTP $statusCode downloading $cleanCode.traineddata")
+                }
+                val totalBytes = conn.contentLengthLong.takeIf { it > 0L }
+                    ?: conn.contentLength.toLong().takeIf { it > 0L }
+                    ?: -1L
+                var bytesRead = 0L
+                var lastEmitMs = 0L
+
+                conn.inputStream.use { input ->
+                    FileOutputStream(tmpFile).use { output ->
+                        val buf = ByteArray(16_384)
+                        while (true) {
+                            val read = input.read(buf)
+                            if (read <= 0) break
+                            output.write(buf, 0, read)
+                            bytesRead += read
+                            val now = System.currentTimeMillis()
+                            if (now - lastEmitMs >= 80L) {
+                                lastEmitMs = now
+                                val frac = if (totalBytes > 0L) {
+                                    (bytesRead.toFloat() / totalBytes.toFloat()).coerceIn(0.03f, 0.99f)
+                                } else {
+                                    (0.05f + (bytesRead / 2_800_000f) * 0.87f).coerceIn(0.05f, 0.92f)
+                                }
+                                _tessOcrProgressFlow.update { it + (cleanCode to frac) }
+                            }
+                        }
+                        output.flush()
+                    }
+                }
+                conn.disconnect()
+                if (finalFile.exists()) finalFile.delete()
+                if (!tmpFile.renameTo(finalFile)) {
+                    tmpFile.copyTo(finalFile, overwrite = true)
+                    tmpFile.delete()
+                }
+                // Invalidate cached Tesseract session so the new language joins immediately
+                tessMutex.withLock {
+                    cachedTessApi?.recycle()
+                    cachedTessApi = null
+                    cachedTessLangCombo = null
+                    isMoEWarmedUp = false
+                }
+                _tessOcrStatusFlow.update { it + (cleanCode to ModelPackStatus.DOWNLOADED) }
+                _tessOcrErrorFlow.update { it - cleanCode }
+                _tessOcrProgressFlow.update { it + (cleanCode to 1f) }
+                true
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed downloading tessdata_fast/$cleanCode.traineddata", e)
+                tmpFile.delete()
+                _tessOcrStatusFlow.update { it + (cleanCode to ModelPackStatus.ERROR) }
+                _tessOcrErrorFlow.update {
+                    it + (cleanCode to (e.localizedMessage ?: "Download failed"))
+                }
+                _tessOcrProgressFlow.update { it - cleanCode }
+                false
+            } finally {
+                activeTessDownloads.remove(cleanCode)
+            }
+        }
+        activeTessDownloads[cleanCode] = deferred
+        return@withContext deferred.await()
     }
 
     fun deleteTesseractPack(context: Context, langCode: String) {
@@ -523,6 +636,7 @@ object MoEOcrRouter {
             }
             _tessOcrStatusFlow.update { it + (cleanCode to ModelPackStatus.NOT_DOWNLOADED) }
             _tessOcrErrorFlow.update { it - cleanCode }
+            _tessOcrProgressFlow.update { it - cleanCode }
         }
     }
 
@@ -745,6 +859,67 @@ object MoEOcrRouter {
         )
     }
 
+    /**
+     * Estimates planar tilt (rotationZ) and 3D perspective foreshortening (rotationX, rotationY)
+     * plus true un-inflated quad dimensions from ML Kit's 4 cornerPoints [TL, TR, BR, BL].
+     */
+    fun computePerspectiveFromCornerPoints(
+        points: List<android.graphics.Point>,
+        scaleBack: Float = 1f
+    ): PerspectivePose? {
+        if (points.size < 4) return null
+        val tlX = points[0].x * scaleBack
+        val tlY = points[0].y * scaleBack
+        val trX = points[1].x * scaleBack
+        val trY = points[1].y * scaleBack
+        val brX = points[2].x * scaleBack
+        val brY = points[2].y * scaleBack
+        val blX = points[3].x * scaleBack
+        val blY = points[3].y * scaleBack
+
+        val topW = hypot(trX - tlX, trY - tlY)
+        val bottomW = hypot(brX - blX, brY - blY)
+        val leftH = hypot(blX - tlX, blY - tlY)
+        val rightH = hypot(brX - trX, brY - trY)
+        if (topW < 4f || bottomW < 4f || leftH < 4f || rightH < 4f) return null
+
+        val avgW = (topW + bottomW) * 0.5f
+        val avgH = (leftH + rightH) * 0.5f
+
+        val topAngle = atan2(trY - tlY, trX - tlX)
+        val botAngle = atan2(brY - blY, brX - blX)
+        val tiltZRaw = ((topAngle + botAngle) * 0.5f) * (180f / PI.toFloat())
+        val tiltZ = if (abs(tiltZRaw) < 2.0f) 0f else tiltZRaw.coerceIn(-45f, 45f)
+
+        // Vertical foreshortening (top shorter than bottom => positive rotationX; left shorter than right => positive rotationY)
+        // Perspective projection scales size by ~ D / (D + deltaZ), so relative edge delta dW / W ~= H * sin(rotX) / D.
+        val depthRatioY = (bottomW - topW) / max(topW, bottomW)
+        val depthRatioX = (leftH - rightH) / max(leftH, rightH)
+
+        // With Compose cameraDistance = 12f * density (~6..10x typical line height), scale gently and clamp safely.
+        val rawTiltX = if (abs(depthRatioY) > 0.025f && avgH > 6f) {
+            (atan(depthRatioY * 3.8f) * (180f / PI.toFloat())).coerceIn(-42f, 42f)
+        } else {
+            0f
+        }
+        val rawTiltY = if (abs(depthRatioX) > 0.025f && avgW > 12f) {
+            // Note: in Compose graphicsLayer, negative rotationY pushes left toward viewer & right away (leftH > rightH -> neg rotationY? wait we check sign in unit test!)
+            -(atan(depthRatioX * 3.2f) * (180f / PI.toFloat())).coerceIn(-42f, 42f)
+        } else {
+            0f
+        }
+        val tiltX = if (abs(rawTiltX) < 3.0f) 0f else rawTiltX
+        val tiltY = if (abs(rawTiltY) < 3.0f) 0f else rawTiltY
+
+        return PerspectivePose(
+            tiltZDeg = tiltZ,
+            tiltXDeg = tiltX,
+            tiltYDeg = tiltY,
+            quadWidthPx = avgW,
+            quadHeightPx = avgH
+        )
+    }
+
     private suspend fun runMlKitExpert(
         key: String,
         inputImage: InputImage,
@@ -761,6 +936,9 @@ object MoEOcrRouter {
                     val rawBox = line.boundingBox ?: continue
                     if (line.text.isBlank()) continue
                     val box = rescaleRect(rawBox, scaleBack)
+                    val pose = line.cornerPoints?.toList()?.let {
+                        computePerspectiveFromCornerPoints(it, scaleBack)
+                    }
                     val words = line.elements.mapNotNull { el ->
                         val wRawBox = el.boundingBox ?: return@mapNotNull null
                         if (el.text.isBlank()) null else CandidateOcrWord(el.text, rescaleRect(wRawBox, scaleBack))
@@ -772,7 +950,12 @@ object MoEOcrRouter {
                             text = line.text.trim(),
                             boundingBox = box,
                             words = words.ifEmpty { listOf(CandidateOcrWord(line.text.trim(), box)) },
-                            confidence = confPct
+                            confidence = confPct,
+                            tiltZDeg = pose?.tiltZDeg ?: 0f,
+                            tiltXDeg = pose?.tiltXDeg ?: 0f,
+                            tiltYDeg = pose?.tiltYDeg ?: 0f,
+                            quadWidthPx = pose?.quadWidthPx ?: box.width().toFloat(),
+                            quadHeightPx = pose?.quadHeightPx ?: box.height().toFloat()
                         )
                     )
                 }

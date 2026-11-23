@@ -3,12 +3,14 @@ package com.example
 import android.app.SearchManager
 import android.content.Context
 import android.content.Intent
+import android.graphics.Point
 import android.graphics.Rect
 import android.view.Display
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onNodeWithTag
+import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
 import androidx.test.core.app.ApplicationProvider
@@ -17,13 +19,16 @@ import com.example.data.GestureZoneConfig
 import com.example.data.TriggerMode
 import com.example.engine.CandidateOcrLine
 import com.example.engine.CandidateOcrWord
+import com.example.engine.InlineScreenTranslationState
 import com.example.engine.MoEOcrRouter
 import com.example.engine.OcrAndLensEngine
 import com.example.engine.OcrExpertKind
 import com.example.engine.RecognizedTextWord
+import com.example.engine.TranslationState
 import com.example.overlay.TextSelectionRange
 import com.example.overlay.buildSelectedText
 import com.example.overlay.buildSmoothedFreehandPath
+import com.example.overlay.correctFreehandShape
 import com.example.overlay.hitTestWord
 import com.example.service.doesTriggerOverlapIme
 import com.example.service.isDeviceLockedOrAodState
@@ -37,6 +42,11 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
+import kotlin.math.PI
+import kotlin.math.abs
+import kotlin.math.cos
+import kotlin.math.hypot
+import kotlin.math.sin
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [36])
@@ -263,6 +273,8 @@ class ExampleRobolectricTest {
 
         composeRule.onNodeWithTag("launch_sandbox_button").performScrollTo().performClick()
         composeRule.onNodeWithTag("sandbox_circle_now_button").assertIsDisplayed()
+        composeRule.onNodeWithText("Test Canvas").assertIsDisplayed()
+        composeRule.onNodeWithText("Test Arena").assertDoesNotExist()
     }
 
     @Test
@@ -375,5 +387,66 @@ class ExampleRobolectricTest {
         assertTrue(isDeviceLockedOrAodState(isKeyguardLocked = false, isDeviceLocked = false, isInteractive = false, displayState = Display.STATE_ON))
         assertTrue(isDeviceLockedOrAodState(isKeyguardLocked = false, isDeviceLocked = false, isInteractive = true, displayState = Display.STATE_DOZE_SUSPEND))
         assertFalse(isDeviceLockedOrAodState(isKeyguardLocked = false, isDeviceLocked = false, isInteractive = true, displayState = Display.STATE_ON))
+    }
+
+    @Test
+    fun `freehand shape correction regularizes wobbly circle without collapsing bounds`() {
+        val cx = 200f
+        val cy = 300f
+        val baseR = 80f
+        val noisyCircle = List(32) { i ->
+            val theta = (i / 32f) * (2f * PI.toFloat())
+            val wobble = if (i % 2 == 0) 1.12f else 0.88f
+            Offset(cx + baseR * wobble * cos(theta), cy + baseR * wobble * sin(theta))
+        }
+        val corrected = correctFreehandShape(noisyCircle)
+        assertTrue(corrected.points.size >= 32)
+        val radii = corrected.points.map { hypot(it.x - cx, it.y - cy) }
+        val maxDeviation = radii.maxOf { abs(it - baseR) }
+        assertTrue("Corrected circle wobble ($maxDeviation) should be smoother than raw wobble (~9.6px)", maxDeviation < 5.5f)
+        assertTrue(corrected.left < cx && corrected.right > cx)
+        assertTrue(corrected.top < cy && corrected.bottom > cy)
+    }
+
+    @Test
+    fun `perspective quad extraction recovers 3d tilt and stays zero on flat lines`() {
+        val flatPose = MoEOcrRouter.computePerspectiveFromCornerPoints(
+            listOf(Point(100, 100), Point(400, 100), Point(400, 140), Point(100, 140))
+        )
+        assertNotNull(flatPose)
+        assertEquals(0f, flatPose!!.tiltZDeg, 0.01f)
+        assertEquals(0f, flatPose.tiltXDeg, 0.01f)
+        assertEquals(0f, flatPose.tiltYDeg, 0.01f)
+
+        // Tilted counter-clockwise slightly (-5 deg Z), top narrower than bottom (+X tilt), left taller than right (-Y tilt)
+        val tiltedPose = MoEOcrRouter.computePerspectiveFromCornerPoints(
+            listOf(Point(120, 210), Point(410, 184), Point(422, 224), Point(106, 260))
+        )
+        assertNotNull(tiltedPose)
+        assertTrue("Should detect negative rotationZ tilt", tiltedPose!!.tiltZDeg < -2.5f)
+        assertTrue("Should detect positive rotationX depth tilt", tiltedPose.tiltXDeg > 3.0f)
+        assertTrue("Should detect negative rotationY depth tilt", tiltedPose.tiltYDeg < -3.0f)
+        assertTrue(tiltedPose.quadWidthPx > 250f)
+        assertTrue(tiltedPose.quadHeightPx in 30f..65f)
+    }
+
+    @Test
+    fun `download translation states carry queue label and bounded progress`() {
+        val inline = InlineScreenTranslationState(
+            targetLangCode = "en",
+            isDownloadingPacks = true,
+            missingPacksLabel = "French, Japanese, Spanish, Korean",
+            downloadProgress = 0.64f
+        )
+        assertEquals("French, Japanese, Spanish, Korean", inline.missingPacksLabel)
+        assertEquals(0.64f, inline.downloadProgress, 0.001f)
+
+        val sheet = TranslationState.DownloadingModel(
+            languagePairLabel = "Japanese -> English",
+            missingPacksLabel = "Japanese, English",
+            progress = 0.45f
+        )
+        assertEquals("Japanese, English", sheet.missingPacksLabel)
+        assertEquals(0.45f, sheet.progress, 0.001f)
     }
 }

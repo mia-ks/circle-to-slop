@@ -82,11 +82,10 @@ import com.example.data.SupportedTesseractOcrPacks
 import com.example.engine.ModelPackStatus
 import com.example.ui.theme.AmberWarn
 import com.example.ui.theme.CoralError
-import com.example.ui.theme.ElectricCyan
-import com.example.ui.theme.EmeraldActive
 import com.example.ui.theme.InterFamily
 import com.example.ui.theme.JetBrainsMonoFamily
 import com.example.ui.theme.SpaceGroteskFamily
+import kotlin.math.roundToInt
 
 @Composable
 fun DashboardScreen(
@@ -94,10 +93,13 @@ fun DashboardScreen(
     isAccessibilityEnabled: Boolean,
     packStatuses: Map<String, ModelPackStatus>,
     packErrors: Map<String, String>,
+    packProgress: Map<String, Float> = emptyMap(),
     mlKitOcrStatuses: Map<String, ModelPackStatus>,
     mlKitOcrErrors: Map<String, String>,
+    mlKitOcrProgress: Map<String, Float> = emptyMap(),
     tessOcrStatuses: Map<String, ModelPackStatus>,
     tessOcrErrors: Map<String, String>,
+    tessOcrProgress: Map<String, Float> = emptyMap(),
     onOpenZoneEditor: () -> Unit,
     onOpenSandbox: () -> Unit,
     onToggleTriggerEnabled: (Boolean) -> Unit,
@@ -215,14 +217,14 @@ fun DashboardScreen(
                                         .size(32.dp)
                                         .clip(CircleShape)
                                         .background(
-                                            (if (isAccessibilityEnabled) EmeraldActive else AmberWarn).copy(alpha = 0.14f)
+                                            (if (isAccessibilityEnabled) MaterialTheme.colorScheme.primary else AmberWarn).copy(alpha = 0.14f)
                                         ),
                                     contentAlignment = Alignment.Center
                                 ) {
                                     Icon(
                                         imageVector = if (isAccessibilityEnabled) Icons.Rounded.CheckCircle else Icons.Rounded.AccessibilityNew,
                                         contentDescription = null,
-                                        tint = if (isAccessibilityEnabled) EmeraldActive else AmberWarn,
+                                        tint = if (isAccessibilityEnabled) MaterialTheme.colorScheme.primary else AmberWarn,
                                         modifier = Modifier.size(18.dp)
                                     )
                                 }
@@ -370,9 +372,18 @@ fun DashboardScreen(
                 val downloadedCount = SupportedTargetLanguages.count {
                     packStatuses[it.code] == ModelPackStatus.DOWNLOADED
                 }
-                val downloadingCount = packStatuses.values.count {
-                    it == ModelPackStatus.DOWNLOADING
-                }
+                val downloadingCodes = packStatuses
+                    .filterValues { it == ModelPackStatus.DOWNLOADING }
+                    .keys
+                    .toList()
+                val downloadingCount = downloadingCodes.size
+                val headerAvgProgress = if (downloadingCount > 0) {
+                    downloadingCodes
+                        .map { (packProgress[it] ?: 0.05f).coerceIn(0f, 1f) }
+                        .average()
+                        .toFloat()
+                        .coerceIn(0f, 1f)
+                } else 0f
 
                 Surface(
                     shape = RoundedCornerShape(18.dp),
@@ -412,14 +423,16 @@ fun DashboardScreen(
                             ) {
                                 if (downloadingCount > 0) {
                                     CircularProgressIndicator(
+                                        progress = { headerAvgProgress },
                                         color = MaterialTheme.colorScheme.primary,
-                                        strokeWidth = 1.8.dp,
-                                        modifier = Modifier.size(12.dp)
+                                        trackColor = MaterialTheme.colorScheme.surfaceVariant,
+                                        strokeWidth = 2.dp,
+                                        modifier = Modifier.size(13.dp)
                                     )
                                 }
                                 Text(
                                     text = if (downloadingCount > 0) {
-                                        "Downloading $downloadingCount…"
+                                        "Downloading $downloadingCount · ${(headerAvgProgress * 100).roundToInt()}%"
                                     } else {
                                         "$downloadedCount/${SupportedTargetLanguages.size}"
                                     },
@@ -439,6 +452,7 @@ fun DashboardScreen(
                             SupportedTargetLanguages.forEach { lang ->
                                 val selected = lang.code == config.targetLanguageCode
                                 val packStatus = packStatuses[lang.code] ?: ModelPackStatus.NOT_DOWNLOADED
+                                val chipProgress = packProgress[lang.code]
                                 Surface(
                                     shape = RoundedCornerShape(12.dp),
                                     color = if (selected) {
@@ -459,7 +473,8 @@ fun DashboardScreen(
                                     ) {
                                         PackDot(
                                             status = packStatus,
-                                            spinnerColor = if (selected) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.primary
+                                            accentColor = if (selected) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.primary,
+                                            progress = chipProgress
                                         )
                                         Text(
                                             text = "${lang.shortCode} · ${lang.label}",
@@ -484,6 +499,7 @@ fun DashboardScreen(
                         } ?: SupportedTargetLanguages.first()
                         val selectedStatus = packStatuses[selectedLang.code] ?: ModelPackStatus.NOT_DOWNLOADED
                         val selectedError = packErrors[selectedLang.code]
+                        val selectedProgress = (packProgress[selectedLang.code] ?: 0.05f).coerceIn(0f, 1f)
 
                         HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.45f))
 
@@ -506,14 +522,14 @@ fun DashboardScreen(
                                 Text(
                                     text = when (selectedStatus) {
                                         ModelPackStatus.DOWNLOADED -> "Ready offline (~30 MB)"
-                                        ModelPackStatus.DOWNLOADING -> "Downloading…"
+                                        ModelPackStatus.DOWNLOADING -> "Downloading ${(selectedProgress * 100).roundToInt()}%"
                                         ModelPackStatus.ERROR -> selectedError ?: "Download failed"
                                         ModelPackStatus.NOT_DOWNLOADED -> "Not downloaded"
                                     },
                                     fontFamily = InterFamily,
                                     fontSize = 12.sp,
                                     color = when (selectedStatus) {
-                                        ModelPackStatus.DOWNLOADED -> EmeraldActive
+                                        ModelPackStatus.DOWNLOADED -> MaterialTheme.colorScheme.primary
                                         ModelPackStatus.DOWNLOADING -> MaterialTheme.colorScheme.primary
                                         ModelPackStatus.ERROR -> CoralError
                                         ModelPackStatus.NOT_DOWNLOADED -> MaterialTheme.colorScheme.onSurfaceVariant
@@ -542,8 +558,10 @@ fun DashboardScreen(
                                 }
                                 ModelPackStatus.DOWNLOADING -> {
                                     CircularProgressIndicator(
+                                        progress = { selectedProgress },
                                         color = MaterialTheme.colorScheme.primary,
-                                        strokeWidth = 2.dp,
+                                        trackColor = MaterialTheme.colorScheme.surfaceVariant,
+                                        strokeWidth = 2.2.dp,
                                         modifier = Modifier
                                             .padding(horizontal = 12.dp)
                                             .size(20.dp)
@@ -576,9 +594,12 @@ fun DashboardScreen(
 
                         if (selectedStatus == ModelPackStatus.DOWNLOADING) {
                             LinearProgressIndicator(
+                                progress = { selectedProgress },
                                 color = MaterialTheme.colorScheme.primary,
-                                trackColor = MaterialTheme.colorScheme.background,
-                                modifier = Modifier.fillMaxWidth()
+                                trackColor = MaterialTheme.colorScheme.surfaceVariant,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(999.dp))
                             )
                         }
 
@@ -610,77 +631,95 @@ fun DashboardScreen(
                             Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                                 SupportedTargetLanguages.forEach { lang ->
                                     val st = packStatuses[lang.code] ?: ModelPackStatus.NOT_DOWNLOADED
-                                    Row(
+                                    val rowProgress = (packProgress[lang.code] ?: 0.05f).coerceIn(0f, 1f)
+                                    Column(
                                         modifier = Modifier
                                             .fillMaxWidth()
-                                            .heightIn(min = 48.dp)
                                             .clip(RoundedCornerShape(10.dp))
                                             .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f))
-                                            .padding(horizontal = 12.dp, vertical = 6.dp),
-                                        horizontalArrangement = Arrangement.SpaceBetween,
-                                        verticalAlignment = Alignment.CenterVertically
                                     ) {
-                                        Column(modifier = Modifier.weight(1f)) {
-                                            Text(
-                                                text = "${lang.label} (${lang.shortCode})",
-                                                fontFamily = InterFamily,
-                                                fontWeight = FontWeight.Medium,
-                                                fontSize = 13.sp,
-                                                color = MaterialTheme.colorScheme.onSurface
-                                            )
-                                            Text(
-                                                text = when (st) {
-                                                    ModelPackStatus.DOWNLOADED -> "Ready offline"
-                                                    ModelPackStatus.DOWNLOADING -> "Downloading…"
-                                                    ModelPackStatus.ERROR -> packErrors[lang.code] ?: "Failed"
-                                                    ModelPackStatus.NOT_DOWNLOADED -> "Not downloaded"
-                                                },
-                                                fontFamily = InterFamily,
-                                                fontSize = 11.5.sp,
-                                                color = when (st) {
-                                                    ModelPackStatus.DOWNLOADED -> EmeraldActive
-                                                    ModelPackStatus.DOWNLOADING -> MaterialTheme.colorScheme.primary
-                                                    ModelPackStatus.ERROR -> CoralError
-                                                    ModelPackStatus.NOT_DOWNLOADED -> MaterialTheme.colorScheme.onSurfaceVariant
-                                                },
-                                                maxLines = 1,
-                                                overflow = TextOverflow.Ellipsis
-                                            )
-                                        }
-                                        when (st) {
-                                            ModelPackStatus.DOWNLOADED -> {
-                                                TextButton(
-                                                    onClick = { onDeleteLanguagePack(lang.code) },
-                                                    modifier = Modifier
-                                                        .heightIn(min = 48.dp)
-                                                        .testTag("pack_delete_${lang.code}")
-                                                ) {
-                                                    Text("Remove", fontSize = 12.sp)
-                                                }
-                                            }
-                                            ModelPackStatus.DOWNLOADING -> {
-                                                CircularProgressIndicator(
-                                                    color = MaterialTheme.colorScheme.primary,
-                                                    strokeWidth = 2.dp,
-                                                    modifier = Modifier
-                                                        .padding(end = 10.dp)
-                                                        .size(18.dp)
+                                        Row(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .heightIn(min = 48.dp)
+                                                .padding(horizontal = 12.dp, vertical = 6.dp),
+                                            horizontalArrangement = Arrangement.SpaceBetween,
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            Column(modifier = Modifier.weight(1f)) {
+                                                Text(
+                                                    text = "${lang.label} (${lang.shortCode})",
+                                                    fontFamily = InterFamily,
+                                                    fontWeight = FontWeight.Medium,
+                                                    fontSize = 13.sp,
+                                                    color = MaterialTheme.colorScheme.onSurface
+                                                )
+                                                Text(
+                                                    text = when (st) {
+                                                        ModelPackStatus.DOWNLOADED -> "Ready offline"
+                                                        ModelPackStatus.DOWNLOADING -> "Downloading ${(rowProgress * 100).roundToInt()}%"
+                                                        ModelPackStatus.ERROR -> packErrors[lang.code] ?: "Failed"
+                                                        ModelPackStatus.NOT_DOWNLOADED -> "Not downloaded"
+                                                    },
+                                                    fontFamily = InterFamily,
+                                                    fontSize = 11.5.sp,
+                                                    color = when (st) {
+                                                        ModelPackStatus.DOWNLOADED -> MaterialTheme.colorScheme.primary
+                                                        ModelPackStatus.DOWNLOADING -> MaterialTheme.colorScheme.primary
+                                                        ModelPackStatus.ERROR -> CoralError
+                                                        ModelPackStatus.NOT_DOWNLOADED -> MaterialTheme.colorScheme.onSurfaceVariant
+                                                    },
+                                                    maxLines = 1,
+                                                    overflow = TextOverflow.Ellipsis
                                                 )
                                             }
-                                            ModelPackStatus.NOT_DOWNLOADED, ModelPackStatus.ERROR -> {
-                                                OutlinedButton(
-                                                    onClick = { onDownloadLanguagePack(lang.code) },
-                                                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
-                                                    modifier = Modifier
-                                                        .heightIn(min = 48.dp)
-                                                        .testTag("pack_download_${lang.code}")
-                                                ) {
-                                                    Text(
-                                                        text = if (st == ModelPackStatus.ERROR) "Retry" else "Get",
-                                                        fontSize = 12.sp
+                                            when (st) {
+                                                ModelPackStatus.DOWNLOADED -> {
+                                                    TextButton(
+                                                        onClick = { onDeleteLanguagePack(lang.code) },
+                                                        modifier = Modifier
+                                                            .heightIn(min = 48.dp)
+                                                            .testTag("pack_delete_${lang.code}")
+                                                    ) {
+                                                        Text("Remove", fontSize = 12.sp)
+                                                    }
+                                                }
+                                                ModelPackStatus.DOWNLOADING -> {
+                                                    CircularProgressIndicator(
+                                                        progress = { rowProgress },
+                                                        color = MaterialTheme.colorScheme.primary,
+                                                        trackColor = MaterialTheme.colorScheme.background,
+                                                        strokeWidth = 2.dp,
+                                                        modifier = Modifier
+                                                            .padding(end = 10.dp)
+                                                            .size(18.dp)
                                                     )
                                                 }
+                                                ModelPackStatus.NOT_DOWNLOADED, ModelPackStatus.ERROR -> {
+                                                    OutlinedButton(
+                                                        onClick = { onDownloadLanguagePack(lang.code) },
+                                                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
+                                                        modifier = Modifier
+                                                            .heightIn(min = 48.dp)
+                                                            .testTag("pack_download_${lang.code}")
+                                                    ) {
+                                                        Text(
+                                                            text = if (st == ModelPackStatus.ERROR) "Retry" else "Get",
+                                                            fontSize = 12.sp
+                                                        )
+                                                    }
+                                                }
                                             }
+                                        }
+                                        if (st == ModelPackStatus.DOWNLOADING) {
+                                            LinearProgressIndicator(
+                                                progress = { rowProgress },
+                                                color = MaterialTheme.colorScheme.primary,
+                                                trackColor = MaterialTheme.colorScheme.background,
+                                                modifier = Modifier
+                                                    .fillMaxWidth()
+                                                    .height(2.5.dp)
+                                            )
                                         }
                                     }
                                 }
@@ -819,73 +858,91 @@ fun DashboardScreen(
 
                                 SupportedMlKitDynamicScripts.forEach { script ->
                                     val st = mlKitOcrStatuses[script.code] ?: ModelPackStatus.NOT_DOWNLOADED
-                                    Row(
+                                    val p = (mlKitOcrProgress[script.code] ?: 0.06f).coerceIn(0f, 1f)
+                                    Column(
                                         modifier = Modifier
                                             .fillMaxWidth()
-                                            .heightIn(min = 48.dp)
                                             .clip(RoundedCornerShape(10.dp))
                                             .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f))
-                                            .padding(horizontal = 12.dp, vertical = 6.dp),
-                                        horizontalArrangement = Arrangement.SpaceBetween,
-                                        verticalAlignment = Alignment.CenterVertically
                                     ) {
-                                        Column(modifier = Modifier.weight(1f)) {
-                                            Text(
-                                                text = script.label,
-                                                fontFamily = InterFamily,
-                                                fontWeight = FontWeight.Medium,
-                                                fontSize = 13.sp,
-                                                color = MaterialTheme.colorScheme.onSurface
-                                            )
-                                            Text(
-                                                text = when (st) {
-                                                    ModelPackStatus.DOWNLOADED -> "Ready via Play Services"
-                                                    ModelPackStatus.DOWNLOADING -> "Installing module…"
-                                                    ModelPackStatus.ERROR -> mlKitOcrErrors[script.code] ?: "Play Services error"
-                                                    ModelPackStatus.NOT_DOWNLOADED -> "On-demand (${script.sizeHint})"
-                                                },
-                                                fontFamily = InterFamily,
-                                                fontSize = 11.5.sp,
-                                                color = when (st) {
-                                                    ModelPackStatus.DOWNLOADED -> EmeraldActive
-                                                    ModelPackStatus.DOWNLOADING -> MaterialTheme.colorScheme.primary
-                                                    ModelPackStatus.ERROR -> CoralError
-                                                    ModelPackStatus.NOT_DOWNLOADED -> MaterialTheme.colorScheme.onSurfaceVariant
-                                                },
-                                                maxLines = 1,
-                                                overflow = TextOverflow.Ellipsis
-                                            )
-                                        }
-                                        when (st) {
-                                            ModelPackStatus.DOWNLOADED -> {
-                                                Icon(
-                                                    imageVector = Icons.Rounded.CheckCircle,
-                                                    contentDescription = "Ready",
-                                                    tint = EmeraldActive,
-                                                    modifier = Modifier.size(20.dp)
+                                        Row(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .heightIn(min = 48.dp)
+                                                .padding(horizontal = 12.dp, vertical = 6.dp),
+                                            horizontalArrangement = Arrangement.SpaceBetween,
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            Column(modifier = Modifier.weight(1f)) {
+                                                Text(
+                                                    text = script.label,
+                                                    fontFamily = InterFamily,
+                                                    fontWeight = FontWeight.Medium,
+                                                    fontSize = 13.sp,
+                                                    color = MaterialTheme.colorScheme.onSurface
+                                                )
+                                                Text(
+                                                    text = when (st) {
+                                                        ModelPackStatus.DOWNLOADED -> "Ready via Play Services"
+                                                        ModelPackStatus.DOWNLOADING -> "Installing ${(p * 100).roundToInt()}%"
+                                                        ModelPackStatus.ERROR -> mlKitOcrErrors[script.code] ?: "Play Services error"
+                                                        ModelPackStatus.NOT_DOWNLOADED -> "On-demand (${script.sizeHint})"
+                                                    },
+                                                    fontFamily = InterFamily,
+                                                    fontSize = 11.5.sp,
+                                                    color = when (st) {
+                                                        ModelPackStatus.DOWNLOADED -> MaterialTheme.colorScheme.primary
+                                                        ModelPackStatus.DOWNLOADING -> MaterialTheme.colorScheme.primary
+                                                        ModelPackStatus.ERROR -> CoralError
+                                                        ModelPackStatus.NOT_DOWNLOADED -> MaterialTheme.colorScheme.onSurfaceVariant
+                                                    },
+                                                    maxLines = 1,
+                                                    overflow = TextOverflow.Ellipsis
                                                 )
                                             }
-                                            ModelPackStatus.DOWNLOADING -> {
-                                                CircularProgressIndicator(
-                                                    color = MaterialTheme.colorScheme.primary,
-                                                    strokeWidth = 2.dp,
-                                                    modifier = Modifier.size(18.dp)
-                                                )
-                                            }
-                                            ModelPackStatus.NOT_DOWNLOADED, ModelPackStatus.ERROR -> {
-                                                OutlinedButton(
-                                                    onClick = { onDownloadMlKitOcrScript(script.code) },
-                                                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
-                                                    modifier = Modifier
-                                                        .heightIn(min = 48.dp)
-                                                        .testTag("mlkit_ocr_get_${script.code}")
-                                                ) {
-                                                    Text(
-                                                        text = if (st == ModelPackStatus.ERROR) "Retry" else "Get",
-                                                        fontSize = 12.sp
+                                            when (st) {
+                                                ModelPackStatus.DOWNLOADED -> {
+                                                    Icon(
+                                                        imageVector = Icons.Rounded.CheckCircle,
+                                                        contentDescription = "Ready",
+                                                        tint = MaterialTheme.colorScheme.primary,
+                                                        modifier = Modifier.size(20.dp)
                                                     )
                                                 }
+                                                ModelPackStatus.DOWNLOADING -> {
+                                                    CircularProgressIndicator(
+                                                        progress = { p },
+                                                        color = MaterialTheme.colorScheme.primary,
+                                                        trackColor = MaterialTheme.colorScheme.background,
+                                                        strokeWidth = 2.dp,
+                                                        modifier = Modifier.size(18.dp)
+                                                    )
+                                                }
+                                                ModelPackStatus.NOT_DOWNLOADED, ModelPackStatus.ERROR -> {
+                                                    OutlinedButton(
+                                                        onClick = { onDownloadMlKitOcrScript(script.code) },
+                                                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
+                                                        modifier = Modifier
+                                                            .heightIn(min = 48.dp)
+                                                            .testTag("mlkit_ocr_get_${script.code}")
+                                                    ) {
+                                                        Text(
+                                                            text = if (st == ModelPackStatus.ERROR) "Retry" else "Get",
+                                                            fontSize = 12.sp
+                                                        )
+                                                    }
+                                                }
                                             }
+                                        }
+                                        if (st == ModelPackStatus.DOWNLOADING) {
+                                            LinearProgressIndicator(
+                                                progress = { p },
+                                                color = MaterialTheme.colorScheme.primary,
+                                                trackColor = MaterialTheme.colorScheme.background,
+                                                modifier = Modifier
+                                                    .fillMaxWidth()
+                                                    .height(2.5.dp)
+                                            )
                                         }
                                     }
                                 }
@@ -901,75 +958,93 @@ fun DashboardScreen(
 
                                 SupportedTesseractOcrPacks.forEach { pack ->
                                     val st = tessOcrStatuses[pack.code] ?: ModelPackStatus.NOT_DOWNLOADED
-                                    Row(
+                                    val p = (tessOcrProgress[pack.code] ?: 0.04f).coerceIn(0f, 1f)
+                                    Column(
                                         modifier = Modifier
                                             .fillMaxWidth()
-                                            .heightIn(min = 48.dp)
                                             .clip(RoundedCornerShape(10.dp))
                                             .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f))
-                                            .padding(horizontal = 12.dp, vertical = 6.dp),
-                                        horizontalArrangement = Arrangement.SpaceBetween,
-                                        verticalAlignment = Alignment.CenterVertically
                                     ) {
-                                        Column(modifier = Modifier.weight(1f)) {
-                                            Text(
-                                                text = "${pack.label} (${pack.shortCode})",
-                                                fontFamily = InterFamily,
-                                                fontWeight = FontWeight.Medium,
-                                                fontSize = 13.sp,
-                                                color = MaterialTheme.colorScheme.onSurface
-                                            )
-                                            Text(
-                                                text = when (st) {
-                                                    ModelPackStatus.DOWNLOADED -> "Ready (${pack.sizeHint})"
-                                                    ModelPackStatus.DOWNLOADING -> "Downloading ${pack.sizeHint}…"
-                                                    ModelPackStatus.ERROR -> tessOcrErrors[pack.code] ?: "Download failed"
-                                                    ModelPackStatus.NOT_DOWNLOADED -> "Download (${pack.sizeHint})"
-                                                },
-                                                fontFamily = InterFamily,
-                                                fontSize = 11.5.sp,
-                                                color = when (st) {
-                                                    ModelPackStatus.DOWNLOADED -> EmeraldActive
-                                                    ModelPackStatus.DOWNLOADING -> MaterialTheme.colorScheme.primary
-                                                    ModelPackStatus.ERROR -> CoralError
-                                                    ModelPackStatus.NOT_DOWNLOADED -> MaterialTheme.colorScheme.onSurfaceVariant
-                                                },
-                                                maxLines = 1,
-                                                overflow = TextOverflow.Ellipsis
-                                            )
-                                        }
-                                        when (st) {
-                                            ModelPackStatus.DOWNLOADED -> {
-                                                TextButton(
-                                                    onClick = { onDeleteTesseractOcrPack(pack.code) },
-                                                    modifier = Modifier
-                                                        .heightIn(min = 48.dp)
-                                                        .testTag("tess_ocr_delete_${pack.code}")
-                                                ) {
-                                                    Text("Remove", fontSize = 12.sp)
-                                                }
-                                            }
-                                            ModelPackStatus.DOWNLOADING -> {
-                                                CircularProgressIndicator(
-                                                    color = MaterialTheme.colorScheme.primary,
-                                                    strokeWidth = 2.dp,
-                                                    modifier = Modifier.size(18.dp)
+                                        Row(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .heightIn(min = 48.dp)
+                                                .padding(horizontal = 12.dp, vertical = 6.dp),
+                                            horizontalArrangement = Arrangement.SpaceBetween,
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            Column(modifier = Modifier.weight(1f)) {
+                                                Text(
+                                                    text = "${pack.label} (${pack.shortCode})",
+                                                    fontFamily = InterFamily,
+                                                    fontWeight = FontWeight.Medium,
+                                                    fontSize = 13.sp,
+                                                    color = MaterialTheme.colorScheme.onSurface
+                                                )
+                                                Text(
+                                                    text = when (st) {
+                                                        ModelPackStatus.DOWNLOADED -> "Ready (${pack.sizeHint})"
+                                                        ModelPackStatus.DOWNLOADING -> "Downloading ${(p * 100).roundToInt()}% (${pack.sizeHint})"
+                                                        ModelPackStatus.ERROR -> tessOcrErrors[pack.code] ?: "Download failed"
+                                                        ModelPackStatus.NOT_DOWNLOADED -> "Download (${pack.sizeHint})"
+                                                    },
+                                                    fontFamily = InterFamily,
+                                                    fontSize = 11.5.sp,
+                                                    color = when (st) {
+                                                        ModelPackStatus.DOWNLOADED -> MaterialTheme.colorScheme.primary
+                                                        ModelPackStatus.DOWNLOADING -> MaterialTheme.colorScheme.primary
+                                                        ModelPackStatus.ERROR -> CoralError
+                                                        ModelPackStatus.NOT_DOWNLOADED -> MaterialTheme.colorScheme.onSurfaceVariant
+                                                    },
+                                                    maxLines = 1,
+                                                    overflow = TextOverflow.Ellipsis
                                                 )
                                             }
-                                            ModelPackStatus.NOT_DOWNLOADED, ModelPackStatus.ERROR -> {
-                                                OutlinedButton(
-                                                    onClick = { onDownloadTesseractOcrPack(pack.code) },
-                                                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
-                                                    modifier = Modifier
-                                                        .heightIn(min = 48.dp)
-                                                        .testTag("tess_ocr_get_${pack.code}")
-                                                ) {
-                                                    Text(
-                                                        text = if (st == ModelPackStatus.ERROR) "Retry" else "Get",
-                                                        fontSize = 12.sp
+                                            when (st) {
+                                                ModelPackStatus.DOWNLOADED -> {
+                                                    TextButton(
+                                                        onClick = { onDeleteTesseractOcrPack(pack.code) },
+                                                        modifier = Modifier
+                                                            .heightIn(min = 48.dp)
+                                                            .testTag("tess_ocr_delete_${pack.code}")
+                                                    ) {
+                                                        Text("Remove", fontSize = 12.sp)
+                                                    }
+                                                }
+                                                ModelPackStatus.DOWNLOADING -> {
+                                                    CircularProgressIndicator(
+                                                        progress = { p },
+                                                        color = MaterialTheme.colorScheme.primary,
+                                                        trackColor = MaterialTheme.colorScheme.background,
+                                                        strokeWidth = 2.dp,
+                                                        modifier = Modifier.size(18.dp)
                                                     )
                                                 }
+                                                ModelPackStatus.NOT_DOWNLOADED, ModelPackStatus.ERROR -> {
+                                                    OutlinedButton(
+                                                        onClick = { onDownloadTesseractOcrPack(pack.code) },
+                                                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
+                                                        modifier = Modifier
+                                                            .heightIn(min = 48.dp)
+                                                            .testTag("tess_ocr_get_${pack.code}")
+                                                    ) {
+                                                        Text(
+                                                            text = if (st == ModelPackStatus.ERROR) "Retry" else "Get",
+                                                            fontSize = 12.sp
+                                                        )
+                                                    }
+                                                }
                                             }
+                                        }
+                                        if (st == ModelPackStatus.DOWNLOADING) {
+                                            LinearProgressIndicator(
+                                                progress = { p },
+                                                color = MaterialTheme.colorScheme.primary,
+                                                trackColor = MaterialTheme.colorScheme.background,
+                                                modifier = Modifier
+                                                    .fillMaxWidth()
+                                                    .height(2.5.dp)
+                                            )
                                         }
                                     }
                                 }
@@ -1013,22 +1088,33 @@ fun DashboardScreen(
 @Composable
 private fun PackDot(
     status: ModelPackStatus,
-    spinnerColor: Color
+    accentColor: Color,
+    progress: Float? = null
 ) {
     when (status) {
         ModelPackStatus.DOWNLOADING -> {
-            CircularProgressIndicator(
-                color = spinnerColor,
-                strokeWidth = 1.8.dp,
-                modifier = Modifier.size(10.dp)
-            )
+            if (progress != null) {
+                CircularProgressIndicator(
+                    progress = { progress.coerceIn(0f, 1f) },
+                    color = accentColor,
+                    trackColor = accentColor.copy(alpha = 0.25f),
+                    strokeWidth = 1.8.dp,
+                    modifier = Modifier.size(10.dp)
+                )
+            } else {
+                CircularProgressIndicator(
+                    color = accentColor,
+                    strokeWidth = 1.8.dp,
+                    modifier = Modifier.size(10.dp)
+                )
+            }
         }
         ModelPackStatus.DOWNLOADED -> {
             Box(
                 modifier = Modifier
                     .size(7.dp)
                     .clip(CircleShape)
-                    .background(EmeraldActive)
+                    .background(accentColor)
             )
         }
         ModelPackStatus.ERROR -> {
@@ -1063,7 +1149,7 @@ private fun StatusChip(
             fontFamily = SpaceGroteskFamily,
             fontWeight = FontWeight.SemiBold,
             fontSize = 13.5.sp,
-            color = if (isActive) EmeraldActive else AmberWarn
+            color = if (isActive) MaterialTheme.colorScheme.primary else AmberWarn
         )
     }
 }
@@ -1073,6 +1159,7 @@ fun MiniPhoneZonePreview(
     config: GestureZoneConfig,
     modifier: Modifier = Modifier
 ) {
+    val previewAccent = MaterialTheme.colorScheme.primary
     Surface(
         shape = RoundedCornerShape(7.dp),
         color = Color(0xFF0E1016),
@@ -1095,7 +1182,7 @@ fun MiniPhoneZonePreview(
             }
 
             drawRoundRect(
-                color = ElectricCyan.copy(alpha = 0.45f),
+                color = previewAccent.copy(alpha = 0.45f),
                 topLeft = Offset(left, top),
                 size = Size(w, h),
                 cornerRadius = CornerRadius(2.dp.toPx(), 2.dp.toPx())

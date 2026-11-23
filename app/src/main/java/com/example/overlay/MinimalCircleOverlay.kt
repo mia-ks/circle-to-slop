@@ -118,13 +118,184 @@ import com.example.ui.theme.SpaceGroteskFamily
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlin.math.PI
+import kotlin.math.abs
+import kotlin.math.atan2
+import kotlin.math.cos
+import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.roundToInt
+import kotlin.math.sign
+import kotlin.math.sin
 
 private sealed interface SelectionGeometry {
     data class Freehand(val points: List<Offset>, val isClosed: Boolean) : SelectionGeometry
     data class BoxRect(val left: Float, val top: Float, val right: Float, val bottom: Float) : SelectionGeometry
     data class LensWords(val range: TextSelectionRange) : SelectionGeometry
+}
+
+data class CorrectedFreehandShape(
+    val points: List<Offset>,
+    val left: Float,
+    val top: Float,
+    val right: Float,
+    val bottom: Float
+)
+
+/**
+ * Applies slight geometric shape correction when a freehand loop is finished:
+ * near-circular/elliptical loops gently snap toward a clean ellipse/circle,
+ * near-rectangular loops snap toward a rounded rectangle, and arbitrary freehand
+ * contours receive light multi-pass smoothing.
+ */
+fun correctFreehandShape(rawPoints: List<Offset>): CorrectedFreehandShape {
+    if (rawPoints.size < 4) {
+        val l = rawPoints.minOfOrNull { it.x } ?: 0f
+        val t = rawPoints.minOfOrNull { it.y } ?: 0f
+        val r = rawPoints.maxOfOrNull { it.x } ?: 0f
+        val b = rawPoints.maxOfOrNull { it.y } ?: 0f
+        return CorrectedFreehandShape(rawPoints, l, t, r, b)
+    }
+
+    // Pass 1: reduce raw finger jitter
+    val smoothed = MutableList(rawPoints.size) { i ->
+        val prev = rawPoints[(i - 1 + rawPoints.size) % rawPoints.size]
+        val cur = rawPoints[i]
+        val next = rawPoints[(i + 1) % rawPoints.size]
+        Offset(
+            x = prev.x * 0.22f + cur.x * 0.56f + next.x * 0.22f,
+            y = prev.y * 0.22f + cur.y * 0.56f + next.y * 0.22f
+        )
+    }
+
+    var minX = Float.MAX_VALUE
+    var minY = Float.MAX_VALUE
+    var maxX = -Float.MAX_VALUE
+    var maxY = -Float.MAX_VALUE
+    for (p in smoothed) {
+        if (p.x < minX) minX = p.x
+        if (p.y < minY) minY = p.y
+        if (p.x > maxX) maxX = p.x
+        if (p.y > maxY) maxY = p.y
+    }
+
+    val w = (maxX - minX).coerceAtLeast(4f)
+    val h = (maxY - minY).coerceAtLeast(4f)
+    val cx = (minX + maxX) * 0.5f
+    val cy = (minY + maxY) * 0.5f
+    val rx = w * 0.5f
+    val ry = h * 0.5f
+
+    var ellipseErrSum = 0f
+    var boxErrSum = 0f
+    for (p in smoothed) {
+        val nx = (p.x - cx) / rx
+        val ny = (p.y - cy) / ry
+        ellipseErrSum += abs(hypot(nx, ny) - 1f)
+        boxErrSum += abs(max(abs(nx), abs(ny)) - 1f)
+    }
+    val ellipseErr = ellipseErrSum / smoothed.size
+    val boxErr = boxErrSum / smoothed.size
+
+    val sampleCount = 48
+    val twoPi = (2.0 * PI).toFloat()
+
+    // Bucket observed radial multiplier per angle around centroid
+    fun radialProfileAt(angle: Float, idealRadiusAt: (Float) -> Float): Float {
+        val binHalfWidth = twoPi / 12f
+        var weightSum = 0f
+        var ratioSum = 0f
+        for (p in smoothed) {
+            val dx = (p.x - cx) / rx
+            val dy = (p.y - cy) / ry
+            val pAngle = atan2(dy, dx)
+            var dAngle = abs(pAngle - angle)
+            if (dAngle > PI.toFloat()) dAngle = twoPi - dAngle
+            if (dAngle <= binHalfWidth) {
+                val weight = 1f - (dAngle / binHalfWidth)
+                val obsR = hypot(dx, dy)
+                val idealR = idealRadiusAt(pAngle).coerceAtLeast(0.15f)
+                weightSum += weight
+                ratioSum += weight * (obsR / idealR)
+            }
+        }
+        return if (weightSum > 0f) (ratioSum / weightSum).coerceIn(0.65f, 1.35f) else 1f
+    }
+
+    val corrected: List<Offset> = when {
+        ellipseErr < 0.24f && ellipseErr <= boxErr + 0.04f -> {
+            // Near-circle or oval loop -> gentle snap toward clean ellipse / circle
+            val aspect = min(rx, ry) / max(rx, ry)
+            val targetRx: Float
+            val targetRy: Float
+            if (aspect >= 0.78f) {
+                val avgR = (rx + ry) * 0.5f
+                targetRx = rx * 0.40f + avgR * 0.60f
+                targetRy = ry * 0.40f + avgR * 0.60f
+            } else {
+                targetRx = rx
+                targetRy = ry
+            }
+            List(sampleCount) { idx ->
+                val theta = (idx.toFloat() / sampleCount.toFloat()) * twoPi - PI.toFloat()
+                val obsMult = radialProfileAt(theta) { 1f }
+                val blendedMult = obsMult * 0.30f + 1.0f * 0.70f
+                Offset(
+                    x = cx + targetRx * blendedMult * cos(theta),
+                    y = cy + targetRy * blendedMult * sin(theta)
+                )
+            }
+        }
+
+        boxErr < 0.19f -> {
+            // Near-rectangular loop -> gentle snap toward clean rounded box
+            val boxIdeal: (Float) -> Float = { theta ->
+                val c = abs(cos(theta)).coerceAtLeast(1e-4f)
+                val s = abs(sin(theta)).coerceAtLeast(1e-4f)
+                // Superellipse n=6 gives crisp rounded corners matching natural box gestures
+                val c6 = (c * c).let { it * it * it }
+                val s6 = (s * s).let { it * it * it }
+                val invR = kotlin.math.exp(kotlin.math.ln((c6 + s6).toDouble()) / 6.0).toFloat()
+                1f / invR.coerceAtLeast(0.5f)
+            }
+            List(sampleCount) { idx ->
+                val theta = (idx.toFloat() / sampleCount.toFloat()) * twoPi - PI.toFloat()
+                val idealR = boxIdeal(theta)
+                val obsMult = radialProfileAt(theta, boxIdeal)
+                val blendedMult = obsMult * 0.30f + 1.0f * 0.70f
+                Offset(
+                    x = cx + rx * idealR * blendedMult * cos(theta),
+                    y = cy + ry * idealR * blendedMult * sin(theta)
+                )
+            }
+        }
+
+        else -> {
+            // Irregular freehand lasso: extra light closed smoothing pass
+            List(smoothed.size) { i ->
+                val prev = smoothed[(i - 1 + smoothed.size) % smoothed.size]
+                val cur = smoothed[i]
+                val next = smoothed[(i + 1) % smoothed.size]
+                Offset(
+                    x = prev.x * 0.25f + cur.x * 0.50f + next.x * 0.25f,
+                    y = prev.y * 0.25f + cur.y * 0.50f + next.y * 0.25f
+                )
+            }
+        }
+    }
+
+    val cMinX = corrected.minOf { it.x }
+    val cMinY = corrected.minOf { it.y }
+    val cMaxX = corrected.maxOf { it.x }
+    val cMaxY = corrected.maxOf { it.y }
+    return CorrectedFreehandShape(
+        points = corrected,
+        left = cMinX,
+        top = cMinY,
+        right = cMaxX,
+        bottom = cMaxY
+    )
 }
 
 fun buildSmoothedFreehandPath(points: List<Offset>, isClosed: Boolean): Path {
@@ -669,14 +840,18 @@ fun MinimalCircleOverlay(
                                     selection = SelectionGeometry.BoxRect(l, t, r, b)
                                     completeRegionSelection(w, h, l, t, r, b)
                                 } else {
-                                    selection = SelectionGeometry.Freehand(currentPoints.toList(), isClosed = true)
+                                    val corrected = correctFreehandShape(currentPoints)
+                                    val clampedPoints = corrected.points.map { pt ->
+                                        Offset(pt.x.coerceIn(0f, w), pt.y.coerceIn(0f, h))
+                                    }
+                                    selection = SelectionGeometry.Freehand(clampedPoints, isClosed = true)
                                     completeRegionSelection(
                                         w,
                                         h,
-                                        minX.coerceAtLeast(0f),
-                                        minY.coerceAtLeast(0f),
-                                        maxX.coerceAtMost(w),
-                                        maxY.coerceAtMost(h)
+                                        corrected.left.coerceIn(0f, w),
+                                        corrected.top.coerceIn(0f, h),
+                                        corrected.right.coerceIn(0f, w),
+                                        corrected.bottom.coerceIn(0f, h)
                                     )
                                 }
                             },
@@ -696,20 +871,37 @@ fun MinimalCircleOverlay(
                 }
                 drawRect(color = Color.Black.copy(alpha = tintAlpha))
 
-                // Whisper-subtle Lens baseline underlines on indexed words so selectable text is obvious without clutter
+                // Full-word rounded highlights on selectable detected words so OCR targets are immediately clear
                 if ((activeSel == null || activeSel is SelectionGeometry.LensWords) && fullScreenWords.isNotEmpty()) {
                     val sx = size.width / screenshotBitmap.width
                     val sy = size.height / screenshotBitmap.height
-                    val underlineStroke = 1.2.dp.toPx()
-                    for (line in fullScreenLines) {
-                        val b = line.boundingBox
-                        val y = b.bottom * sy + 1.5f
-                        drawLine(
-                            color = Color.White.copy(alpha = 0.28f),
-                            start = Offset(b.left * sx, y),
-                            end = Offset(b.right * sx, y),
-                            strokeWidth = underlineStroke,
-                            cap = StrokeCap.Round
+                    val selectedRange = (activeSel as? SelectionGeometry.LensWords)?.range
+                    val padX = 2.dp.toPx()
+                    val padY = 1.dp.toPx()
+                    val wordCorner = 4.dp.toPx()
+                    val wordBorderWidth = 0.9.dp.toPx()
+                    for (word in fullScreenWords) {
+                        if (selectedRange != null && word.globalIndex in selectedRange.minIndex..selectedRange.maxIndex) {
+                            continue
+                        }
+                        val b = word.boundingBox
+                        val wl = b.left * sx - padX
+                        val wt = b.top * sy - padY
+                        val ww = b.width() * sx + padX * 2f
+                        val wh = b.height() * sy + padY * 2f
+                        if (ww <= 1f || wh <= 1f) continue
+                        drawRoundRect(
+                            color = Color.White.copy(alpha = 0.15f),
+                            topLeft = Offset(wl, wt),
+                            size = Size(ww, wh),
+                            cornerRadius = CornerRadius(wordCorner, wordCorner)
+                        )
+                        drawRoundRect(
+                            color = Color.White.copy(alpha = 0.34f),
+                            topLeft = Offset(wl, wt),
+                            size = Size(ww, wh),
+                            cornerRadius = CornerRadius(wordCorner, wordCorner),
+                            style = Stroke(width = wordBorderWidth)
                         )
                     }
                 }
@@ -1742,17 +1934,32 @@ private fun CompactLookupSheet(
 
                         when (val tState = translationState) {
                             is TranslationState.DownloadingModel -> {
+                                val pct = (tState.progress.coerceIn(0f, 1f) * 100f).roundToInt()
                                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                                    Text(
-                                        text = "Downloading ${tState.engineLabel} pack: ${tState.missingPacksLabel} (~30 MB each)…",
-                                        color = Color(0xFFD1D5DB),
-                                        fontFamily = InterFamily,
-                                        fontSize = 12.5.sp
-                                    )
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .horizontalScroll(rememberScrollState()),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Text(
+                                            text = "Downloading ${tState.missingPacksLabel} ($pct% · ${tState.engineLabel})…",
+                                            color = Color(0xFFD1D5DB),
+                                            fontFamily = InterFamily,
+                                            fontSize = 12.5.sp,
+                                            maxLines = 1,
+                                            softWrap = false,
+                                            modifier = Modifier.testTag("lookup_download_queue_text")
+                                        )
+                                    }
                                     LinearProgressIndicator(
+                                        progress = { tState.progress.coerceIn(0f, 1f) },
                                         color = accentColor,
                                         trackColor = Color(0xFF2B2B36),
-                                        modifier = Modifier.fillMaxWidth()
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .clip(RoundedCornerShape(999.dp))
+                                            .testTag("lookup_download_progress")
                                     )
                                     OutlinedButton(
                                         onClick = { onWebTranslate(editableText) },
@@ -2019,42 +2226,73 @@ private fun InlineTranslateBottomBar(
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                     modifier = Modifier.weight(1f)
                 ) {
-                    if (isRunningMoE || inlineTranslationState.isTranslating) {
-                        CircularProgressIndicator(
-                            color = accentColor,
-                            strokeWidth = 2.dp,
-                            modifier = Modifier.size(16.dp)
-                        )
+                    val dlProgress = inlineTranslationState.downloadProgress.coerceIn(0f, 1f)
+                    val dlPct = (dlProgress * 100f).roundToInt()
+                    when {
+                        inlineTranslationState.isDownloadingPacks -> {
+                            CircularProgressIndicator(
+                                progress = { dlProgress },
+                                color = accentColor,
+                                trackColor = Color(0xFF2B2B36),
+                                strokeWidth = 2.dp,
+                                modifier = Modifier.size(16.dp)
+                            )
+                        }
+                        isRunningMoE || inlineTranslationState.isTranslating -> {
+                            CircularProgressIndicator(
+                                color = accentColor,
+                                strokeWidth = 2.dp,
+                                modifier = Modifier.size(16.dp)
+                            )
+                        }
+                        else -> {
+                            Icon(
+                                imageVector = Icons.Rounded.Translate,
+                                contentDescription = null,
+                                tint = accentColor,
+                                modifier = Modifier.size(17.dp)
+                            )
+                        }
+                    }
+                    if (inlineTranslationState.isDownloadingPacks) {
+                        Box(
+                            modifier = Modifier
+                                .weight(1f)
+                                .horizontalScroll(rememberScrollState())
+                        ) {
+                            Text(
+                                text = "Downloading ${inlineTranslationState.missingPacksLabel} ($dlPct%)",
+                                color = Color.White,
+                                fontFamily = SpaceGroteskFamily,
+                                fontWeight = FontWeight.Medium,
+                                fontSize = 13.sp,
+                                maxLines = 1,
+                                softWrap = false,
+                                modifier = Modifier.testTag("inline_download_queue_text")
+                            )
+                        }
                     } else {
-                        Icon(
-                            imageVector = Icons.Rounded.Translate,
-                            contentDescription = null,
-                            tint = accentColor,
-                            modifier = Modifier.size(17.dp)
+                        Text(
+                            text = when {
+                                isRunningMoE ->
+                                    "Scanning scripts…"
+                                inlineTranslationState.isTranslating ->
+                                    "Translating ($translatedCount)…"
+                                inlineTranslationState.errorMessage != null ->
+                                    "Offline pack unavailable"
+                                translatedCount > 0 ->
+                                    "$translatedCount translated"
+                                else ->
+                                    "Same language"
+                            },
+                            color = Color.White,
+                            fontFamily = SpaceGroteskFamily,
+                            fontWeight = FontWeight.Medium,
+                            fontSize = 13.sp,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
                         )
                     }
-                    Text(
-                        text = when {
-                            isRunningMoE ->
-                                "Scanning scripts…"
-                            inlineTranslationState.isDownloadingPacks ->
-                                "Downloading ${inlineTranslationState.missingPacksLabel}…"
-                            inlineTranslationState.isTranslating ->
-                                "Translating ($translatedCount)…"
-                            inlineTranslationState.errorMessage != null ->
-                                "Offline pack unavailable"
-                            translatedCount > 0 ->
-                                "$translatedCount translated"
-                            else ->
-                                "Same language"
-                        },
-                        color = Color.White,
-                        fontFamily = SpaceGroteskFamily,
-                        fontWeight = FontWeight.Medium,
-                        fontSize = 13.sp,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
                 }
 
                 Row(
@@ -2125,9 +2363,13 @@ private fun InlineTranslateBottomBar(
 
             if (inlineTranslationState.isDownloadingPacks) {
                 LinearProgressIndicator(
+                    progress = { inlineTranslationState.downloadProgress.coerceIn(0f, 1f) },
                     color = accentColor,
                     trackColor = Color(0xFF2B2B36),
-                    modifier = Modifier.fillMaxWidth()
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(999.dp))
+                        .testTag("inline_download_progress")
                 )
                 val targetText = focusedBlock?.text?.ifBlank { null } ?: fallbackScreenText
                 if (targetText.isNotBlank()) {

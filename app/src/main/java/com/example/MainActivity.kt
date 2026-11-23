@@ -46,10 +46,13 @@ fun QuickCircleApp(
     val isAccessibilityEnabled by viewModel.isAccessibilityEnabled.collectAsStateWithLifecycle()
     val packStatuses by viewModel.packStatuses.collectAsStateWithLifecycle()
     val packErrors by viewModel.packErrors.collectAsStateWithLifecycle()
+    val packProgress by viewModel.packProgress.collectAsStateWithLifecycle()
     val mlKitOcrStatuses by viewModel.mlKitOcrStatuses.collectAsStateWithLifecycle()
     val mlKitOcrErrors by viewModel.mlKitOcrErrors.collectAsStateWithLifecycle()
+    val mlKitOcrProgress by viewModel.mlKitOcrProgress.collectAsStateWithLifecycle()
     val tessOcrStatuses by viewModel.tessOcrStatuses.collectAsStateWithLifecycle()
     val tessOcrErrors by viewModel.tessOcrErrors.collectAsStateWithLifecycle()
+    val tessOcrProgress by viewModel.tessOcrProgress.collectAsStateWithLifecycle()
     val lifecycleOwner = LocalLifecycleOwner.current
 
     DisposableEffect(lifecycleOwner) {
@@ -74,10 +77,13 @@ fun QuickCircleApp(
                 isAccessibilityEnabled = isAccessibilityEnabled,
                 packStatuses = packStatuses,
                 packErrors = packErrors,
+                packProgress = packProgress,
                 mlKitOcrStatuses = mlKitOcrStatuses,
                 mlKitOcrErrors = mlKitOcrErrors,
+                mlKitOcrProgress = mlKitOcrProgress,
                 tessOcrStatuses = tessOcrStatuses,
                 tessOcrErrors = tessOcrErrors,
+                tessOcrProgress = tessOcrProgress,
                 onOpenZoneEditor = { navController.navigate(ROUTE_ZONE_EDITOR) },
                 onOpenSandbox = { navController.navigate(ROUTE_SANDBOX) },
                 onToggleTriggerEnabled = viewModel::setTriggerEnabled,

@@ -25,10 +25,14 @@ import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
@@ -38,6 +42,9 @@ import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
+import kotlin.math.abs
+import kotlin.math.exp
+import kotlin.math.max
 
 data class RecognizedTextWord(
     val globalIndex: Int,
@@ -64,7 +71,12 @@ data class InlineTextBlock(
     val detectedLanguageCode: String?,
     val backgroundColorArgb: Int,
     val foregroundColorArgb: Int,
-    val sourceLines: List<String> = emptyList()
+    val sourceLines: List<String> = emptyList(),
+    val tiltZDeg: Float = 0f,
+    val tiltXDeg: Float = 0f,
+    val tiltYDeg: Float = 0f,
+    val quadWidthPx: Float = 0f,
+    val quadHeightPx: Float = 0f
 )
 
 data class ScreenOcrAnalysis(
@@ -85,6 +97,7 @@ data class InlineScreenTranslationState(
     val targetLangCode: String = "en",
     val isDownloadingPacks: Boolean = false,
     val missingPacksLabel: String = "",
+    val downloadProgress: Float = 0f,
     val isTranslating: Boolean = false,
     val blockStates: Map<Int, InlineBlockStatus> = emptyMap(),
     val errorMessage: String? = null
@@ -109,7 +122,8 @@ sealed interface TranslationState {
     data class DownloadingModel(
         val languagePairLabel: String,
         val missingPacksLabel: String,
-        val engineLabel: String = "Google ML Kit Offline"
+        val engineLabel: String = "Google ML Kit Offline",
+        val progress: Float = 0f
     ) : TranslationState
     data object Translating : TranslationState
     data class Success(val translatedText: String, val sourceLangName: String, val targetLangName: String) : TranslationState
@@ -137,6 +151,9 @@ object OcrAndLensEngine {
 
     private val _packErrorFlow = MutableStateFlow<Map<String, String>>(emptyMap())
     val packErrorFlow: StateFlow<Map<String, String>> = _packErrorFlow.asStateFlow()
+
+    private val _packProgressFlow = MutableStateFlow<Map<String, Float>>(emptyMap())
+    val packProgressFlow: StateFlow<Map<String, Float>> = _packProgressFlow.asStateFlow()
 
     fun prewarmLatin(context: Context) {
         try {
@@ -186,6 +203,11 @@ object OcrAndLensEngine {
                     }
                 }
             }
+            _packProgressFlow.update { cur ->
+                val next = cur.toMutableMap()
+                downloadedCodes.forEach { next[it] = 1f }
+                next
+            }
         } catch (e: Exception) {
             Log.w(TAG, "Unable to query downloaded ML Kit packs: ${e.message}")
         }
@@ -207,6 +229,7 @@ object OcrAndLensEngine {
             val msg = e.localizedMessage ?: "ML Kit model manager unavailable"
             _packStatusFlow.update { it + (mlTag to ModelPackStatus.ERROR) }
             _packErrorFlow.update { it + (mlTag to msg) }
+            _packProgressFlow.update { it - mlTag }
             return Result.failure(e)
         }
 
@@ -219,6 +242,7 @@ object OcrAndLensEngine {
         if (alreadyDownloaded) {
             _packStatusFlow.update { it + (mlTag to ModelPackStatus.DOWNLOADED) }
             _packErrorFlow.update { it - mlTag }
+            _packProgressFlow.update { it + (mlTag to 1f) }
             return Result.success(Unit)
         }
 
@@ -231,19 +255,38 @@ object OcrAndLensEngine {
         val deferred = engineScope.async {
             _packStatusFlow.update { it + (mlTag to ModelPackStatus.DOWNLOADING) }
             _packErrorFlow.update { it - mlTag }
+            _packProgressFlow.update { it + (mlTag to 0.06f) }
+
+            val ticker = launch {
+                val startMs = System.currentTimeMillis()
+                while (isActive) {
+                    delay(220L)
+                    val elapsedSec = (System.currentTimeMillis() - startMs) / 1000.0
+                    val est = (0.06 + (1.0 - exp(-elapsedSec / 3.4)) * 0.86)
+                        .toFloat()
+                        .coerceIn(0.06f, 0.92f)
+                    _packProgressFlow.update { cur ->
+                        cur + (mlTag to max(cur[mlTag] ?: 0f, est))
+                    }
+                }
+            }
+
             try {
                 val conditions = DownloadConditions.Builder().build()
                 modelManager.download(model, conditions).awaitTask()
                 _packStatusFlow.update { it + (mlTag to ModelPackStatus.DOWNLOADED) }
                 _packErrorFlow.update { it - mlTag }
+                _packProgressFlow.update { it + (mlTag to 1f) }
                 Result.success(Unit)
             } catch (e: Exception) {
                 Log.e(TAG, "Failed downloading ML Kit pack for $mlTag", e)
                 val friendly = e.localizedMessage ?: "Download failed (check internet or Google Play Services)"
                 _packStatusFlow.update { it + (mlTag to ModelPackStatus.ERROR) }
                 _packErrorFlow.update { it + (mlTag to friendly) }
+                _packProgressFlow.update { it - mlTag }
                 Result.failure(e)
             } finally {
+                ticker.cancel()
                 activeDownloads.remove(mlTag)
             }
         }
@@ -259,6 +302,7 @@ object OcrAndLensEngine {
                 RemoteModelManager.getInstance().deleteDownloadedModel(model).awaitTask()
                 _packStatusFlow.update { it + (mlTag to ModelPackStatus.NOT_DOWNLOADED) }
                 _packErrorFlow.update { it - mlTag }
+                _packProgressFlow.update { it - mlTag }
             } catch (e: Exception) {
                 Log.e(TAG, "Failed deleting ML Kit pack for $mlTag", e)
             }
@@ -470,47 +514,80 @@ object OcrAndLensEngine {
             return
         }
 
-        val missingTags = mutableListOf<String>()
         val allNeededTags = (uniqueMissingSources + mlTarget).distinct()
-        for (tag in allNeededTags) {
-            val downloaded = try {
-                modelManager.isModelDownloaded(TranslateRemoteModel.Builder(tag).build()).awaitTask()
-            } catch (_: Exception) {
-                false
-            }
-            if (!downloaded) {
-                missingTags.add(tag)
-            } else {
-                _packStatusFlow.update { it + (tag to ModelPackStatus.DOWNLOADED) }
-            }
+        val availabilityChecks = coroutineScope {
+            allNeededTags.map { tag ->
+                async(Dispatchers.IO) {
+                    val downloaded = try {
+                        modelManager.isModelDownloaded(TranslateRemoteModel.Builder(tag).build()).awaitTask()
+                    } catch (_: Exception) {
+                        false
+                    }
+                    tag to downloaded
+                }
+            }.awaitAll()
+        }
+        val missingTags = availabilityChecks.filter { !it.second }.map { it.first }
+        availabilityChecks.filter { it.second }.forEach { (tag, _) ->
+            _packStatusFlow.update { it + (tag to ModelPackStatus.DOWNLOADED) }
+            _packProgressFlow.update { it + (tag to 1f) }
         }
 
         if (missingTags.isNotEmpty()) {
-            val missingLabel = missingTags.joinToString(" + ") { formatLanguageName(it) }
+            val missingLabel = missingTags.joinToString(", ") { formatLanguageName(it) }
             onState(
                 InlineScreenTranslationState(
                     targetLangCode = targetLangCode,
                     isDownloadingPacks = true,
                     missingPacksLabel = missingLabel,
+                    downloadProgress = 0.05f,
                     isTranslating = true,
                     blockStates = currentStates.toMap()
                 )
             )
-            for (tag in missingTags) {
-                val res = ensureLanguagePackDownloaded(tag)
-                if (res.isFailure) {
-                    val reason = res.exceptionOrNull()?.localizedMessage ?: "network or Play Services unavailable"
-                    onState(
-                        InlineScreenTranslationState(
-                            targetLangCode = targetLangCode,
-                            isDownloadingPacks = false,
-                            isTranslating = false,
-                            blockStates = currentStates.toMap(),
-                            errorMessage = "Could not download ${formatLanguageName(tag)} offline pack ($reason)."
+
+            val downloadResults = coroutineScope {
+                val watcher = launch {
+                    while (isActive) {
+                        val pMap = _packProgressFlow.value
+                        val avg = missingTags.map { (pMap[it] ?: 0.05f).coerceIn(0f, 1f) }.average().toFloat()
+                        onState(
+                            InlineScreenTranslationState(
+                                targetLangCode = targetLangCode,
+                                isDownloadingPacks = true,
+                                missingPacksLabel = missingLabel,
+                                downloadProgress = avg.coerceIn(0.04f, 0.99f),
+                                isTranslating = true,
+                                blockStates = currentStates.toMap()
+                            )
                         )
-                    )
-                    return
+                        delay(180L)
+                    }
                 }
+                try {
+                    missingTags.map { tag ->
+                        async { tag to ensureLanguagePackDownloaded(tag) }
+                    }.awaitAll()
+                } finally {
+                    watcher.cancel()
+                }
+            }
+
+            val firstFailure = downloadResults.firstOrNull { it.second.isFailure }
+            if (firstFailure != null) {
+                val reason = firstFailure.second.exceptionOrNull()?.localizedMessage
+                    ?: "network or Play Services unavailable"
+                onState(
+                    InlineScreenTranslationState(
+                        targetLangCode = targetLangCode,
+                        isDownloadingPacks = false,
+                        downloadProgress = 0f,
+                        isTranslating = false,
+                        blockStates = currentStates.toMap(),
+                        errorMessage = "Could not download ${formatLanguageName(firstFailure.first)} offline pack ($reason)."
+                    )
+                )
+                return
             }
         }
 
@@ -518,6 +595,7 @@ object OcrAndLensEngine {
             InlineScreenTranslationState(
                 targetLangCode = targetLangCode,
                 isDownloadingPacks = false,
+                downloadProgress = 1f,
                 isTranslating = true,
                 blockStates = currentStates.toMap()
             )
@@ -714,41 +792,51 @@ object OcrAndLensEngine {
             }
 
             if (!sourceDownloaded || !targetDownloaded) {
-                val missingNames = buildList {
-                    if (!sourceDownloaded) add(sourceLabel)
-                    if (!targetDownloaded) add(targetLabel)
+                val missingEntries = buildList {
+                    if (!sourceDownloaded) add(mlSource to sourceLabel)
+                    if (!targetDownloaded) add(mlTarget to targetLabel)
                 }
+                val missingQueueLabel = missingEntries.joinToString(", ") { it.second }
                 onState(
                     TranslationState.DownloadingModel(
                         languagePairLabel = "$sourceLabel -> $targetLabel",
-                        missingPacksLabel = missingNames.joinToString(" + ")
+                        missingPacksLabel = missingQueueLabel,
+                        progress = 0.05f
                     )
                 )
-                if (!sourceDownloaded) {
-                    val res = ensureLanguagePackDownloaded(mlSource)
-                    if (res.isFailure) {
-                        val reason = res.exceptionOrNull()?.localizedMessage ?: "network or Play Services unavailable"
-                        onState(
-                            TranslationState.Error(
-                                message = "Could not download $sourceLabel offline pack ($reason).",
-                                canFallbackToGoogleTranslate = true
+                val downloadResults = coroutineScope {
+                    val watcher = launch {
+                        while (isActive) {
+                            val pMap = _packProgressFlow.value
+                            val avg = missingEntries.map { (tag, _) -> (pMap[tag] ?: 0.05f).coerceIn(0f, 1f) }.average().toFloat()
+                            onState(
+                                TranslationState.DownloadingModel(
+                                    languagePairLabel = "$sourceLabel -> $targetLabel",
+                                    missingPacksLabel = missingQueueLabel,
+                                    progress = avg.coerceIn(0.04f, 0.99f)
+                                )
                             )
-                        )
-                        return
+                            delay(180L)
+                        }
+                    }
+                    try {
+                        missingEntries.map { (tag, label) ->
+                            async { label to ensureLanguagePackDownloaded(tag) }
+                        }.awaitAll()
+                    } finally {
+                        watcher.cancel()
                     }
                 }
-                if (!targetDownloaded) {
-                    val res = ensureLanguagePackDownloaded(mlTarget)
-                    if (res.isFailure) {
-                        val reason = res.exceptionOrNull()?.localizedMessage ?: "network or Play Services unavailable"
-                        onState(
-                            TranslationState.Error(
-                                message = "Could not download $targetLabel offline pack ($reason).",
-                                canFallbackToGoogleTranslate = true
-                            )
+                val failed = downloadResults.firstOrNull { it.second.isFailure }
+                if (failed != null) {
+                    val reason = failed.second.exceptionOrNull()?.localizedMessage ?: "network or Play Services unavailable"
+                    onState(
+                        TranslationState.Error(
+                            message = "Could not download ${failed.first} offline pack ($reason).",
+                            canFallbackToGoogleTranslate = true
                         )
-                        return
-                    }
+                    )
+                    return
                 }
             }
 
@@ -1149,19 +1237,23 @@ object OcrAndLensEngine {
             if (currentGroup.isEmpty()) {
                 currentGroup.add(line)
             } else {
-                val prevRect = currentGroup.last().boundingBox
+                val prevLine = currentGroup.last()
+                val prevRect = prevLine.boundingBox
                 val avgH = currentGroup.map { it.boundingBox.height() }.average().toFloat().coerceAtLeast(8f)
                 val curH = rect.height().toFloat().coerceAtLeast(8f)
                 val vGap = (rect.top - prevRect.bottom).toFloat()
                 val hOverlap = minOf(rect.right, prevRect.right) - maxOf(rect.left, prevRect.left)
                 val minWidth = minOf(rect.width(), prevRect.width()).coerceAtLeast(1)
                 val horizontallyAligned = hOverlap > -avgH * 1.5f && hOverlap.toFloat() / minWidth >= -0.25f
-                val sameExpert = currentGroup.last().expert == line.expert
+                val sameExpert = prevLine.expert == line.expert
+                val samePose = abs(prevLine.tiltZDeg - line.tiltZDeg) <= 10f &&
+                    abs(prevLine.tiltXDeg - line.tiltXDeg) <= 12f
                 val sizeRatio = curH / avgH
                 val sameParagraph = vGap in (-avgH * 0.35f)..(avgH * 0.95f) &&
                     sizeRatio in 0.62f..1.6f &&
                     horizontallyAligned &&
-                    sameExpert
+                    sameExpert &&
+                    samePose
                 if (sameParagraph) {
                     currentGroup.add(line)
                 } else {
@@ -1184,12 +1276,15 @@ object OcrAndLensEngine {
         for ((blockId, groupLines) in visualGroups.withIndex()) {
             val blockBounds = Rect(groupLines.first().boundingBox)
             var heightSum = 0f
+            var uninflatedLineHeightSum = 0f
             val joinedPieces = mutableListOf<String>()
 
             for (candLine in groupLines) {
                 val lineBox = candLine.boundingBox
                 blockBounds.union(lineBox)
+                val localQuadH = if (candLine.quadHeightPx > 0f) candLine.quadHeightPx else lineBox.height().toFloat()
                 heightSum += lineBox.height().toFloat()
+                uninflatedLineHeightSum += localQuadH
                 joinedPieces.add(candLine.text.trim())
 
                 val lineWords = mutableListOf<RecognizedTextWord>()
@@ -1217,6 +1312,26 @@ object OcrAndLensEngine {
                 nextLineIdx++
             }
 
+            val avgTiltZ = groupLines.map { it.tiltZDeg }.average().toFloat()
+            val avgTiltX = groupLines.map { it.tiltXDeg }.average().toFloat()
+            val avgTiltY = groupLines.map { it.tiltYDeg }.average().toFloat()
+            val hasTilt = abs(avgTiltZ) >= 2.0f || abs(avgTiltX) >= 3.0f || abs(avgTiltY) >= 3.0f
+            val quadWidth = if (hasTilt) {
+                groupLines.maxOfOrNull { if (it.quadWidthPx > 0f) it.quadWidthPx else it.boundingBox.width().toFloat() }
+                    ?: blockBounds.width().toFloat()
+            } else {
+                blockBounds.width().toFloat()
+            }
+            val quadHeight = if (hasTilt) {
+                if (groupLines.size == 1) {
+                    groupLines[0].quadHeightPx.takeIf { it > 0f } ?: blockBounds.height().toFloat()
+                } else {
+                    (uninflatedLineHeightSum * 1.18f).coerceAtLeast(16f)
+                }
+            } else {
+                blockBounds.height().toFloat()
+            }
+
             val blockText = joinLinesIntelligently(joinedPieces)
             val cleanedForLang = cleanTextForLanguageId(blockText)
             val langTag = if (enrichLanguagesAndColors && cleanedForLang.length >= 3) {
@@ -1235,11 +1350,16 @@ object OcrAndLensEngine {
                     text = blockText,
                     boundingBox = blockBounds,
                     lineCount = groupLines.size,
-                    averageLineHeightPx = (heightSum / groupLines.size.coerceAtLeast(1)).coerceAtLeast(12f),
+                    averageLineHeightPx = ((if (hasTilt) uninflatedLineHeightSum else heightSum) / groupLines.size.coerceAtLeast(1)).coerceAtLeast(12f),
                     detectedLanguageCode = langTag,
                     backgroundColorArgb = bgArgb,
                     foregroundColorArgb = fgArgb,
-                    sourceLines = joinedPieces.toList()
+                    sourceLines = joinedPieces.toList(),
+                    tiltZDeg = if (abs(avgTiltZ) >= 2.0f) avgTiltZ else 0f,
+                    tiltXDeg = if (abs(avgTiltX) >= 3.0f) avgTiltX else 0f,
+                    tiltYDeg = if (abs(avgTiltY) >= 3.0f) avgTiltY else 0f,
+                    quadWidthPx = quadWidth,
+                    quadHeightPx = quadHeight
                 )
             )
         }

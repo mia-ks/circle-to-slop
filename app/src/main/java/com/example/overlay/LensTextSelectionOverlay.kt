@@ -16,6 +16,7 @@ import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -29,6 +30,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.Fill
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.LayoutCoordinates
 import androidx.compose.ui.layout.onGloballyPositioned
@@ -48,7 +50,6 @@ import com.example.engine.InlineBlockStatus
 import com.example.engine.InlineScreenTranslationState
 import com.example.engine.InlineTextBlock
 import com.example.engine.RecognizedTextWord
-import com.example.ui.theme.ElectricCyan
 import com.example.ui.theme.InterFamily
 import kotlin.math.abs
 import kotlin.math.hypot
@@ -322,6 +323,7 @@ fun LensTeardropHandle(
             .testTag(testTagName),
         contentAlignment = Alignment.TopCenter
     ) {
+        val handleAccentColor = MaterialTheme.colorScheme.primary
         Canvas(
             modifier = Modifier
                 .padding(top = 4.dp)
@@ -359,7 +361,7 @@ fun LensTeardropHandle(
                 close()
             }
 
-            drawPath(path = path, color = ElectricCyan, style = Fill)
+            drawPath(path = path, color = handleAccentColor, style = Fill)
             drawPath(
                 path = path,
                 color = Color.White,
@@ -403,20 +405,49 @@ fun InlineTranslatedBlocksLayer(
                 val status = translationState.blockStates[block.id] ?: continue
                 if (status == InlineBlockStatus.SameLanguage) continue
 
-                val rawL = block.boundingBox.left * sx - padH
-                val rawT = block.boundingBox.top * sy - padV
-                val rawR = block.boundingBox.right * sx + padH
-                val rawB = block.boundingBox.bottom * sy + padV
+                val hasPerspective = block.tiltZDeg != 0f || block.tiltXDeg != 0f || block.tiltYDeg != 0f
+                val left: Float
+                val top: Float
+                val boxW: Float
+                val boxH: Float
+                if (hasPerspective) {
+                    val centerX = block.boundingBox.centerX() * sx
+                    val centerY = block.boundingBox.centerY() * sy
+                    val desiredW = ((if (block.quadWidthPx > 0f) block.quadWidthPx else block.boundingBox.width().toFloat()) * sx + padH * 2f)
+                        .coerceIn(28f, canvasW)
+                    val desiredH = ((if (block.quadHeightPx > 0f) block.quadHeightPx else block.boundingBox.height().toFloat()) * sy + padV * 2f)
+                        .coerceIn(18f, canvasH)
+                    left = (centerX - desiredW * 0.5f).coerceIn(0f, (canvasW - 12f).coerceAtLeast(0f))
+                    top = (centerY - desiredH * 0.5f).coerceIn(0f, (canvasH - 12f).coerceAtLeast(0f))
+                    boxW = desiredW.coerceIn(24f, canvasW - left)
+                    boxH = desiredH.coerceIn(18f, canvasH - top)
+                } else {
+                    val rawL = block.boundingBox.left * sx - padH
+                    val rawT = block.boundingBox.top * sy - padV
+                    val rawR = block.boundingBox.right * sx + padH
+                    val rawB = block.boundingBox.bottom * sy + padV
 
-                val left = rawL.coerceIn(0f, (canvasW - 12f).coerceAtLeast(0f))
-                val top = rawT.coerceIn(0f, (canvasH - 12f).coerceAtLeast(0f))
-                val boxW = (rawR - left).coerceIn(24f, canvasW - left)
-                val boxH = (rawB - top).coerceIn(18f, canvasH - top)
+                    left = rawL.coerceIn(0f, (canvasW - 12f).coerceAtLeast(0f))
+                    top = rawT.coerceIn(0f, (canvasH - 12f).coerceAtLeast(0f))
+                    boxW = (rawR - left).coerceIn(24f, canvasW - left)
+                    boxH = (rawB - top).coerceIn(18f, canvasH - top)
+                }
+
+                val perspectiveModifier = if (hasPerspective) {
+                    Modifier.graphicsLayer {
+                        rotationZ = block.tiltZDeg
+                        rotationX = block.tiltXDeg
+                        rotationY = block.tiltYDeg
+                        cameraDistance = 12f * density.density
+                    }
+                } else {
+                    Modifier
+                }
 
                 val isSelected = selectedBlockId == block.id
                 val bgColor = Color(block.backgroundColorArgb).copy(alpha = 1f)
                 val fgColor = Color(block.foregroundColorArgb)
-                val accentColor = androidx.compose.material3.MaterialTheme.colorScheme.primary
+                val accentColor = MaterialTheme.colorScheme.primary
 
                 when (status) {
                     is InlineBlockStatus.Translated -> {
@@ -455,6 +486,7 @@ fun InlineTranslatedBlocksLayer(
                                     width = with(density) { boxW.toDp() },
                                     height = with(density) { boxH.toDp() }
                                 )
+                                .then(perspectiveModifier)
                                 .clip(RoundedCornerShape(6.dp))
                                 .background(bgColor)
                                 .then(
@@ -493,6 +525,7 @@ fun InlineTranslatedBlocksLayer(
                                     width = with(density) { boxW.toDp() },
                                     height = with(density) { boxH.toDp() }
                                 )
+                                .then(perspectiveModifier)
                                 .clip(RoundedCornerShape(6.dp))
                                 .background(accentColor.copy(alpha = 0.20f))
                                 .border(
@@ -511,6 +544,7 @@ fun InlineTranslatedBlocksLayer(
                                     width = with(density) { boxW.toDp() },
                                     height = with(density) { boxH.toDp() }
                                 )
+                                .then(perspectiveModifier)
                                 .clip(RoundedCornerShape(6.dp))
                                 .border(
                                     width = 1.dp,
