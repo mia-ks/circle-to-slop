@@ -169,6 +169,9 @@ object MoEOcrRouter {
     @Volatile
     private var isMoEPrewarming = false
 
+    @Volatile
+    private var hasRefreshedMlKitModules = false
+
     /**
      * Lightweight startup/service-connect warmup: refreshes pack metadata and keeps only
      * the bundled Latin recognizer ready without allocating heavy MoE weights in RAM.
@@ -356,6 +359,7 @@ object MoEOcrRouter {
                     current + (script.code to next)
                 }
             }
+            hasRefreshedMlKitModules = true
         } catch (e: Exception) {
             Log.w(TAG, "ModuleInstall check unavailable: ${e.message}")
         }
@@ -640,7 +644,10 @@ object MoEOcrRouter {
         }
     }
 
-    private fun resolveMlKitKeys(appCtx: Context, scriptMode: OcrScriptMode): List<String> {
+    private suspend fun resolveMlKitKeys(appCtx: Context, scriptMode: OcrScriptMode): List<String> {
+        if (scriptMode == OcrScriptMode.AUTO_MOE && !hasRefreshedMlKitModules) {
+            refreshAllOcrPacks(appCtx)
+        }
         val mlKitKeys = when (scriptMode) {
             OcrScriptMode.LATIN -> listOf("latin")
             OcrScriptMode.JAPANESE_AND_LATIN -> listOf("latin", "japanese")

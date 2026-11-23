@@ -4,8 +4,6 @@ import android.graphics.Bitmap
 import android.graphics.Rect
 import android.graphics.RectF
 import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -25,7 +23,6 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Close
-import androidx.compose.material.icons.rounded.DragIndicator
 import androidx.compose.material.icons.rounded.Pause
 import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material.icons.rounded.Translate
@@ -59,7 +56,6 @@ import com.example.engine.ModelPackStatus
 import com.example.ui.theme.AmberWarn
 import com.example.ui.theme.EmeraldActive
 import com.example.ui.theme.JetBrainsMonoFamily
-import com.example.ui.theme.SpaceGroteskFamily
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
@@ -156,23 +152,17 @@ fun LiveTranslatedScreenLayer(
     isPaused: Boolean,
     isScrollSettling: Boolean
 ) {
-    AnimatedVisibility(
-        visible = !isPaused && !isScrollSettling && blocks.isNotEmpty(),
-        enter = fadeIn(),
-        exit = fadeOut(),
+    if (isPaused || isScrollSettling || blocks.isEmpty()) return
+    InlineTranslatedBlocksLayer(
+        blocks = blocks,
+        translationState = translationState,
+        bitmapWidth = bitmapWidth,
+        bitmapHeight = bitmapHeight,
+        showOriginal = false,
+        selectedBlockId = null,
+        onBlockTapped = { _, _ -> },
         modifier = Modifier.fillMaxSize()
-    ) {
-        InlineTranslatedBlocksLayer(
-            blocks = blocks,
-            translationState = translationState,
-            bitmapWidth = bitmapWidth,
-            bitmapHeight = bitmapHeight,
-            showOriginal = false,
-            selectedBlockId = null,
-            onBlockTapped = { _, _ -> },
-            modifier = Modifier.fillMaxSize()
-        )
-    }
+    )
 }
 
 @Composable
@@ -186,6 +176,7 @@ fun LiveTranslateHud(
     onSelectTargetLanguage: (String) -> Unit,
     onDragDelta: (dx: Float, dy: Float) -> Unit,
     onStop: () -> Unit,
+    onRefreshNow: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     var showLanguagePicker by remember { mutableStateOf(false) }
@@ -201,24 +192,20 @@ fun LiveTranslateHud(
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.spacedBy(6.dp),
         modifier = modifier
-            .widthIn(max = 320.dp)
+            .widthIn(max = 290.dp)
             .testTag("live_translate_hud")
     ) {
         val rootView = LocalView.current
         Surface(
-            color = Color(0xEB101218),
-            shape = RoundedCornerShape(999.dp),
-            border = BorderStroke(
-                1.dp,
-                if (isPaused) AmberWarn.copy(alpha = 0.55f) else accentColor.copy(alpha = 0.55f)
-            ),
-            shadowElevation = 6.dp
+            color = Color(0xEC0E1016),
+            shape = RoundedCornerShape(16.dp),
+            border = BorderStroke(0.8.dp, Color.White.copy(alpha = 0.13f)),
+            shadowElevation = 8.dp
         ) {
             Row(
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(2.dp),
                 modifier = Modifier
-                    .padding(start = 10.dp, top = 2.dp, end = 4.dp, bottom = 2.dp)
+                    .padding(start = 12.dp, top = 2.dp, end = 2.dp, bottom = 2.dp)
                     .pointerInput(Unit) {
                         val loc = IntArray(2)
                         var lastScreenX = 0f
@@ -243,99 +230,98 @@ fun LiveTranslateHud(
                         )
                     }
             ) {
-                Icon(
-                    imageVector = Icons.Rounded.DragIndicator,
-                    contentDescription = "Drag Live Translate HUD",
-                    tint = Color(0xFF94A3B8),
-                    modifier = Modifier.size(16.dp)
-                )
-
-                val statusColor = when {
-                    isPaused -> AmberWarn
-                    else -> EmeraldActive
-                }
-
-                when {
-                    translationState.isDownloadingPacks -> {
-                        CircularProgressIndicator(
-                            progress = { translationState.downloadProgress.coerceIn(0f, 1f) },
-                            color = accentColor,
-                            trackColor = Color(0xFF2B2B36),
-                            strokeWidth = 2.dp,
-                            modifier = Modifier
-                                .padding(horizontal = 4.dp)
-                                .size(13.dp)
-                        )
-                    }
-                    !isPaused && (isScanning || translationState.isTranslating) -> {
-                        CircularProgressIndicator(
-                            color = EmeraldActive,
-                            strokeWidth = 2.dp,
-                            modifier = Modifier
-                                .padding(horizontal = 4.dp)
-                                .size(13.dp)
-                        )
-                    }
-                    else -> {
-                        Box(
-                            modifier = Modifier
-                                .padding(horizontal = 4.dp)
-                                .size(8.dp)
-                                .clip(CircleShape)
-                                .background(statusColor)
-                        )
-                    }
-                }
-
-                val statusText = when {
-                    isPaused -> "Paused"
-                    translationState.isDownloadingPacks ->
-                        "DL ${(translationState.downloadProgress.coerceIn(0f, 1f) * 100f).roundToInt()}%"
-                    translationState.errorMessage != null -> "Offline err"
-                    translatedCount > 0 -> "Live · $translatedCount"
-                    isScanning || translationState.isTranslating -> "Live…"
-                    else -> "Live"
-                }
-
-                Text(
-                    text = statusText,
-                    color = Color.White,
-                    fontFamily = SpaceGroteskFamily,
-                    fontWeight = FontWeight.SemiBold,
-                    fontSize = 12.sp,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
                     modifier = Modifier
-                        .padding(end = 4.dp)
+                        .heightIn(min = 48.dp)
+                        .clip(RoundedCornerShape(10.dp))
+                        .clickable { onRefreshNow() }
+                        .padding(horizontal = 4.dp, vertical = 4.dp)
                         .testTag("live_hud_status_text")
-                )
+                ) {
+                    val statusColor = when {
+                        isPaused -> AmberWarn
+                        else -> accentColor
+                    }
+
+                    when {
+                        translationState.isDownloadingPacks -> {
+                            CircularProgressIndicator(
+                                progress = { translationState.downloadProgress.coerceIn(0f, 1f) },
+                                color = accentColor,
+                                trackColor = Color(0xFF282C38),
+                                strokeWidth = 1.8.dp,
+                                modifier = Modifier.size(11.dp)
+                            )
+                        }
+                        !isPaused && (isScanning || translationState.isTranslating) -> {
+                            CircularProgressIndicator(
+                                color = accentColor,
+                                strokeWidth = 1.8.dp,
+                                modifier = Modifier.size(11.dp)
+                            )
+                        }
+                        else -> {
+                            Box(
+                                modifier = Modifier
+                                    .size(7.dp)
+                                    .clip(CircleShape)
+                                    .background(statusColor)
+                            )
+                        }
+                    }
+
+                    val statusText = when {
+                        isPaused -> "PAUSED"
+                        translationState.isDownloadingPacks ->
+                            "DL ${(translationState.downloadProgress.coerceIn(0f, 1f) * 100f).roundToInt()}%"
+                        translationState.errorMessage != null -> "ERR"
+                        translatedCount > 0 -> "LIVE · $translatedCount"
+                        isScanning || translationState.isTranslating -> "SCAN"
+                        else -> "LIVE"
+                    }
+
+                    Text(
+                        text = statusText,
+                        color = Color(0xFFF1F5F9),
+                        fontFamily = JetBrainsMonoFamily,
+                        fontWeight = FontWeight.SemiBold,
+                        fontSize = 11.sp,
+                        letterSpacing = 0.4.sp,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.padding(end = 4.dp)
+                    )
+                }
 
                 Surface(
-                    color = Color(0xFF222531),
-                    shape = RoundedCornerShape(999.dp),
+                    color = Color(0xFF1C202B),
+                    shape = RoundedCornerShape(10.dp),
+                    border = BorderStroke(0.8.dp, Color.White.copy(alpha = 0.08f)),
                     modifier = Modifier
                         .heightIn(min = 36.dp)
-                        .clip(RoundedCornerShape(999.dp))
+                        .clip(RoundedCornerShape(10.dp))
                         .clickable { showLanguagePicker = !showLanguagePicker }
                         .testTag("live_hud_lang_button")
                 ) {
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(4.dp),
-                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                        modifier = Modifier.padding(horizontal = 9.dp, vertical = 6.dp)
                     ) {
                         Icon(
                             imageVector = Icons.Rounded.Translate,
                             contentDescription = "Select target language",
                             tint = accentColor,
-                            modifier = Modifier.size(14.dp)
+                            modifier = Modifier.size(13.dp)
                         )
                         Text(
                             text = currentShortCode,
                             color = Color.White,
                             fontFamily = JetBrainsMonoFamily,
                             fontWeight = FontWeight.Bold,
-                            fontSize = 11.5.sp
+                            fontSize = 11.sp
                         )
                     }
                 }
@@ -349,8 +335,8 @@ fun LiveTranslateHud(
                     Icon(
                         imageVector = if (isPaused) Icons.Rounded.PlayArrow else Icons.Rounded.Pause,
                         contentDescription = if (isPaused) "Resume Live Translate" else "Pause Live Translate",
-                        tint = if (isPaused) EmeraldActive else Color.White,
-                        modifier = Modifier.size(19.dp)
+                        tint = if (isPaused) accentColor else Color(0xFFD6DBE6),
+                        modifier = Modifier.size(18.dp)
                     )
                 }
 
@@ -363,8 +349,8 @@ fun LiveTranslateHud(
                     Icon(
                         imageVector = Icons.Rounded.Close,
                         contentDescription = "Stop Live Translate",
-                        tint = Color(0xFFFCA5A5),
-                        modifier = Modifier.size(18.dp)
+                        tint = Color(0xFF94A3B8),
+                        modifier = Modifier.size(17.dp)
                     )
                 }
             }
@@ -372,10 +358,10 @@ fun LiveTranslateHud(
 
         AnimatedVisibility(visible = showLanguagePicker) {
             Surface(
-                color = Color(0xF012141B),
+                color = Color(0xF211131A),
                 shape = RoundedCornerShape(14.dp),
-                border = BorderStroke(1.dp, Color(0xFF2C3040)),
-                shadowElevation = 4.dp
+                border = BorderStroke(0.8.dp, Color.White.copy(alpha = 0.12f)),
+                shadowElevation = 6.dp
             ) {
                 Row(
                     modifier = Modifier
@@ -387,7 +373,7 @@ fun LiveTranslateHud(
                         val selected = lang.code == targetLangCode
                         val packReady = packStatuses[lang.code] == ModelPackStatus.DOWNLOADED
                         Surface(
-                            color = if (selected) accentColor else Color(0xFF222531),
+                            color = if (selected) accentColor else Color(0xFF1C202B),
                             shape = RoundedCornerShape(9.dp),
                             modifier = Modifier
                                 .heightIn(min = 36.dp)

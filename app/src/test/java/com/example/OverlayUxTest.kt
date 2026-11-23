@@ -10,6 +10,8 @@ import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onRoot
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performTouchInput
+import androidx.compose.ui.test.swipeDown
 import com.example.data.OcrScriptMode
 import com.example.engine.InlineBlockStatus
 import com.example.engine.InlineScreenTranslationState
@@ -84,12 +86,18 @@ class OverlayUxTest {
         // Live button appears inside InlineTranslateBottomBar and invokes live handoff
         composeRule.onNodeWithTag("inline_start_live_button").assertIsDisplayed().performClick()
         assertTrue(liveTriggered)
+
+        // Swiping down on inline_translate_bar smoothly slides & dismisses it
+        composeRule.onNodeWithTag("inline_translate_bar").performTouchInput { swipeDown() }
+        composeRule.waitForIdle()
+        composeRule.onNodeWithTag("inline_translate_bar").assertDoesNotExist()
     }
 
     @Test
-    fun `live translate hud allows pausing stopping and switching language`() {
+    fun `live translate hud allows refreshing pausing stopping and switching language`() {
         var pausedToggled = false
         var stopped = false
+        var refreshed = false
         var pickedLang: String? = null
 
         composeRule.setContent {
@@ -109,14 +117,17 @@ class OverlayUxTest {
                     onTogglePause = { pausedToggled = true },
                     onSelectTargetLanguage = { pickedLang = it },
                     onDragDelta = { _, _ -> },
-                    onStop = { stopped = true }
+                    onStop = { stopped = true },
+                    onRefreshNow = { refreshed = true }
                 )
             }
         }
         composeRule.waitForIdle()
 
         composeRule.onNodeWithTag("live_translate_hud").assertIsDisplayed()
-        composeRule.onNodeWithTag("live_hud_status_text").assertIsDisplayed()
+        composeRule.onNodeWithTag("live_hud_status_text").assertIsDisplayed().performClick()
+        assertTrue(refreshed)
+
         composeRule.onNodeWithTag("live_hud_lang_button").performClick()
         composeRule.waitForIdle()
         composeRule.onNodeWithTag("live_hud_lang_chip_ja").performClick()

@@ -6,6 +6,11 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Rect
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.FastOutLinearInEasing
+import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.spring
+import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInVertically
@@ -50,6 +55,7 @@ import androidx.compose.material.icons.rounded.Language
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material.icons.rounded.SelectAll
+import androidx.compose.material.icons.rounded.Subtitles
 import androidx.compose.material.icons.rounded.Translate
 import androidx.compose.material.icons.rounded.Visibility
 import androidx.compose.material.icons.rounded.VisibilityOff
@@ -89,8 +95,13 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
+import androidx.compose.ui.input.nestedscroll.NestedScrollSource
+import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.pointer.util.VelocityTracker
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalHapticFeedback
@@ -98,6 +109,7 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Velocity
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.data.OcrScriptMode
@@ -1271,6 +1283,7 @@ fun MinimalCircleOverlay(
             modifier = Modifier.align(Alignment.BottomCenter)
         ) {
             InlineTranslateBottomBar(
+                isVisible = isInlineTranslateMode,
                 selectedTargetLang = selectedTargetLang,
                 packStatuses = packStatuses,
                 hasGoogleTranslateApp = hasGoogleTranslateApp,
@@ -1431,6 +1444,87 @@ private fun CompactLookupSheet(
     val scrollState = rememberScrollState()
     val accentColor = MaterialTheme.colorScheme.primary
     val onAccentColor = MaterialTheme.colorScheme.onPrimary
+    val density = LocalDensity.current
+    val scope = rememberCoroutineScope()
+    val sheetOffsetY = remember(croppedBitmap) { Animatable(0f) }
+    var sheetHeightPx by remember { mutableStateOf(0f) }
+    var isDismissing by remember(croppedBitmap) { mutableStateOf(false) }
+    val minDismissDragPx = with(density) { 80.dp.toPx() }
+    val flingVelocityThresholdPx = with(density) { 680.dp.toPx() }
+    val minFlingOffsetPx = with(density) { 24.dp.toPx() }
+
+    fun settleSheetDrag(velocityY: Float) {
+        if (isDismissing) return
+        val dismissThreshold = max(minDismissDragPx, sheetHeightPx * 0.28f)
+        val shouldDismiss = sheetOffsetY.value >= dismissThreshold ||
+            (velocityY >= flingVelocityThresholdPx && sheetOffsetY.value >= minFlingOffsetPx)
+        scope.launch {
+            if (shouldDismiss) {
+                isDismissing = true
+                val exitTarget = max(sheetHeightPx, dismissThreshold * 2.5f) + 64f
+                sheetOffsetY.animateTo(
+                    targetValue = exitTarget,
+                    animationSpec = tween(durationMillis = 160, easing = FastOutLinearInEasing),
+                    initialVelocity = velocityY.coerceAtLeast(0f)
+                )
+                onResetSelection()
+            } else {
+                sheetOffsetY.animateTo(
+                    targetValue = 0f,
+                    animationSpec = spring(
+                        dampingRatio = Spring.DampingRatioMediumBouncy,
+                        stiffness = Spring.StiffnessMediumLow
+                    ),
+                    initialVelocity = velocityY
+                )
+            }
+        }
+    }
+
+    val sheetNestedScroll = remember(croppedBitmap, scrollState) {
+        object : NestedScrollConnection {
+            override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
+                if (isDismissing) return available
+                if (available.y < 0f && sheetOffsetY.value > 0f) {
+                    val consumedY = max(available.y, -sheetOffsetY.value)
+                    val target = (sheetOffsetY.value + consumedY).coerceAtLeast(0f)
+                    scope.launch { sheetOffsetY.snapTo(target) }
+                    return Offset(0f, consumedY)
+                }
+                return Offset.Zero
+            }
+
+            override fun onPostScroll(
+                consumed: Offset,
+                available: Offset,
+                source: NestedScrollSource
+            ): Offset {
+                if (isDismissing) return available
+                if (source == NestedScrollSource.UserInput && available.y > 0f) {
+                    val next = (sheetOffsetY.value + available.y).coerceAtLeast(0f)
+                    scope.launch { sheetOffsetY.snapTo(next) }
+                    return Offset(0f, available.y)
+                }
+                return Offset.Zero
+            }
+
+            override suspend fun onPreFling(available: Velocity): Velocity {
+                if (sheetOffsetY.value > 0f) {
+                    settleSheetDrag(available.y)
+                    return available
+                }
+                return Velocity.Zero
+            }
+
+            override suspend fun onPostFling(consumed: Velocity, available: Velocity): Velocity {
+                if (sheetOffsetY.value > 0f) {
+                    settleSheetDrag(available.y)
+                    return available
+                }
+                return Velocity.Zero
+            }
+        }
+    }
 
     Surface(
         color = Color(0xFF101014),
@@ -1441,6 +1535,16 @@ private fun CompactLookupSheet(
             .heightIn(max = 460.dp)
             .navigationBarsPadding()
             .imePadding()
+            .onSizeChanged { sheetHeightPx = it.height.toFloat() }
+            .graphicsLayer {
+                translationY = sheetOffsetY.value
+                alpha = if (sheetHeightPx > 0f) {
+                    (1f - (sheetOffsetY.value / sheetHeightPx) * 0.55f).coerceIn(0.3f, 1f)
+                } else {
+                    1f
+                }
+            }
+            .nestedScroll(sheetNestedScroll)
             .testTag("compact_lookup_sheet")
     ) {
         Column(
@@ -1450,25 +1554,25 @@ private fun CompactLookupSheet(
                 .padding(horizontal = 16.dp, vertical = 12.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
-            // Bottom-right reachable utility controls (Reset / MoE / Translate) — swipe down on header to close selection
-            var headerDragDelta by remember { mutableStateOf(0f) }
-            val dismissThresholdPx = with(LocalDensity.current) { 44.dp.toPx() }
+            // Bottom-right reachable utility controls (Reset / MoE / Translate) — drag header down to slide dismiss
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .pointerInput(Unit) {
+                    .pointerInput(croppedBitmap) {
+                        val velocityTracker = VelocityTracker()
                         detectVerticalDragGestures(
-                            onDragStart = { headerDragDelta = 0f },
-                            onDragEnd = { headerDragDelta = 0f },
-                            onDragCancel = { headerDragDelta = 0f },
+                            onDragStart = { velocityTracker.resetTracking() },
+                            onDragEnd = {
+                                val vel = velocityTracker.calculateVelocity().y
+                                settleSheetDrag(vel)
+                            },
+                            onDragCancel = { settleSheetDrag(0f) },
                             onVerticalDrag = { change, dragAmount ->
-                                if (scrollState.value == 0 && dragAmount > 0f) {
-                                    headerDragDelta += dragAmount
-                                    if (headerDragDelta >= dismissThresholdPx) {
-                                        change.consume()
-                                        headerDragDelta = 0f
-                                        onResetSelection()
-                                    }
+                                if (scrollState.value == 0 || sheetOffsetY.value > 0f) {
+                                    change.consume()
+                                    velocityTracker.addPosition(change.uptimeMillis, change.position)
+                                    val next = (sheetOffsetY.value + dragAmount).coerceAtLeast(0f)
+                                    scope.launch { sheetOffsetY.snapTo(next) }
                                 }
                             }
                         )
@@ -2188,6 +2292,7 @@ private fun CompactLookupSheet(
 
 @Composable
 private fun InlineTranslateBottomBar(
+    isVisible: Boolean,
     selectedTargetLang: String,
     packStatuses: Map<String, ModelPackStatus>,
     hasGoogleTranslateApp: Boolean,
@@ -2213,8 +2318,49 @@ private fun InlineTranslateBottomBar(
     }
     val accentColor = MaterialTheme.colorScheme.primary
     val onAccentColor = MaterialTheme.colorScheme.onPrimary
-    var barDragDelta by remember { mutableStateOf(0f) }
-    val barDismissThresholdPx = with(LocalDensity.current) { 44.dp.toPx() }
+    val density = LocalDensity.current
+    val scope = rememberCoroutineScope()
+    val barOffsetY = remember { Animatable(0f) }
+    var barHeightPx by remember { mutableStateOf(0f) }
+    var isDismissingBar by remember { mutableStateOf(false) }
+    val minDismissDragPx = with(density) { 64.dp.toPx() }
+    val flingVelocityThresholdPx = with(density) { 620.dp.toPx() }
+    val minFlingOffsetPx = with(density) { 20.dp.toPx() }
+
+    LaunchedEffect(isVisible) {
+        if (isVisible) {
+            isDismissingBar = false
+            barOffsetY.snapTo(0f)
+        }
+    }
+
+    fun settleBarDrag(velocityY: Float) {
+        if (isDismissingBar) return
+        val dismissThreshold = max(minDismissDragPx, barHeightPx * 0.34f)
+        val shouldDismiss = barOffsetY.value >= dismissThreshold ||
+            (velocityY >= flingVelocityThresholdPx && barOffsetY.value >= minFlingOffsetPx)
+        scope.launch {
+            if (shouldDismiss) {
+                isDismissingBar = true
+                val exitTarget = max(barHeightPx, dismissThreshold * 2.5f) + 48f
+                barOffsetY.animateTo(
+                    targetValue = exitTarget,
+                    animationSpec = tween(durationMillis = 155, easing = FastOutLinearInEasing),
+                    initialVelocity = velocityY.coerceAtLeast(0f)
+                )
+                onExitInlineMode()
+            } else {
+                barOffsetY.animateTo(
+                    targetValue = 0f,
+                    animationSpec = spring(
+                        dampingRatio = Spring.DampingRatioMediumBouncy,
+                        stiffness = Spring.StiffnessMediumLow
+                    ),
+                    initialVelocity = velocityY
+                )
+            }
+        }
+    }
 
     Surface(
         color = Color(0xF2101014),
@@ -2224,6 +2370,29 @@ private fun InlineTranslateBottomBar(
             .fillMaxWidth()
             .navigationBarsPadding()
             .imePadding()
+            .onSizeChanged { barHeightPx = it.height.toFloat() }
+            .graphicsLayer {
+                translationY = barOffsetY.value
+                alpha = if (barHeightPx > 0f) {
+                    (1f - (barOffsetY.value / barHeightPx) * 0.6f).coerceIn(0.3f, 1f)
+                } else {
+                    1f
+                }
+            }
+            .pointerInput(Unit) {
+                val velocityTracker = VelocityTracker()
+                detectVerticalDragGestures(
+                    onDragStart = { velocityTracker.resetTracking() },
+                    onDragEnd = { settleBarDrag(velocityTracker.calculateVelocity().y) },
+                    onDragCancel = { settleBarDrag(0f) },
+                    onVerticalDrag = { change, dragAmount ->
+                        change.consume()
+                        velocityTracker.addPosition(change.uptimeMillis, change.position)
+                        val next = (barOffsetY.value + dragAmount).coerceAtLeast(0f)
+                        scope.launch { barOffsetY.snapTo(next) }
+                    }
+                )
+            }
             .testTag("inline_translate_bar")
     ) {
         Column(
@@ -2233,25 +2402,7 @@ private fun InlineTranslateBottomBar(
             verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
             Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .pointerInput(Unit) {
-                        detectVerticalDragGestures(
-                            onDragStart = { barDragDelta = 0f },
-                            onDragEnd = { barDragDelta = 0f },
-                            onDragCancel = { barDragDelta = 0f },
-                            onVerticalDrag = { change, dragAmount ->
-                                if (dragAmount > 0f) {
-                                    barDragDelta += dragAmount
-                                    if (barDragDelta >= barDismissThresholdPx) {
-                                        change.consume()
-                                        barDragDelta = 0f
-                                        onExitInlineMode()
-                                    }
-                                }
-                            }
-                        )
-                    },
+                modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
@@ -2365,9 +2516,9 @@ private fun InlineTranslateBottomBar(
 
                     if (onStartLiveTranslate != null) {
                         Surface(
-                            color = EmeraldActive.copy(alpha = 0.16f),
+                            color = Color(0xFF1F222C),
                             shape = RoundedCornerShape(999.dp),
-                            border = BorderStroke(1.dp, EmeraldActive.copy(alpha = 0.55f)),
+                            border = BorderStroke(0.8.dp, Color.White.copy(alpha = 0.12f)),
                             modifier = Modifier
                                 .heightIn(min = 48.dp)
                                 .clip(RoundedCornerShape(999.dp))
@@ -2379,17 +2530,17 @@ private fun InlineTranslateBottomBar(
                                 verticalAlignment = Alignment.CenterVertically,
                                 horizontalArrangement = Arrangement.spacedBy(5.dp)
                             ) {
-                                Box(
-                                    modifier = Modifier
-                                        .size(6.dp)
-                                        .clip(CircleShape)
-                                        .background(EmeraldActive)
+                                Icon(
+                                    imageVector = Icons.Rounded.Subtitles,
+                                    contentDescription = "Start continuous Live Translate",
+                                    tint = accentColor,
+                                    modifier = Modifier.size(15.dp)
                                 )
                                 Text(
                                     text = "Live",
-                                    color = EmeraldActive,
+                                    color = Color.White,
                                     fontFamily = SpaceGroteskFamily,
-                                    fontWeight = FontWeight.SemiBold,
+                                    fontWeight = FontWeight.Medium,
                                     fontSize = 12.sp
                                 )
                             }

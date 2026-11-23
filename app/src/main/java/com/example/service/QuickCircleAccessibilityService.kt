@@ -133,8 +133,9 @@ class QuickCircleAccessibilityService : AccessibilityService() {
     private val liveScanningFlow = MutableStateFlow(false)
     private val liveScrollSettlingFlow = MutableStateFlow(false)
 
-    private var liveHeartbeatJob: Job? = null
     private var liveProcessJob: Job? = null
+    private var currentLiveProcessToken = 0L
+    private var lastLiveEmittedSignature: List<Pair<Int, String>>? = null
     private var liveCaptureInFlight = false
     private var lastLiveFingerprint: IntArray? = null
     private var lastLiveTargetLang: String? = null
@@ -187,32 +188,25 @@ class QuickCircleAccessibilityService : AccessibilityService() {
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         val type = event?.eventType ?: return
+        val eventPkg = event.packageName?.toString()
         when (type) {
             AccessibilityEvent.TYPE_WINDOWS_CHANGED,
             AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED -> {
                 updateTriggerWindowVisibility()
                 if (_isLiveTranslateActive.value) {
                     onLiveContentEvent(
-                        isScroll = false,
-                        eventPkg = event.packageName?.toString()
+                        eventType = type,
+                        eventPkg = eventPkg
                     )
                 }
             }
 
-            AccessibilityEvent.TYPE_VIEW_SCROLLED -> {
-                if (_isLiveTranslateActive.value) {
-                    onLiveContentEvent(
-                        isScroll = true,
-                        eventPkg = event.packageName?.toString()
-                    )
-                }
-            }
-
+            AccessibilityEvent.TYPE_VIEW_SCROLLED,
             AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED -> {
                 if (_isLiveTranslateActive.value) {
                     onLiveContentEvent(
-                        isScroll = false,
-                        eventPkg = event.packageName?.toString()
+                        eventType = type,
+                        eventPkg = eventPkg
                     )
                 }
             }
@@ -850,29 +844,20 @@ class QuickCircleAccessibilityService : AccessibilityService() {
         lastLiveFingerprint = null
         lastLiveTargetLang = null
         lastLiveScreenSize = null
+        lastLiveEmittedSignature = null
+        currentLiveProcessToken++
 
         attachLiveTranslationLayer()
         attachLiveHudWindow()
         _isLiveTranslateActive.value = true
 
-        liveHeartbeatJob?.cancel()
-        liveHeartbeatJob = serviceScope.launch {
-            delay(180L)
-            while (isActive && _isLiveTranslateActive.value) {
-                if (!livePausedFlow.value && !liveScrollSettlingFlow.value && !isDeviceLockedOrAod()) {
-                    scheduleLiveCapture(delayMs = 0L, forceRefresh = false)
-                }
-                delay(2200L)
-            }
-        }
-        scheduleLiveCapture(delayMs = 140L, forceRefresh = true)
+        scheduleLiveCapture(delayMs = 150L, forceRefresh = true)
         return true
     }
 
     private fun stopLiveTranslateInternal() {
         _isLiveTranslateActive.value = false
-        liveHeartbeatJob?.cancel()
-        liveHeartbeatJob = null
+        currentLiveProcessToken++
         liveProcessJob?.cancel()
         liveProcessJob = null
         liveDebouncedCaptureRunnable?.let { mainHandler.removeCallbacks(it) }
@@ -882,6 +867,7 @@ class QuickCircleAccessibilityService : AccessibilityService() {
         liveScrollSettlingFlow.value = false
         liveBlocksFlow.value = emptyList()
         lastLiveFingerprint = null
+        lastLiveEmittedSignature = null
         detachLiveHudWindow()
         detachLiveTranslationLayer()
     }
@@ -1012,7 +998,7 @@ class QuickCircleAccessibilityService : AccessibilityService() {
                         onTogglePause = {
                             val nextPaused = !livePausedFlow.value
                             livePausedFlow.value = nextPaused
-                            suppressLiveEventsUntilMs = SystemClock.uptimeMillis() + 260L
+                            suppressLiveEventsUntilMs = SystemClock.uptimeMillis() + 550L
                             liveTranslationContainer?.visibility =
                                 if (nextPaused) View.GONE else View.VISIBLE
                             if (!nextPaused) {
@@ -1020,12 +1006,13 @@ class QuickCircleAccessibilityService : AccessibilityService() {
                             }
                         },
                         onSelectTargetLanguage = { code ->
-                            suppressLiveEventsUntilMs = SystemClock.uptimeMillis() + 260L
+                            suppressLiveEventsUntilMs = SystemClock.uptimeMillis() + 550L
                             serviceScope.launch {
                                 repository.updateConfig { it.copy(targetLanguageCode = code) }
                             }
                             lastLiveTargetLang = null
-                            scheduleLiveCapture(delayMs = 80L, forceRefresh = true)
+                            lastLiveEmittedSignature = null
+                            scheduleLiveCapture(delayMs = 90L, forceRefresh = true)
                         },
                         onDragDelta = { dx, dy ->
                             val curW = liveHudContainer?.width?.takeIf { it > 0 } ?: hudWidthEstimate
@@ -1036,7 +1023,7 @@ class QuickCircleAccessibilityService : AccessibilityService() {
                             liveHudY = (liveHudY + dy).coerceIn(0f, maxY)
                             hudParams.x = liveHudX.roundToInt()
                             hudParams.y = liveHudY.roundToInt()
-                            suppressLiveEventsUntilMs = SystemClock.uptimeMillis() + 250L
+                            suppressLiveEventsUntilMs = SystemClock.uptimeMillis() + 500L
                             liveHudContainer?.let { view ->
                                 if (view.parent != null) {
                                     try {
@@ -1046,7 +1033,14 @@ class QuickCircleAccessibilityService : AccessibilityService() {
                                 }
                             }
                         },
-                        onStop = { stopLiveTranslateInternal() }
+                        onStop = { stopLiveTranslateInternal() },
+                        onRefreshNow = {
+                            if (livePausedFlow.value) {
+                                livePausedFlow.value = false
+                                liveTranslationContainer?.visibility = View.VISIBLE
+                            }
+                            scheduleLiveCapture(delayMs = 40L, forceRefresh = true)
+                        }
                     )
                 }
             }
@@ -1087,16 +1081,32 @@ class QuickCircleAccessibilityService : AccessibilityService() {
         liveHudLifecycleOwner = null
     }
 
-    private fun onLiveContentEvent(isScroll: Boolean, eventPkg: String?) {
+    private fun onLiveContentEvent(eventType: Int, eventPkg: String?) {
         if (!_isLiveTranslateActive.value || livePausedFlow.value || isDeviceLockedOrAod()) return
+        if (liveCaptureInFlight) return
         val now = SystemClock.uptimeMillis()
-        if (eventPkg == packageName && now < suppressLiveEventsUntilMs) return
-        if (isScroll) {
-            // Clear floating blocks briefly during active scrolls so old boxes don't lag behind text
-            liveScrollSettlingFlow.value = true
-            scheduleLiveCapture(delayMs = 340L, forceRefresh = false)
-        } else {
-            scheduleLiveCapture(delayMs = 420L, forceRefresh = false)
+        if (now < suppressLiveEventsUntilMs) return
+
+        // Never allow our own HUD spinner / chip recompositions or language strip scroll to re-trigger capture
+        if (eventPkg == packageName &&
+            (eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED ||
+                eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED)
+        ) {
+            return
+        }
+
+        when (eventType) {
+            AccessibilityEvent.TYPE_VIEW_SCROLLED -> {
+                // Hide stale floating boxes only while user actively scrolls, then re-capture when scroll settles
+                liveScrollSettlingFlow.value = true
+                scheduleLiveCapture(delayMs = 420L, forceRefresh = false)
+            }
+            AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED -> {
+                scheduleLiveCapture(delayMs = 360L, forceRefresh = false)
+            }
+            else -> {
+                scheduleLiveCapture(delayMs = 600L, forceRefresh = false)
+            }
         }
     }
 
@@ -1144,14 +1154,21 @@ class QuickCircleAccessibilityService : AccessibilityService() {
 
         liveCaptureInFlight = true
         val layer = liveTranslationContainer
-        suppressLiveEventsUntilMs = SystemClock.uptimeMillis() + 220L
-        layer?.visibility = View.INVISIBLE
+        val needTempHide = layer != null &&
+            liveBlocksFlow.value.isNotEmpty() &&
+            !liveScrollSettlingFlow.value &&
+            layer.visibility == View.VISIBLE
 
-        // 24ms (1-2 frames) ensures WindowManager composites without our translation blocks
+        suppressLiveEventsUntilMs = SystemClock.uptimeMillis() + 650L
+        if (needTempHide) {
+            layer?.visibility = View.INVISIBLE
+        }
+
+        val captureDelay = if (needTempHide) 28L else 0L
         mainHandler.postDelayed({
             if (!_isLiveTranslateActive.value || livePausedFlow.value || isDeviceLockedOrAod()) {
                 liveCaptureInFlight = false
-                if (_isLiveTranslateActive.value && !livePausedFlow.value) {
+                if (needTempHide && _isLiveTranslateActive.value && !livePausedFlow.value) {
                     layer?.visibility = View.VISIBLE
                 }
                 return@postDelayed
@@ -1163,8 +1180,8 @@ class QuickCircleAccessibilityService : AccessibilityService() {
                 object : TakeScreenshotCallback {
                     override fun onSuccess(screenshot: ScreenshotResult) {
                         liveCaptureInFlight = false
-                        suppressLiveEventsUntilMs = SystemClock.uptimeMillis() + 220L
-                        if (_isLiveTranslateActive.value && !livePausedFlow.value) {
+                        suppressLiveEventsUntilMs = SystemClock.uptimeMillis() + 600L
+                        if (needTempHide && _isLiveTranslateActive.value && !livePausedFlow.value) {
                             layer?.visibility = View.VISIBLE
                         }
 
@@ -1192,14 +1209,15 @@ class QuickCircleAccessibilityService : AccessibilityService() {
                     override fun onFailure(errorCode: Int) {
                         liveCaptureInFlight = false
                         liveScrollSettlingFlow.value = false
-                        if (_isLiveTranslateActive.value && !livePausedFlow.value) {
+                        suppressLiveEventsUntilMs = SystemClock.uptimeMillis() + 450L
+                        if (needTempHide && _isLiveTranslateActive.value && !livePausedFlow.value) {
                             layer?.visibility = View.VISIBLE
                         }
                         Log.w(TAG, "Live takeScreenshot failed errorCode=$errorCode")
                     }
                 }
             )
-        }, 24L)
+        }, captureDelay)
     }
 
     private fun processCapturedLiveBitmap(bitmap: Bitmap, forceRefresh: Boolean) {
@@ -1229,7 +1247,7 @@ class QuickCircleAccessibilityService : AccessibilityService() {
         val unchanged = !forceRefresh &&
             lastLiveTargetLang == targetLang &&
             lastLiveScreenSize == screenSize &&
-            diff < 0.014f
+            diff < 0.018f
 
         if (unchanged) {
             liveScrollSettlingFlow.value = false
@@ -1240,12 +1258,14 @@ class QuickCircleAccessibilityService : AccessibilityService() {
         lastLiveFingerprint = fingerprint
         lastLiveTargetLang = targetLang
         lastLiveScreenSize = screenSize
+        lastLiveEmittedSignature = null
 
         val excludedRects = buildList {
             hudRect?.let { add(it) }
             addAll(getImeWindowRects())
         }
 
+        val jobToken = ++currentLiveProcessToken
         liveProcessJob?.cancel()
         liveProcessJob = serviceScope.launch(Dispatchers.Default) {
             liveScanningFlow.value = true
@@ -1261,11 +1281,20 @@ class QuickCircleAccessibilityService : AccessibilityService() {
                     bitmap,
                     effectiveMode
                 ) { analysis, isFinal ->
-                    val filteredBlocks = filterBlocksExcludingRects(analysis.blocks, excludedRects)
-                    val filteredAnalysis = analysis.copy(blocks = filteredBlocks)
+                    if (currentLiveProcessToken != jobToken) return@analyzeFullScreenProgressive
 
+                    val filteredBlocks = filterBlocksExcludingRects(analysis.blocks, excludedRects)
+                    val signature = filteredBlocks.map { it.id to it.text }
+                    if (isFinal && signature == lastLiveEmittedSignature && signature.isNotEmpty()) {
+                        liveScanningFlow.value = false
+                        liveScrollSettlingFlow.value = false
+                        return@analyzeFullScreenProgressive
+                    }
+
+                    val filteredAnalysis = analysis.copy(blocks = filteredBlocks)
                     if (filteredBlocks.isEmpty()) {
-                        if (isFinal) {
+                        if (isFinal && currentLiveProcessToken == jobToken) {
+                            lastLiveEmittedSignature = emptyList()
                             liveBitmapSizeFlow.value = bitmap.width to bitmap.height
                             liveBlocksFlow.value = emptyList()
                             liveInlineStateFlow.value = InlineScreenTranslationState(targetLangCode = targetLang)
@@ -1276,20 +1305,24 @@ class QuickCircleAccessibilityService : AccessibilityService() {
                     }
 
                     val enriched = OcrAndLensEngine.enrichAnalysisForInlineTranslate(bitmap, filteredAnalysis)
+                    if (currentLiveProcessToken != jobToken) return@analyzeFullScreenProgressive
+
                     OcrAndLensEngine.translateBlocksInline(
                         blocks = enriched.blocks,
                         targetLangCode = targetLang,
                         dominantLangHint = enriched.dominantLanguageCode,
                         useCache = true
                     ) { state ->
-                        suppressLiveEventsUntilMs = SystemClock.uptimeMillis() + 160L
+                        if (currentLiveProcessToken != jobToken) return@translateBlocksInline
+                        suppressLiveEventsUntilMs = SystemClock.uptimeMillis() + 300L
+                        lastLiveEmittedSignature = signature
                         liveBitmapSizeFlow.value = bitmap.width to bitmap.height
                         liveBlocksFlow.value = enriched.blocks
                         liveInlineStateFlow.value = state
                         liveScrollSettlingFlow.value = false
                     }
 
-                    if (isFinal) {
+                    if (isFinal && currentLiveProcessToken == jobToken) {
                         liveScanningFlow.value = false
                     }
                 }
@@ -1298,8 +1331,10 @@ class QuickCircleAccessibilityService : AccessibilityService() {
                     Log.w(TAG, "Live Translate processing error: ${e.message}")
                 }
             } finally {
-                liveScanningFlow.value = false
-                liveScrollSettlingFlow.value = false
+                if (currentLiveProcessToken == jobToken) {
+                    liveScanningFlow.value = false
+                    liveScrollSettlingFlow.value = false
+                }
                 if (!bitmap.isRecycled) {
                     bitmap.recycle()
                 }
